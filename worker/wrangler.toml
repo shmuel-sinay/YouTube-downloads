@@ -1,0 +1,17 @@
+# Only needed if you deploy with the wrangler CLI. Deploying from the
+# dashboard? Paste worker.js and set the same things in Settings (see README).
+name = "yt-tracker"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+[triggers]
+crons = ["0 */3 * * *"]
+
+[[kv_namespaces]]
+binding = "DB"
+id = "PUT-YOUR-KV-NAMESPACE-ID-HERE"
+
+# Optional:
+# [[r2_buckets]]
+# binding = "FILES"
+# bucket_name = "yt-files"
