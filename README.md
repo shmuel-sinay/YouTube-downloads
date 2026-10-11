@@ -1,49 +1,52 @@
-# מעקב ערוצי יוטיוב והורדה בשרת
+# Gemini + מעקב ערוצי יוטיוב
 
-המערכת עוקבת אחרי ערוצי יוטיוב, ומורידה לבד כל סרטון חדש שעולה, לפי הסינונים שבחרת. ההורדה רצה על שרת ולא על המחשב שלך, ולכן נטפרי לא מפריע לה.
+בכתובת אחת, `my-gemini.<שם>.workers.dev`, יש שתי מערכות, ומעבר ביניהן בלחיצת כפתור:
+- **`/`**: הצ'אט עם Gemini, בדיוק כמו קודם.
+- **`/yt/`**: מעקב ערוצים. כשעולה סרטון חדש, הוא יורד אוטומטית בשרת, ומשם ישר למחשב.
 
 ```
-Cloudflare Worker  ("המוח")                 שרת אמיתי  ("הידיים")
- ├─ דף ניהול עם סיסמה                         agent/agent.py
- ├─ כל 3 שעות: RSS של כל ערוץ  ──תור──▶       ├─ yt-dlp (עוגיות, Node, PO Token)
- └─ API לסוכן                   ◀─דיווח──     └─ העלאה ל-R2 (אופציונלי)
+Cloudflare Worker (my-gemini)            Render (שרת ההורדות)
+ ├─ /     Gemini                           Dockerfile → agent/agent.py
+ ├─ /yt   דף + RSS כל 3 שעות  ──תור + "התעורר"──▶  yt-dlp (עוגיות + Node)
+ └─ /yt/api               ◀──────דיווח───────  /files/… (זמני)
+          הדף פתוח ← הורדה אוטומטית למחשב ◀── הקובץ
 ```
 
-| חלק | איפה | עלות |
-|---|---|---|
-| `worker/worker.js` | Cloudflare Workers + KV | חינם |
-| `agent/` | שרת Linux, למשל Oracle Cloud Always Free | חינם |
-| קבצים ב-R2 (אופציונלי) | Cloudflare R2 | חינם עד 10GB. דורש להזין אמצעי תשלום ב-Cloudflare |
+## חלק 1: ה-Worker הקיים (`my-gemini`)
 
-> **למה צריך שרת?** ב-Worker אי אפשר להריץ את yt-dlp או את ffmpeg, ויוטיוב חוסם את הכתובות של Cloudflare. ה-Worker רק עוקב ומנהל, וההורדה עצמה נעשית בשרת.
+1. **הדבקת הקוד.** פותחים את `my-gemini` ולוחצים **Edit code**. מוחקים הכל, מדביקים את כל `worker/worker.js` ולוחצים **Deploy**.
+2. **סודות.** תחת **Settings ← Variables and Secrets ← Add**, בוחרים **Type: Secret** ומוסיפים:
+   - `GEMINI_API_KEY`: מפתח ה-API של Gemini. **מפתח חדש**, לא זה שהיה כתוב בקוד הישן.
+   - `GEMINI_PASSWORD`: משפט הכניסה לצ'אט.
+   - `ADMIN_PASSWORD`: הסיסמה לדף הערוצים.
+   - `AGENT_TOKEN`: מחרוזת ארוכה ואקראית. אותה מחרוזת תיכנס גם ל-Render.
+3. **משתנה רגיל (Type: Text).** `RENDER_URL` = הכתובת של שרת Render, למשל `https://yt-agent.onrender.com`.
+4. **מסד נתונים (KV).**
+   1. בתפריט: **Storage & Databases ← KV ← Create**, בשם `yt-tracker`.
+   2. ב-Worker: **Settings ← Bindings ← Add ← KV namespace**. Variable name: `DB`.
+5. **בדיקה אוטומטית.** ב-**Settings ← Trigger Events ← Add ← Cron Triggers** מזינים `0 */3 * * *`.
+
+## חלק 2: Render (שרת ההורדות)
+
+1. **יצירת השירות.** ב-Render לוחצים **New ← Web Service** ומחברים את הריפו הזה. **Language: Docker**, ו-**Instance type: Free**.
+2. **Environment.**
+   - `TRACKER_URL` = `https://my-gemini.<שם>.workers.dev/yt`
+   - `AGENT_TOKEN` = אותה מחרוזת שהכנסת ב-Worker.
+   - `YTDLP_COOKIES` = `/etc/secrets/cookies.txt`
+3. **עוגיות.** תחת **Secret Files**, יוצרים קובץ בשם `cookies.txt` ומדביקים בו את העוגיות של youtube.com (בפורמט Netscape, עם התוסף "Get cookies.txt LOCALLY"). **לעולם לא בצ'אט ולא בריפו.**
+4. **Health Check Path:** `/healthz`. לוחצים **Create**.
+
+## שימוש
+
+- **מעבר בין המערכות:** בצ'אט יש כפתור **📺 ערוצים**, ובדף הערוצים יש כפתור **💬 מעבר ל-Gemini**.
+- **שרת ההורדות:** Render נרדם אחרי כ-15 דקות בלי שימוש. ה-Worker מעיר אותו לבד בכל בדיקה ובכל פעם שמשהו נכנס לתור. אפשר להעיר אותו גם ידנית עם **⏰ הער את שרת ההורדות**. ההתעוררות לוקחת עד דקה.
+- **הורדה אוטומטית למחשב:** מסמנים את התיבה ומשאירים את הדף פתוח. כל קובץ שמסיים לרדת בשרת יורד לבד למחשב. בפעם הראשונה הדפדפן ישאל אם לאשר הורדה של כמה קבצים, ועונים כן.
+- **הקבצים ב-Render זמניים.** הם נמחקים כשהשרת נרדם, או אחרי 6 שעות. אם יש לך R2, אפשר להוסיף את הפרטים שלו ב-Render (ראה `agent/agent.env.example`), ואז הקבצים נשמרים שם קבוע.
 
 ---
 
-## חלק 1: ה-Worker (בדשבורד של Cloudflare)
+## אפשרות אחרת: שרת Linux רגיל במקום Render
 
-1. **יצירת Worker.** נכנסים ל-**Workers & Pages**, לוחצים **Create**, בוחרים **Start with Hello World**, נותנים שם (למשל `yt-tracker`) ולוחצים **Deploy**.
-2. **הדבקת הקוד.** לוחצים **Edit code**, מוחקים את כל מה שיש, מדביקים את כל התוכן של `worker/worker.js` ולוחצים **Deploy**.
-3. **יצירת מסד נתונים (KV).**
-   1. בתפריט: **Storage & Databases**, אחר כך **KV**, ואז **Create**. שם: `yt-tracker`.
-   2. חוזרים ל-Worker: **Settings**, אחר כך **Bindings**, **Add**, ובוחרים **KV namespace**.
-   3. Variable name: `DB`. בוחרים את ה-KV שיצרת.
-4. **סודות.** ב-**Settings**, תחת **Variables and Secrets**, לוחצים **Add** ובוחרים **Type: Secret**:
-   - `ADMIN_PASSWORD`: הסיסמה לדף.
-   - `AGENT_TOKEN`: מחרוזת ארוכה ואקראית, לפחות 32 תווים. אותה מחרוזת תיכנס גם לשרת.
-5. **בדיקה אוטומטית כל 3 שעות.** ב-**Settings**, תחת **Trigger Events**, לוחצים **Add**, בוחרים **Cron Triggers** ומזינים `0 */3 * * *`.
-6. **(אופציונלי) R2.** אם מגדירים אותו, אפשר להוריד את הקבצים ישר מהדף:
-   1. יוצרים bucket בשם `yt-files`.
-   2. ב-Worker: **Bindings**, אחר כך **Add**, ואז **R2 bucket**. Variable name: `FILES`.
-   3. ב-**R2**, תחת **Manage API tokens**, יוצרים טוקן עם הרשאת **Object Read & Write**. את הפרטים שלו מכניסים לשרת (חלק 2).
-7. **כניסה לדף.** לוחצים **Visit**, נכנסים עם הסיסמה ומוסיפים ערוץ.
-
-**הוספת ערוץ:** מדביקים קישור לערוץ, `@handle` או מזהה `UC…`, ובוחרים:
-- **שיר או סרטון.**
-- **אורך מינימלי בדקות.**
-- **בלי Shorts.**
-- **כמה מהסרטונים האחרונים להוריד כבר עכשיו.** אם לא מבקשים, יורדים רק סרטונים שיעלו מעכשיו.
-
-## חלק 2: הסוכן (בשרת)
 
 **שרת חינמי:** אפשר לפתוח שרת ב-Oracle Cloud, תחת **Always Free**, עם מכונת VM של Ubuntu. ההרשמה מבקשת כרטיס אשראי לאימות בלבד.
 
