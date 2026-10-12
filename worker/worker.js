@@ -192,7 +192,9 @@ async function addJobs(env, jobs) {
   if (!jobs.length) return;
   // A NetFree-only profile: videos wait until the desktop app (behind
   // NetFree) confirms they're open. Lists/searches expand first.
-  if ((await profileInfo(env, env.PROFILE)).netfree) {
+  // A profile that downloads on its own computer skips this: the download is the check.
+  const pi = await profileInfo(env, env.PROFILE);
+  if (pi.netfree && !pi.direct) {
     for (const j of jobs) if (!j.kind && j.status === "queued" && j.nf !== "ok") j.status = "nfcheck";
   }
   const ids = await getJobIds(env);
@@ -394,10 +396,10 @@ function profileEnv(env, pid) {
 async function profileInfo(env, pid) {
   if (!pid || pid === "main") {
     const m = await getJSON(env, "mainprof", {});
-    return { id: "main", name: m.name || "מנהל", netfree: false, vault: !!m.vault, admin: true };
+    return { id: "main", name: m.name || "מנהל", netfree: false, vault: !!m.vault, direct: !!m.direct, admin: true };
   }
   const pr = (await getJSON(env, "profiles", {}))[pid] || {};
-  return { id: pid, name: pr.name || pid, netfree: !!pr.netfree, vault: !!pr.vault, admin: false, created: pr.created };
+  return { id: pid, name: pr.name || pid, netfree: !!pr.netfree, vault: !!pr.vault, direct: !!pr.direct, admin: false, created: pr.created };
 }
 
 async function profileIds(env) {
@@ -514,8 +516,13 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const all = [];
       for (const pid of await profileIds(env)) {
         const penv = profileEnv(env, pid);
-        const nf = (await profileInfo(env, pid)).netfree;
-        for (const j of (await listJobs(penv)).reverse()) all.push({ j, pid, penv, nf });
+        const pi = await profileInfo(env, pid);
+        for (const j of (await listJobs(penv)).reverse()) {
+          // "מוריד מהמחשב": the profile's computer tries first; the server only
+          // takes a job after the computer failed on an unrestricted profile.
+          if (pi.direct && !j.fallback) continue;
+          all.push({ j, pid, penv, nf: pi.netfree });
+        }
       }
       all.sort((a, b) => (b.j.priority || 0) - (a.j.priority || 0));
       for (const { j, pid, penv, nf } of all) {
@@ -611,7 +618,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const profs = await getJSON(rootEnv, "profiles", {});
     const id = "u" + Date.now().toString(36);
     profs[id] = { name, hash: await sha256("pw:" + pw), created: new Date().toISOString(),
-                  netfree: f.get("netfree") === "on", vault: f.get("vault") === "on" };
+                  netfree: f.get("netfree") === "on", vault: f.get("vault") === "on", direct: f.get("direct") === "on" };
     await putJSON(rootEnv, "profiles", profs);
     await addLog(env, "worker", `נוצר פרופיל: ${name}`);
     return json({ ok: true, id });
@@ -624,6 +631,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (id === "main") {
       const m = await getJSON(rootEnv, "mainprof", {});
       if (f.has("vault")) m.vault = on("vault");
+      if (f.has("direct")) m.direct = on("direct");
       if (name) m.name = name;
       await putJSON(rootEnv, "mainprof", m);
       return json({ ok: true });
@@ -632,6 +640,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (!pr) return new Response("אין פרופיל כזה", { status: 404 });
     if (f.has("netfree")) pr.netfree = on("netfree");
     if (f.has("vault")) pr.vault = on("vault");
+    if (f.has("direct")) pr.direct = on("direct");
     if (name) pr.name = name;
     const pw = String(f.get("password") || "");
     if (pw) {
@@ -641,7 +650,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     }
     await putJSON(rootEnv, "profiles", profs);
     await addLog(env, "worker", `עודכן פרופיל: ${pr.name}` + (f.has("netfree") ? (pr.netfree ? " · רק פתוח בנטפרי" : " · בלי הגבלת נטפרי") : "") +
-      (f.has("vault") ? (pr.vault ? " · כספת" : " · בלי כספת") : "") + (pw ? " · קוד חדש" : ""));
+      (f.has("vault") ? (pr.vault ? " · כספת" : " · בלי כספת") : "") +
+      (f.has("direct") ? (pr.direct ? " · מוריד מהמחשב" : " · מוריד בשרת") : "") + (pw ? " · קוד חדש" : ""));
     return json({ ok: true });
   }
   // --- NetFree check, done by the desktop app (it sits behind NetFree; the
@@ -649,7 +659,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   if (p === "/nf/pending" && pid === "main") {
     const items = [];
     for (const q of await profileIds(rootEnv)) {
-      if (!(await profileInfo(rootEnv, q)).netfree) continue;
+      const qi = await profileInfo(rootEnv, q);
+      if (!qi.netfree || qi.direct) continue;
       const groups = new Set();
       const jobs = (await listJobs(profileEnv(rootEnv, q)))
         .filter((j) => j.status === "nfcheck" || (j.status === "queued" && !j.kind && j.nf !== "ok"))
@@ -694,6 +705,43 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       profiles.push({ id: q, name: info.name, netfree: info.netfree, vault: info.vault, ...countJobs(await listJobs(profileEnv(rootEnv, q))) });
     }
     return json({ items: await getJSON(rootEnv, "activity", []), profiles });
+  }
+  // --- downloads done on the profile's own computer (its desktop app) ---
+  // YouTube blocks cloud addresses; a home computer isn't blocked, and with
+  // NetFree on, a download that succeeds is already a NetFree-approved one.
+  if (p === "/pc/next" && req.method === "POST") {
+    if (!(await profileInfo(env, pid)).direct) return json({ jobs: [] });
+    const now = Date.now();
+    const cand = (await listJobs(env)).reverse().sort((a, b) => (b.priority || 0) - (a.priority || 0));
+    for (const j of cand) {
+      if (j.kind || j.fallback) continue;   // lists/searches go to the server; so do failed computer jobs
+      const stale = j.status === "taken" && now - Date.parse(j.updated) > CLAIM_TIMEOUT_MS;
+      if (j.status !== "queued" && !stale) continue;
+      j.status = "taken"; j.updated = new Date().toISOString(); j.via = "pc";
+      j.pcConvert = j.mode === "audio";
+      await putJSON(env, "job:" + j.videoId, j);
+      return json({ jobs: [j] });           // one at a time: the rest stay in line
+    }
+    return json({ jobs: [] });
+  }
+  if (p === "/pc/done" && req.method === "POST") {
+    const b = await req.json();
+    const j = await getJSON(env, "job:" + b.videoId, null);
+    if (!j) return json({ ok: true, ignored: true });
+    if (j.status === "cancelled") return json({ ok: true, ignored: "cancelled" });
+    const ok = b.status === "done";
+    const pi = await profileInfo(env, env.PROFILE);
+    // Unrestricted profile: the computer couldn't get it → the server tries.
+    // NetFree profile: no fallback — the server would skip the NetFree check.
+    const fallback = !ok && pi.direct && !pi.netfree && !j.kind;
+    const why = String(b.error || "").slice(0, 300);
+    Object.assign(j, { status: ok ? "done" : fallback ? "queued" : "failed", fileUrl: "", pcGot: ok, via: "pc",
+                       fallback, error: ok ? "" : (fallback ? "במחשב נכשל, עובר לשרת: " : "") + why,
+                       updated: new Date().toISOString() });
+    await putJSON(env, "job:" + j.videoId, j);
+    await recordActivity(env, j);
+    await addLog(env, "pc", (ok ? "✓ ירד למחשב: " : "✗ נכשל במחשב: ") + j.title + (ok ? "" : " — " + j.error));
+    return json({ ok: true });
   }
   if (p === "/profiles/remove" && req.method === "POST" && pid === "main") {
     // Removes the profile and all of its data.
@@ -799,7 +847,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const j = await getJSON(env, "job:" + f.get("id"), null);
       if (j) {
         // NetFree-only profile: back to the check right away (not via the download server).
-        j.status = !j.kind && j.nf !== "ok" && (await profileInfo(env, env.PROFILE)).netfree ? "nfcheck" : "queued";
+        const ri = await profileInfo(env, env.PROFILE);
+        j.status = !j.kind && j.nf !== "ok" && ri.netfree && !ri.direct ? "nfcheck" : "queued";
         j.error = ""; j.updated = new Date().toISOString(); await putJSON(env, "job:" + j.videoId, j);
         if (j.status === "queued") wake();
       }
@@ -956,7 +1005,7 @@ async function state(env) {
   const pid = env.PROFILE || "main";
   const profile = await profileInfo(env, pid);
   const profiles = profile.admin ? [profile, ...Object.entries(profs).map(([id, v]) => ({ id, name: v.name, created: v.created,
-    netfree: !!v.netfree, vault: !!v.vault }))] : [];
+    netfree: !!v.netfree, vault: !!v.vault, direct: !!v.direct }))] : [];
   return { channels, jobs: jobs.slice(0, 200), logs: logs.slice(-LOG_CAP), agent, lastCheck, settings, pc, profile, profiles,
            renderUrl: env.RENDER_URL || "", now: new Date().toISOString() };
 }
@@ -1328,13 +1377,14 @@ async function dashboard(env) {
     </div>
     <div class="card hidden" id="profilesCard">
       <h2>${icon("users")}פרופילים</h2>
-      <p class="sub">לכל פרופיל קוד משלו (רק המנהל קובע ומשנה אותו), ותור, ערוצים והיסטוריה נפרדים לגמרי. <b>רק פתוח בנטפרי</b> — יורד רק מה שהתוכנה במחשב בדקה שנטפרי מאשר. <b>כספת</b> — בתוכנה למחשב הקבצים נשמרים מוצפנים.</p>
+      <p class="sub">לכל פרופיל קוד משלו (רק המנהל קובע ומשנה אותו), ותור, ערוצים והיסטוריה נפרדים לגמרי. <b>רק פתוח בנטפרי</b> — יורד רק מה שנטפרי מאשר. <b>מוריד מהמחשב</b> — ההורדה נעשית בתוכנה במחשב של המשתמש (לא בשרת, שיוטיוב חוסם): לפרופיל לא מוגבל, אם נכשל — עובר לשרת; לפרופיל "רק פתוח בנטפרי" ההורדה עצמה היא הבדיקה. <b>כספת</b> — הקבצים נשמרים מוצפנים.</p>
       <div id="profilesList"></div>
       <form class="grid" data-action="/profiles/add" style="margin-top:12px">
         <label class="field">שם<input name="name" placeholder="למשל: אחי" required></label>
         <label class="field">קוד לפרופיל<input name="password" type="password" minlength="4" required></label>
         <label class="field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" name="netfree" style="width:auto" checked>רק פתוח בנטפרי</label>
         <label class="field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" name="vault" style="width:auto">כספת מוצפנת</label>
+        <label class="field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" name="direct" style="width:auto">מוריד מהמחשב (לא מהשרת)</label>
         <div class="actions-row" style="align-self:end;margin:0"><button class="btn">${icon("add")}<span>צור פרופיל</span></button></div>
       </form>
     </div>
@@ -1544,7 +1594,7 @@ function render() {
   $("profilesList").innerHTML = (S.profiles || []).map((pr) =>
     '<div class="setting"><div class="avatar">' + esc(pr.name.charAt(0)) + '</div><div class="txt"><b>' + esc(pr.name) + '</b><span>' +
     (pr.admin ? "מנהל · הקוד הוא ADMIN_PASSWORD" : "נוצר " + ago(pr.created)) + '</span></div>' +
-    '<div class="pflags">' + (pr.admin ? "" : sw(pr, "netfree", "רק פתוח בנטפרי")) + sw(pr, "vault", "כספת") + '</div>' +
+    '<div class="pflags">' + (pr.admin ? "" : sw(pr, "netfree", "רק פתוח בנטפרי")) + sw(pr, "vault", "כספת") + sw(pr, "direct", "מוריד מהמחשב") + '</div>' +
     btn("profname", pr.id, "edit", "שינוי שם") + (pr.admin ? "" : btn("profcode", pr.id, "key", "קוד חדש") + btn("profdel", pr.id, "trash", "מחק פרופיל וכל הנתונים שלו", "danger")) + '</div>').join("");
   $("pcState").textContent = pcActive() ? "התוכנה פועלת עכשיו — היא מורידה." : "";
 }

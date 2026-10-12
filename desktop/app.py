@@ -352,7 +352,7 @@ class Downloader(threading.Thread):
             self.cfg["pid"] = pid
             self.save_state()
         changed = False
-        for k in ("name", "vault", "netfree"):
+        for k in ("name", "vault", "netfree", "direct"):
             v = prof.get(k) if k == "name" else bool(prof.get(k))
             if v is not None and self.cfg.get(k) != v:
                 self.cfg[k], changed = v, True
@@ -540,6 +540,8 @@ class Downloader(threading.Thread):
                 continue
             try:
                 st = self.status()
+                if self.cfg.get("direct"):
+                    self.direct_pass()           # this profile downloads on this computer
                 since = self.cfg.get("since") or ""
                 for job in st.get("jobs", []):
                     if job.get("status") != "done" or not job.get("fileUrl"):
@@ -590,6 +592,73 @@ class Downloader(threading.Thread):
                 self._batch = 0
         else:
             self._batch = 0
+
+    # -- downloading on this computer (profiles set to "מוריד מהמחשב")
+    # YouTube blocks most cloud addresses; a home computer isn't blocked. With
+    # NetFree on, a download that succeeds is already a NetFree-approved one.
+    def direct_pass(self) -> None:
+        r = self.s.post(self.base + "/pc/next", timeout=60)
+        if r.status_code != 200 or not r.headers.get("content-type", "").startswith("application/json"):
+            return
+        for job in r.json().get("jobs", []):
+            vid = job["videoId"]
+            try:
+                self._download_direct(job)
+                self.s.post(self.base + "/pc/done", json={"videoId": vid, "status": "done"}, timeout=30)
+            except Exception as e:
+                why = (str(e) or type(e).__name__)[:280]
+                self.log(f"ההורדה מהמחשב נכשלה ({job.get('title') or vid}): {why}")
+                self.s.post(self.base + "/pc/done", json={"videoId": vid, "status": "failed", "error": why}, timeout=30)
+
+    def _download_direct(self, job: dict) -> None:
+        import yt_dlp
+        vid = job["videoId"]
+        work = USERDATA / "pc-work" / vid
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            audio = job.get("mode") in ("m4a", "audio")
+            opts = {"outtmpl": str(work / "%(id)s.%(ext)s"), "noplaylist": True, "quiet": True, "no_warnings": True,
+                    "format": "ba[ext=m4a]/ba" if audio else "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+                    "merge_output_format": "mp4", "ffmpeg_location": ffmpeg_exe()}
+            if shutil.which("node"):
+                opts["js_runtimes"] = {"node": {}}          # YouTube's JavaScript challenge
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([job.get("url") or "https://www.youtube.com/watch?v=" + vid])
+            files = [p for p in work.iterdir() if p.is_file() and p.suffix not in (".part", ".ytdl")]
+            if not files:
+                raise RuntimeError("לא נוצר קובץ")
+            src = max(files, key=lambda p: p.stat().st_size)
+            title = "".join(c for c in (job.get("title") or src.stem) if c not in '<>:"/\\|?*').strip() or src.stem
+            final = work / (title + src.suffix)
+            if job.get("mode") == "audio":
+                mp3 = work / (title + ".mp3")
+                if ffmpeg_mp3(src, mp3):
+                    final = mp3
+            if final != src:
+                src.replace(final)
+            final = self._store(final, job)
+            self.state["got"].append(vid)
+            self.state["files"][vid] = str(final)
+            self.save_state()
+            self.pending_got.append(vid)
+            self.log("ירד למחשב" + ("" if self.cfg.get("vault_dir") else f": {final.name}"))
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _store(self, final: Path, job: dict) -> Path:
+        """Put a finished file where this profile keeps its files."""
+        if self.cfg.get("vault_dir"):
+            from vault import Vault
+            eid = Vault(self.cfg["vault_dir"]).add(final, {"videoId": job["videoId"], "title": job.get("title", ""),
+                                                          "mode": job.get("mode", "")})
+            return Path(self.cfg["vault_dir"]) / (eid + ".ytv")
+        folder = self.folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        dest = folder / final.name
+        if dest.exists():
+            dest = folder / f"{final.stem} ({job['videoId']}){final.suffix}"
+        return Path(shutil.move(str(final), str(dest)))
 
     def netfree_checks(self) -> None:
         """Admin's copy only: videos waiting for "is it open on NetFree?"
