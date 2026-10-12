@@ -158,7 +158,8 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
            "--no-warnings", "--no-quiet",
            # One progress line at a time, in a form run_ytdlp() can parse.
            "--progress", "--newline", "--progress-template",
-           "download:PROG %(progress._percent_str)s · %(progress._total_bytes_str)s · %(progress._speed_str)s",
+           "download:PROG %(progress._percent_str)s · %(progress._total_bytes_str,progress._total_bytes_estimate_str)s"
+           " · %(progress._speed_str)s · %(progress._eta_str)s",
            "--js-runtimes", "node", "--impersonate", "chrome",
            "--extractor-args", "youtube:player_client=web,ios,android",
            "--embed-thumbnail", "--embed-metadata"]
@@ -210,12 +211,21 @@ def upload_r2(path: Path) -> str | None:
     return TRACKER + "/files/" + urllib.request.quote(key)
 
 
+# Live progress of the job being worked on — served at GET /progress, which
+# the site polls to draw a progress panel. Not secret: id, stage and %.
+PROGRESS: dict = {}
+
+
+def set_progress(vid: str, **kw) -> None:
+    PROGRESS[vid] = {**PROGRESS.get(vid, {}), **kw, "t": time.time()}
+
+
 class _Result:
     def __init__(self, returncode: int, stdout: str, stderr: str):
         self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
 
 
-def run_ytdlp(cmd: list[str]) -> _Result:
+def run_ytdlp(cmd: list[str], vid: str = "") -> _Result:
     """Run yt-dlp and report progress to the log while it works: download %
     about once a minute, when conversion starts, and a heartbeat during long
     silent steps (ffmpeg converting an hour-long set on a small CPU)."""
@@ -239,9 +249,19 @@ def run_ytdlp(cmd: list[str]) -> _Result:
     t_err.start()
     threading.Thread(target=heartbeat, daemon=True).start()
     last_prog = 0.0
+    parts = 0
     for line in proc.stdout:
         line = line.rstrip("\n")
         if line.startswith("PROG "):
+            f = [x.strip() for x in line[5:].split("·")]
+            try:
+                pct = float(f[0].rstrip("%"))
+            except ValueError:
+                pct = None
+            if vid:
+                set_progress(vid, stage="download", pct=pct, size=f[1] if len(f) > 1 else "",
+                             speed=f[2] if len(f) > 2 else "", eta=f[3] if len(f) > 3 else "",
+                             part=max(parts, 1))
             finished = line.split("·")[0].strip().endswith("100.0%")
             if (finished and not state.get("logged100")) or (not finished and time.time() - last_prog >= 60):
                 say("   ⬇ " + line[5:].strip())
@@ -249,6 +269,10 @@ def run_ytdlp(cmd: list[str]) -> _Result:
                 state["logged100"] = finished
             continue
         out_lines.append(line)
+        if line.startswith("[download] Destination:"):
+            parts += 1  # video+audio downloads come in two parts
+        if vid and line.startswith(("[ExtractAudio]", "[Merger]", "[VideoRemuxer]")):
+            set_progress(vid, stage="convert", pct=None)
         if line.startswith(("[ExtractAudio]", "[Merger]", "[VideoRemuxer]")):
             say("   ⚙ ממיר/מאחד (בשרת חלש זה יכול לקחת כמה דקות)…")
     proc.wait()
@@ -258,13 +282,24 @@ def run_ytdlp(cmd: list[str]) -> _Result:
 
 
 def handle(job: dict) -> None:
+    try:
+        _handle(job)
+    finally:
+        PROGRESS.pop(job["videoId"], None)
+
+
+def _handle(job: dict) -> None:
+    vid = job["videoId"]
     log(f"-> מוריד: {job['title']} ({job['url']})")
+    set_progress(vid, stage="start", pct=None, started=time.time(), mode=job.get("mode", "audio"))
     OUT.mkdir(parents=True, exist_ok=True)
-    r = run_ytdlp(ytdlp_cmd(job, OUT))
+    r = run_ytdlp(ytdlp_cmd(job, OUT), vid)
     files = [Path(l.strip()) for l in r.stdout.splitlines()
              if l.strip().startswith(str(OUT)) and Path(l.strip()).is_file()]
     if files:
+        set_progress(vid, stage="zip", pct=None)
         f = to_zip(files[-1])
+        set_progress(vid, stage="finish", pct=100)
         try:
             url = upload_r2(f) or ""
         except Exception as e:  # keep the local file, still report success
@@ -298,7 +333,8 @@ def run_queue() -> int:
     """Process jobs until the queue is empty. Returns how many were handled."""
     done = 0
     while True:
-        jobs = api("/api/next?limit=3").get("jobs", [])
+        # One at a time, so "בהורדה" on the site means it's really in progress.
+        jobs = api("/api/next?limit=1").get("jobs", [])
         if not jobs:
             return done
         for job in jobs:
@@ -378,6 +414,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/progress":
+            now = time.time()
+            body = json.dumps({"busy": _busy.is_set(), "jobs": {
+                k: {**v, "elapsed": int(now - v.get("started", now))} for k, v in PROGRESS.items()}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")  # the site reads it
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if u.path in ("/", "/ping", "/healthz"):
             return self._send(200, "busy" if _busy.is_set() else "idle")
         if u.path == "/wake":
@@ -408,7 +456,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         line = re.sub(r"([?&]k=)[^ &\"]+", r"\1***", fmt % args)  # hide file keys
-        if "/ping" not in line and "/healthz" not in line and "HEAD " not in line:
+        if not any(x in line for x in ("/ping", "/healthz", "/progress", "HEAD ")):
             print("http:", line, flush=True)
 
 

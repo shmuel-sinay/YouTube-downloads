@@ -448,6 +448,15 @@ input:focus,select:focus{outline:none;border-color:var(--primary)}
 .logs .bad{color:var(--bad)}
 #toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);padding:10px 16px;border-radius:12px;display:none;max-width:90%}
 .login{max-width:380px;margin:12vh auto;text-align:center}
+.prog{margin-top:8px;background:var(--panel2);border-radius:10px;padding:8px 10px}
+.steps{display:flex;gap:4px;flex-wrap:wrap;font-size:.75rem;margin-bottom:6px}
+.step{padding:2px 8px;border-radius:999px;color:var(--muted);background:var(--bg)}
+.step.done{color:var(--ok)}.step.now{background:var(--primary);color:#202124;font-weight:600}
+.bar{height:8px;border-radius:999px;background:var(--bg);overflow:hidden}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--primary),var(--ok));border-radius:999px;transition:width .6s}
+.bar.busy>i{width:35%!important;animation:slide 1.4s ease-in-out infinite}
+@keyframes slide{0%{margin-inline-start:-35%}100%{margin-inline-start:100%}}
+.prog .nums{font-size:.78rem;color:var(--muted);margin-top:4px;direction:ltr;text-align:right}
 .logs .m{unicode-bidi:isolate}
 @media (max-width:600px){.job{flex-wrap:wrap}.job .info{flex-basis:calc(100% - 100px)}.thumb{width:80px;height:45px}
 .job .chip{margin-inline-start:92px}}
@@ -561,7 +570,8 @@ function render() {
     '<div class="job"><img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">' +
     '<div class="info"><div class="title" title="' + esc(j.title) + '">' + esc(j.title) + '</div>' +
     '<div class="muted">' + esc(j.channelName) + ' · ' + (MODES[j.mode] || MODES.audio) + ' · ' + ago(j.updated) + '</div>' +
-    (j.error ? '<div class="' + (j.status === "failed" ? "err" : "muted") + '">' + esc(j.error) + '</div>' : '') + '</div>' +
+    (j.error ? '<div class="' + (j.status === "failed" ? "err" : "muted") + '">' + esc(j.error) + '</div>' : '') +
+    (j.status === "taken" ? '<div class="prog" data-prog="' + esc(j.videoId) + '">' + progHtml(j.videoId) + '</div>' : '') + '</div>' +
     '<span class="chip ' + esc(j.status) + '">' + (STATUS[j.status] || esc(j.status)) + '</span>' +
     (j.fileUrl ? '<a class="btn small" href="' + esc(j.fileUrl) + '">⬇ הורדה</a>' : '') +
     (["failed", "skipped", "taken"].includes(j.status) ? '<button class="btn small ghost" data-retry="' + esc(j.videoId) + '">שוב</button>' : '') +
@@ -579,6 +589,32 @@ function render() {
     '<span dir="auto" class="m ' + (/ERROR|⚠|נכשל|\\[!\\]|שגיא/.test(l.msg) ? "bad" : "") + '">' + esc(l.msg) + '</span></div>').join("") : '<span class="t">אין עדיין לוגים</span>';
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
+
+// ---- live progress panel: read straight from the download server ----
+let P = {};
+const STAGES = [["start", "⏳ מתחיל"], ["download", "⬇ הורדה"], ["convert", "⚙ המרה"], ["zip", "📦 אריזה ל-zip"], ["finish", "✓ סיום"]];
+const mmss = (s) => Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+function progHtml(id) {
+  const p = P[id];
+  if (!p) return '<div class="muted">⏳ ממתין לשרת ההורדות…</div>';
+  const at = STAGES.findIndex(([k]) => k === p.stage);
+  const steps = STAGES.map(([k, label], i) => '<span class="step ' + (i < at ? "done" : i === at ? "now" : "") + '">' + label + '</span>').join("");
+  const known = p.stage === "download" && typeof p.pct === "number";
+  const bar = '<div class="bar' + (known ? "" : " busy") + '"><i style="width:' + (known ? p.pct : 0) + '%"></i></div>';
+  const nums = [known ? p.pct.toFixed(1) + "%" : "", p.stage === "download" && p.size ? p.size : "",
+    p.stage === "download" && p.speed ? p.speed : "", p.stage === "download" && p.eta && p.eta !== "NA" ? "ETA " + p.eta : "",
+    p.part > 1 ? "part " + p.part + "/2" : "", "⏱ " + mmss(p.elapsed || 0)].filter(Boolean).join(" · ");
+  return '<div class="steps">' + steps + '</div>' + bar + '<div class="nums">' + esc(nums) + '</div>';
+}
+async function pollProgress() {
+  if (!S.renderUrl || !S.jobs.some((j) => j.status === "taken")) return;
+  try {
+    const r = await fetch(S.renderUrl.replace(/\\/$/, "") + "/progress", { cache: "no-store" });
+    P = (await r.json()).jobs || {};
+  } catch (e) { return; }
+  document.querySelectorAll("[data-prog]").forEach((el) => { el.innerHTML = progHtml(el.dataset.prog); });
+}
+setInterval(pollProgress, 3000);
 
 async function refresh() {
   try { S = await (await fetch(B + "/status")).json(); render(); autoDownload(); } catch (e) {}
