@@ -121,6 +121,7 @@ def hello() -> None:
 
 
 LAST_ERR = ""  # last failure talking to the Worker — returned on /wake
+_job_profile: dict = {}  # profile of the job being worked on (sent back with every call)
 
 
 def api(path: str, body: dict | None = None) -> dict:
@@ -128,6 +129,8 @@ def api(path: str, body: dict | None = None) -> dict:
     agent sends back on /wake — so the site can show why even when the agent
     can't reach the Worker at all (wrong TRACKER_URL, blocked, bad token)."""
     global LAST_ERR
+    if body is not None and "profile" not in body and _job_profile.get("id"):
+        body = {**body, "profile": _job_profile["id"]}   # which profile's job this is
     req = urllib.request.Request(
         TRACKER + path, method="POST",
         data=json.dumps(body or {}).encode(),
@@ -375,10 +378,12 @@ def run_ytdlp(cmd: list[str], vid: str = "") -> _Result:
 
 
 def handle(job: dict) -> None:
+    _job_profile["id"] = job.get("profile") or "main"
     try:
         _handle(job)
     finally:
         PROGRESS.pop(job["videoId"], None)
+        _job_profile.clear()
 
 
 def handle_list(job: dict) -> None:
@@ -533,7 +538,8 @@ def run_queue() -> int:
             except Exception as e:
                 log(f"[!] {job.get('videoId')}: {e}")
                 try:
-                    api("/api/report", {"videoId": job["videoId"], "status": "failed", "error": str(e)[:200]})
+                    api("/api/report", {"videoId": job["videoId"], "status": "failed", "error": str(e)[:200],
+                                        "profile": job.get("profile") or "main"})
                 except Exception:
                     pass
             done += 1

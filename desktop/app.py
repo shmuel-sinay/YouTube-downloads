@@ -42,9 +42,11 @@ PROGRAMDATA = Path(os.environ.get("PROGRAMDATA") or r"C:\ProgramData")
 DATA = PROGRAMDATA / APP
 USERDATA = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / APP
 OLD_DATA = Path(os.environ.get("APPDATA") or Path.home()) / APP   # before all-users install
-CONFIG = DATA / "config.json"
-STATE = DATA / "state.json"
-LOGFILE = DATA / "app.log"
+CONFIG = DATA / "config.json"          # shared: site address only
+USERCFG = USERDATA / "user.json"       # this Windows user: profile login, folder, vault
+STATE = USERDATA / "state.json"        # this user's download history
+LOGFILE = USERDATA / "app.log"
+TMP = USERDATA / "tmp"                 # decrypted copies for playing — wiped on lock/exit
 DEFAULT_SITE = "https://my-gemini.g47ben.workers.dev"
 # Where new versions are published (GitHub release built by desktop.yml).
 RELEASE_API = "https://api.github.com/repos/shmuel-sinay/YouTube-downloads/releases/tags/desktop-latest"
@@ -67,6 +69,74 @@ def set_pref(key: str, value) -> None:
     prefs = load_json(PREFS, {})
     prefs[key] = value
     save_json(PREFS, prefs)
+
+
+# ---- the profile password is stored encrypted for this Windows user only
+# (DPAPI): another user of the computer can't read it from the file.
+
+def protect(text: str) -> str:
+    import base64
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+        data = text.encode("utf-8")
+        inp = BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_char)))
+        out = BLOB()
+        if not ctypes.windll.crypt32.CryptProtectData(ctypes.byref(inp), None, None, None, None, 0, ctypes.byref(out)):
+            raise OSError("CryptProtectData failed")
+        enc = ctypes.string_at(out.pbData, out.cbData)
+        ctypes.windll.kernel32.LocalFree(out.pbData)
+        return "dpapi:" + base64.b64encode(enc).decode()
+    except (AttributeError, OSError):
+        return "plain:" + base64.b64encode(text.encode()).decode()   # not Windows (tests)
+
+
+def unprotect(blob: str) -> str:
+    import base64
+    kind, _, b64 = (blob or "").partition(":")
+    raw = base64.b64decode(b64 or "")
+    if kind == "plain":
+        return raw.decode()
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    inp = BLOB(len(raw), ctypes.cast(ctypes.create_string_buffer(raw, len(raw)), ctypes.POINTER(ctypes.c_char)))
+    out = BLOB()
+    if not ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(inp), None, None, None, None, 0, ctypes.byref(out)):
+        raise OSError("CryptUnprotectData failed")
+    dec = ctypes.string_at(out.pbData, out.cbData)
+    ctypes.windll.kernel32.LocalFree(out.pbData)
+    return dec.decode("utf-8")
+
+
+def load_cfg() -> dict:
+    """Shared site address + this user's own settings (password decrypted)."""
+    shared = load_json(CONFIG, {})
+    user = load_json(USERCFG, {})
+    cfg = {"site": shared.get("site") or DEFAULT_SITE, **{k: v for k, v in user.items() if k != "password_enc"}}
+    try:
+        cfg["password"] = unprotect(user["password_enc"]) if user.get("password_enc") else ""
+    except Exception:
+        cfg["password"] = ""
+    return cfg
+
+
+def save_user_cfg(cfg: dict) -> None:
+    user = {k: v for k, v in cfg.items() if k not in ("password", "site")}
+    if cfg.get("password"):
+        user["password_enc"] = protect(cfg["password"])
+    save_json(USERCFG, user)
+    shared = load_json(CONFIG, {})
+    if cfg.get("site") and shared.get("site") != cfg["site"]:
+        shared["site"] = cfg["site"]
+    shared.pop("password", None)          # never keep a password in the shared file
+    shared.pop("folder", None)            # folders are per user now
+    save_json(CONFIG, shared)
 
 
 def load_json(path: Path, default):
@@ -99,7 +169,8 @@ def set_tk_icon(root) -> None:
 
 
 def first_run_setup(cfg: dict) -> dict:
-    """Ask for the site, password and folder (small Tk dialogs)."""
+    """Per Windows user: which profile (by its password), where files go,
+    and whether to keep them in an encrypted vault."""
     import tkinter as tk
     from tkinter import filedialog, messagebox, simpledialog
 
@@ -109,22 +180,43 @@ def first_run_setup(cfg: dict) -> dict:
     site = simpledialog.askstring(APP, "כתובת האתר:", initialvalue=cfg.get("site") or DEFAULT_SITE, parent=root)
     if not site:
         sys.exit(0)
-    password = simpledialog.askstring(APP, "הסיסמה של דף הערוצים (ADMIN_PASSWORD):", show="*", parent=root)
+    password = simpledialog.askstring(APP, "הסיסמה שלך לאתר (הפרופיל שלך):\n"
+                                      "התוכנה תוריד רק את מה שבפרופיל הזה.", show="*", parent=root)
     if not password:
         sys.exit(0)
-    messagebox.showinfo(APP, "עכשיו בחר תיקייה שאליה יירדו הקבצים.", parent=root)
-    # A shared folder by default, so every user of the computer sees the files.
-    shared = Path(os.environ.get("PUBLIC") or r"C:\Users\Public") / "Music" / APP
-    shared.mkdir(parents=True, exist_ok=True)
-    folder = filedialog.askdirectory(title="תיקיית הורדות", initialdir=str(shared), parent=root)
-    if not folder:
-        sys.exit(0)
-    unzip = messagebox.askyesno(APP, "לפתוח את קבצי ה-zip אוטומטית אחרי ההורדה?\n(כן = יישאר רק השיר/הסרטון עצמו)", parent=root)
+    vault_dir = ""
+    if messagebox.askyesno(APP, "לשמור את הקבצים שלך בכספת מוצפנת?\n\n"
+                           "בסייר של Windows יראו רק קבצים מקודדים בלי שמות, "
+                           "ופותחים אותם רק בתוכנה עם סיסמה.", parent=root):
+        messagebox.showinfo(APP, "בחר תיקייה ריקה לכספת.", parent=root)
+        vault_dir = filedialog.askdirectory(title="תיקיית הכספת", initialdir=str(Path.home()), parent=root)
+        if vault_dir:
+            from vault import Vault
+            v = Vault(vault_dir)
+            if not v.exists:
+                while True:
+                    p1 = simpledialog.askstring(APP, "בחר סיסמה לכספת (לפחות 6 תווים):", show="*", parent=root)
+                    if not p1:
+                        vault_dir = ""
+                        break
+                    p2 = simpledialog.askstring(APP, "הקלד שוב את סיסמת הכספת:", show="*", parent=root)
+                    if p1 == p2 and len(p1) >= 6:
+                        v.create(p1)
+                        messagebox.showinfo(APP, "הכספת נוצרה. אין דרך לשחזר את הסיסמה אם תישכח — שמור אותה.", parent=root)
+                        break
+                    messagebox.showwarning(APP, "הסיסמאות לא זהות או קצרות מדי.", parent=root)
+    folder = cfg.get("folder") or ""
+    if not vault_dir:
+        messagebox.showinfo(APP, "בחר תיקייה שאליה יירדו הקבצים.", parent=root)
+        default = Path.home() / "Music" / APP
+        default.mkdir(parents=True, exist_ok=True)
+        folder = filedialog.askdirectory(title="תיקיית הורדות", initialdir=str(default), parent=root) or str(default)
     old = messagebox.askyesno(APP, "להוריד גם קבצים שכבר מוכנים עכשיו בתור?\n(לא = רק מה שיסתיים מעכשיו)", parent=root)
     root.destroy()
-    cfg.update(site=site.rstrip("/"), password=password, folder=folder, unzip=unzip,
-               include_existing=old, since="" if old else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    save_json(CONFIG, cfg)
+    cfg.update(site=site.rstrip("/"), password=password, folder=folder or str(USERDATA / "files"),
+               vault_dir=vault_dir, unzip=True, include_existing=old,
+               since="" if old else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    save_user_cfg(cfg)
     return cfg
 
 
@@ -209,7 +301,9 @@ class Downloader(threading.Thread):
             self._download(job)
 
     def _download(self, job: dict) -> None:
-        folder = Path(self.cfg["folder"])
+        # With a vault, files land in a private staging folder and are
+        # encrypted straight away; otherwise in the chosen folder.
+        folder = (USERDATA / "incoming") if self.cfg.get("vault_dir") else Path(self.cfg["folder"])
         folder.mkdir(parents=True, exist_ok=True)
         url = job["fileUrl"]
         name = job.get("fileName") or urllib.parse.unquote(urllib.parse.urlparse(url).path.split("/")[-1])
@@ -236,11 +330,17 @@ class Downloader(threading.Thread):
                 final = folder / names[0] if names else folder
             except zipfile.BadZipFile:
                 pass  # keep the file as it is
+        if self.cfg.get("vault_dir") and final.is_file():
+            from vault import Vault
+            eid = Vault(self.cfg["vault_dir"]).add(final, {"videoId": job["videoId"], "title": job.get("title", ""),
+                                                          "mode": job.get("mode", "")})
+            self.log(f"נשמר בכספת: {final.name}", remote=False)
+            final = Path(self.cfg["vault_dir"]) / (eid + ".ytv")
         self.state["got"].append(job["videoId"])
         self.state["files"][job["videoId"]] = str(final)
         self.save_state()
         self.pending_got.append(job["videoId"])
-        self.log(f"ירד למחשב: {final.name}")
+        self.log("ירד למחשב" + ("" if self.cfg.get("vault_dir") else f": {final.name}"))
 
     def convert_to_mp3(self, zpath: Path, folder: Path) -> Path:
         """The server sent the original audio (no MP3 encode, to save its
@@ -287,6 +387,12 @@ class Downloader(threading.Thread):
             self.log(f"אין חיבור לאתר: {e}", remote=False)
         lock = DownloadLock()
         while True:
+            if lock.name is None:
+                try:
+                    lock.name = (self.status().get("profile") or {}).get("id") or "main"
+                except Exception:
+                    time.sleep(POLL_SECONDS)
+                    continue
             if not lock.acquire():
                 # Another user's copy is downloading for this computer; this
                 # copy still shows notifications to its own user.
@@ -648,17 +754,18 @@ def listen_for_show(show) -> None:
 
 
 class DownloadLock:
-    """Only one copy on the computer downloads at a time (two users logged
-    in at once would otherwise fetch the same files into the shared folder)."""
+    """Only one copy per profile downloads at a time (the same profile open
+    in two Windows sessions would otherwise fetch everything twice)."""
     def __init__(self):
         self.fh = None
+        self.name: str | None = None      # profile id, known after the first status
 
     def acquire(self) -> bool:
         if self.fh:
             return True
         try:
             import msvcrt
-            fh = open(DATA / "downloader.lock", "a+")
+            fh = open(DATA / f"downloader-{self.name or 'main'}.lock", "a+")
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             self.fh = fh
             return True
@@ -682,11 +789,25 @@ class Api:
         return self.dl.download_now(vid)
 
     def open_folder(self) -> None:
-        os.startfile(self.cfg["folder"])
+        if self.cfg.get("vault_dir"):
+            open_vault_window(self.cfg)
+        else:
+            os.startfile(self.cfg["folder"])
+
+    def open_vault(self) -> bool:
+        open_vault_window(self.cfg)
+        return True
+
+    def has_vault(self) -> bool:
+        return bool(self.cfg.get("vault_dir"))
 
     def show_file(self, vid: str) -> bool:
-        """Open the downloads folder with this video's file selected."""
+        """Open the downloads folder with this video's file selected (or the
+        vault, for files kept there)."""
         path = self.dl.state.get("files", {}).get(vid)
+        if path and path.endswith(".ytv"):
+            open_vault_window(self.cfg)
+            return True
         if path and Path(path).exists():
             subprocess.Popen(["explorer", "/select,", path])
             return True
@@ -716,7 +837,8 @@ class Api:
         return [v for v, p in self.dl.state.get("files", {}).items() if Path(p).exists()]
 
     def app_info(self) -> dict:
-        return {"folder": self.cfg["folder"], "version": bundled_version()[:7], "autostart": get_autostart(),
+        return {"folder": "כספת מוצפנת" if self.cfg.get("vault_dir") else self.cfg["folder"],
+                "vault": bool(self.cfg.get("vault_dir")), "version": bundled_version()[:7], "autostart": get_autostart(),
                 "notify": get_pref("notify", "each")}
 
     def get_notify(self) -> str:
@@ -730,6 +852,34 @@ class Api:
     def set_autostart(self, on: bool) -> bool:
         set_autostart(bool(on))
         return get_autostart()
+
+
+_VAULT = {}
+
+
+def open_vault_window(cfg: dict) -> None:
+    """One vault window per app; showing it again just brings it forward."""
+    import webview
+    from vault_ui import VAULT_HTML, VaultApi
+    w = _VAULT.get("win")
+    if w is not None:
+        try:
+            w.show()
+            w.restore()
+            return
+        except Exception:
+            pass
+    api = _VAULT.get("api") or VaultApi(cfg, TMP)
+    _VAULT["api"] = api
+    w = webview.create_window("הכספת — מעקב ערוצים", html=VAULT_HTML, js_api=api, width=900, height=640,
+                              min_size=(420, 420), background_color="#0e1015")
+    api.window = w
+
+    def closed():
+        api.lock()                       # closing the vault window locks it
+        _VAULT.pop("win", None)
+    w.events.closed += closed
+    _VAULT["win"] = w
 
 
 def make_tray(on_open, on_quit, cfg: dict):
@@ -748,7 +898,8 @@ def make_tray(on_open, on_quit, cfg: dict):
         menu = pystray.Menu(
             pystray.MenuItem("פתח", lambda: on_open(), default=True),
             pystray.MenuItem("התראות", notify_menu),
-            pystray.MenuItem("פתח את תיקיית ההורדות", lambda: os.startfile(cfg["folder"])),
+            pystray.MenuItem("פתח כספת" if cfg.get("vault_dir") else "פתח את תיקיית ההורדות",
+                             lambda: open_vault_window(cfg) if cfg.get("vault_dir") else os.startfile(cfg["folder"])),
             pystray.MenuItem("יציאה", lambda: on_quit()))
         return pystray.Icon(APP, img, "מעקב ערוצים — מוריד ברקע", menu)
     except Exception:
@@ -786,6 +937,8 @@ def open_window(cfg: dict, dl: "Downloader", background: bool) -> None:
 
     def quit_app():
         state["quit"] = True
+        if _VAULT.get("api"):
+            _VAULT["api"].lock()
         if tray:
             tray.stop()
         win.destroy()
@@ -917,8 +1070,16 @@ def main() -> None:
             return                       # the new version is starting
     except Exception:
         traceback.print_exc()            # an update problem must never stop the app
-    cfg = load_json(CONFIG, {})
-    if "--setup" in sys.argv or not all(cfg.get(k) for k in ("site", "password", "folder")):
+    # Older versions kept the password in the shared file — remove it there;
+    # each user now signs in to their own profile (stored only for them).
+    shared = load_json(CONFIG, {})
+    if "password" in shared or "folder" in shared:
+        save_json(CONFIG, {"site": shared.get("site") or DEFAULT_SITE})
+    if not STATE.exists() and (DATA / "state.json").exists():
+        shutil.copy2(DATA / "state.json", STATE)
+    shutil.rmtree(TMP, ignore_errors=True)      # decrypted leftovers from last time
+    cfg = load_cfg()
+    if "--setup" in sys.argv or not cfg.get("password") or not (cfg.get("folder") or cfg.get("vault_dir")):
         cfg = first_run_setup(cfg)
     dl = Downloader(cfg)
     dl.start()

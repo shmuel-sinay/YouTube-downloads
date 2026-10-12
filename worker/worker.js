@@ -38,7 +38,10 @@ export default {
     }
   },
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(checkAllChannels(env).then(() => wakeAgent(env)));
+    ctx.waitUntil((async () => {
+      for (const pid of await profileIds(env)) await checkAllChannels(profileEnv(env, pid));
+      await wakeAgent(env);
+    })());
   },
 };
 
@@ -194,6 +197,28 @@ async function wakeAgent(env) {
   return res;
 }
 
+// ---------- profiles ----------
+// "main" is the admin (ADMIN_PASSWORD) and keeps the original, unprefixed
+// keys. Every other profile has its own copy of everything under
+// "p:<id>:" — channels, queue, history, log, settings. "agent" and the
+// profile list itself stay global.
+const GLOBAL_KEYS = new Set(["agent", "profiles"]);
+
+function profileEnv(env, pid) {
+  if (!pid || pid === "main") return { ...env, PROFILE: "main" };
+  const pre = "p:" + pid + ":";
+  const k = (key) => (GLOBAL_KEYS.has(key) ? key : pre + key);
+  return { ...env, PROFILE: pid, DB: {
+    get: (key) => env.DB.get(k(key)),
+    put: (key, v) => env.DB.put(k(key), v),
+    delete: (key) => env.DB.delete(k(key)),
+  } };
+}
+
+async function profileIds(env) {
+  return ["main", ...Object.keys(await getJSON(env, "profiles", {}))];
+}
+
 // ---------- auth ----------
 
 async function sha256(s) {
@@ -201,11 +226,28 @@ async function sha256(s) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function isAdmin(req, env) {
-  if (!env.ADMIN_PASSWORD) return false;
+async function profileToken(env, pid) {
+  if (pid === "main") return sha256("yt-tracker:main:" + env.ADMIN_PASSWORD);
+  const prof = (await getJSON(env, "profiles", {}))[pid];
+  return prof ? sha256("yt-tracker:" + pid + ":" + prof.hash) : null;
+}
+
+// Which profile is logged in (cookie "auth=<profile>.<token>"), or null.
+async function whoIs(req, env) {
+  if (!env.ADMIN_PASSWORD) return null;
   const c = req.headers.get("Cookie") || "";
-  const m = c.match(/(?:^|;\s*)auth=([a-f0-9]{64})/);
-  return !!m && m[1] === await sha256("yt-tracker:" + env.ADMIN_PASSWORD);
+  const m = c.match(/(?:^|;\s*)auth=([\w-]+)\.([a-f0-9]{64})/);
+  if (m && m[2] === await profileToken(env, m[1])) return m[1];
+  const legacy = c.match(/(?:^|;\s*)auth=([a-f0-9]{64})(?:;|$)/);   // cookie from before profiles
+  if (legacy && legacy[1] === await sha256("yt-tracker:" + env.ADMIN_PASSWORD)) return "main";
+  return null;
+}
+
+async function loginProfile(env, password) {
+  if (env.ADMIN_PASSWORD && password === env.ADMIN_PASSWORD) return "main";
+  const h = await sha256("pw:" + password);
+  const profs = await getJSON(env, "profiles", {});
+  return Object.keys(profs).find((id) => profs[id].hash === h) || null;
 }
 
 function isAgent(req, env) {
@@ -255,10 +297,14 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       // A (re)started agent has lost whatever it was working on — Render's
       // disk is wiped on every restart/deploy. Put those jobs back in line
       // instead of leaving them "בהורדה" for hours.
-      const stuck = (await listJobs(env)).filter((j) => j.status === "taken");
-      for (const j of stuck) {
-        j.status = "queued"; j.updated = new Date().toISOString();
-        await putJSON(env, "job:" + j.videoId, j);
+      let stuck = [];
+      for (const pid of await profileIds(env)) {
+        const penv = profileEnv(env, pid);
+        for (const j of (await listJobs(penv)).filter((x) => x.status === "taken")) {
+          j.status = "queued"; j.updated = new Date().toISOString();
+          await putJSON(penv, "job:" + j.videoId, j);
+          stuck.push(j);
+        }
       }
       if (stuck.length) await addLog(env, "worker", `השרת עלה מחדש — ${stuck.length} משימות שהיו בהורדה חזרו לתור`);
       return json({ ok: true });
@@ -270,20 +316,25 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     }
     if (p === "/api/next" && req.method === "POST") {
       const limit = Math.min(+(url.searchParams.get("limit") || 3), 20);
-      const settings = await getJSON(env, "settings", {});
       const now = Date.now();
       const out = [];
-      // "⏫ הורד עכשיו" jobs first (newest bump wins), then oldest first.
-      const ordered = (await listJobs(env)).reverse()
-        .sort((a, b) => (b.priority || 0) - (a.priority || 0));
-      for (const j of ordered) {
+      // Jobs from every profile. "⏫ הורד עכשיו" first (newest bump wins),
+      // then oldest first.
+      const all = [];
+      for (const pid of await profileIds(env)) {
+        const penv = profileEnv(env, pid);
+        const settings = await getJSON(penv, "settings", {});
+        for (const j of (await listJobs(penv)).reverse()) all.push({ j, pid, penv, settings });
+      }
+      all.sort((a, b) => (b.j.priority || 0) - (a.j.priority || 0));
+      for (const { j, pid, penv, settings } of all) {
         const stale = j.status === "taken" && now - Date.parse(j.updated) > CLAIM_TIMEOUT_MS;
         if (j.status !== "queued" && !stale) continue;
-        j.status = "taken"; j.updated = new Date().toISOString();
+        j.status = "taken"; j.updated = new Date().toISOString(); j.profile = pid;
         // "Convert on the PC": the server skips the slow MP3 encode and the
         // desktop app converts after downloading.
-        j.pcConvert = j.mode === "audio" && !!settings.pcConvert;
-        await putJSON(env, "job:" + j.videoId, j);
+        j.pcConvert = j.mode === "audio";   // the server never encodes MP3 — the app does
+        await putJSON(penv, "job:" + j.videoId, j);
         out.push(j);
         if (out.length >= limit) break;
       }
@@ -293,6 +344,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (p === "/api/enqueue" && req.method === "POST") {
       // Videos found by a 'list' job. Skip ones already in the list.
       const b = await req.json();
+      env = profileEnv(env, b.profile);
       const known = new Set(await getJobIds(env));
       const fresh = (b.items || []).filter((it) => it.videoId && !known.has(it.videoId)).map((it) => ({
         videoId: it.videoId, channelId: b.channelId || "", channelName: b.channelName || "",
@@ -307,11 +359,13 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (p === "/api/check" && req.method === "POST") {
       // The agent asks every few seconds whether its job was cancelled.
       const b = await req.json();
+      env = profileEnv(env, b.profile);
       const j = await getJSON(env, "job:" + b.videoId, null);
       return json({ status: j ? j.status : "missing" });
     }
     if (p === "/api/report" && req.method === "POST") {
       const b = await req.json();
+      env = profileEnv(env, b.profile);
       const j = await getJSON(env, "job:" + b.videoId, null);
       if (!j) return json({ error: "no such job" }, 404);
       if (j.status === "cancelled") return json({ ok: true, ignored: "cancelled" });
@@ -330,15 +384,52 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   // --- login ---
   if (p === "/login" && req.method === "POST") {
     const f = await req.formData();
-    if (env.ADMIN_PASSWORD && f.get("password") === env.ADMIN_PASSWORD) {
-      const tok = await sha256("yt-tracker:" + env.ADMIN_PASSWORD);
-      return redirect(BASE + "/", { "Set-Cookie": `auth=${tok}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000` });
+    const pid = await loginProfile(env, String(f.get("password") || ""));
+    if (pid) {
+      const tok = await profileToken(env, pid);
+      return redirect(BASE + "/", { "Set-Cookie": `auth=${pid}.${tok}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000` });
     }
     return page("כניסה", loginForm("סיסמה שגויה"));
   }
-  if (!(await isAdmin(req, env))) {
+  if (p === "/logout") {
+    return redirect(BASE + "/", { "Set-Cookie": "auth=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0" });
+  }
+  const pid = await whoIs(req, env);
+  if (!pid) {
     if (!env.ADMIN_PASSWORD) return page("הגדרה חסרה", "<p>חסר Secret בשם <b>ADMIN_PASSWORD</b> ב-Worker. ראה README.</p>");
     return page("כניסה", loginForm(""));
+  }
+  const rootEnv = env;
+  env = profileEnv(env, pid);   // from here on everything is this profile's own data
+  if (p === "/profiles/add" && req.method === "POST" && pid === "main") {
+    const f = await req.formData();
+    const name = String(f.get("name") || "").trim().slice(0, 40), pw = String(f.get("password") || "");
+    if (!name || pw.length < 4) return new Response("שם וסיסמה (לפחות 4 תווים) נדרשים", { status: 400 });
+    if (pw === env.ADMIN_PASSWORD || await loginProfile(rootEnv, pw)) return new Response("הסיסמה כבר בשימוש", { status: 400 });
+    const profs = await getJSON(rootEnv, "profiles", {});
+    const id = "u" + Date.now().toString(36);
+    profs[id] = { name, hash: await sha256("pw:" + pw), created: new Date().toISOString() };
+    await putJSON(rootEnv, "profiles", profs);
+    await addLog(env, "worker", `נוצר פרופיל: ${name}`);
+    return json({ ok: true, id });
+  }
+  if (p === "/profiles/remove" && req.method === "POST" && pid === "main") {
+    // Removes the profile and all of its data.
+    const f = await req.formData(), id = String(f.get("id") || "");
+    const profs = await getJSON(rootEnv, "profiles", {});
+    if (profs[id]) {
+      const name = profs[id].name;
+      delete profs[id];
+      await putJSON(rootEnv, "profiles", profs);
+      let cursor;
+      do {
+        const r = await rootEnv.DB.list({ prefix: "p:" + id + ":", cursor });
+        for (const k of r.keys) await rootEnv.DB.delete(k.name);
+        cursor = r.list_complete ? null : r.cursor;
+      } while (cursor);
+      await addLog(env, "worker", `נמחק פרופיל: ${name}`);
+    }
+    return json({ ok: true });
   }
 
   // --- files from R2 (optional) ---
@@ -561,8 +652,10 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
 
 // Download kinds. "m4a" keeps YouTube's own audio (no MP3 conversion), which
 // is many times faster on a small server.
-const MODES = { audio: "שיר · MP3", m4a: "שיר מהיר · M4A", video: "סרטון · MP4" };
-const modeOf = (v) => (v in MODES ? v : "audio");
+// MP3 is only made by the desktop app (it converts in seconds; the free
+// server would take many minutes), so it's offered only while the app runs.
+const MODES = { video: "סרטון · MP4", m4a: "שיר מהיר · M4A", audio: "שיר · MP3 (המרה בתוכנה)" };
+const modeOf = (v) => (v in MODES ? v : "video");
 
 const STATUS = { queued: "ממתין", taken: "בהורדה", done: "הושלם", failed: "נכשל", skipped: "דולג", cancelled: "בוטל", paused: "מושהה" };
 
@@ -571,7 +664,11 @@ async function state(env) {
   const [channels, jobs, logs, agent, lastCheck, settings, pc] = await Promise.all([
     getChannels(env), listJobs(env), getJSON(env, "logs", []),
     getJSON(env, "agent", {}), getJSON(env, "lastCheck", null), getJSON(env, "settings", {}), getJSON(env, "pc", {})]);
-  return { channels, jobs: jobs.slice(0, 200), logs: logs.slice(-LOG_CAP), agent, lastCheck, settings, pc,
+  const profs = await getJSON(env, "profiles", {});
+  const pid = env.PROFILE || "main";
+  const profile = { id: pid, name: pid === "main" ? "מנהל" : (profs[pid] || {}).name || pid, admin: pid === "main" };
+  const profiles = profile.admin ? Object.entries(profs).map(([id, v]) => ({ id, name: v.name, created: v.created })) : [];
+  return { channels, jobs: jobs.slice(0, 200), logs: logs.slice(-LOG_CAP), agent, lastCheck, settings, pc, profile, profiles,
            renderUrl: env.RENDER_URL || "", now: new Date().toISOString() };
 }
 
@@ -607,6 +704,10 @@ const IC = {
   alert: '<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>',
   link: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/>',
   monitor: '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/>',
+  users: '<circle cx="9" cy="8" r="4"/><path d="M1 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1M16 4a4 4 0 0 1 0 8M23 21v-1a6 6 0 0 0-4-5.6"/>',
+  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
+  lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
 };
 const icon = (n, cls = "") => `<svg class="i ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${IC[n] || ""}</svg>`;
 
@@ -762,6 +863,7 @@ async function dashboard(env) {
   <button class="nav" data-page="add">${icon("add")}<span>הוספה</span></button>
   <button class="nav" data-page="logs">${icon("logs")}<span>לוגים</span></button>
   <button class="nav" data-page="settings">${icon("settings")}<span>הגדרות</span></button>
+  <button class="nav hidden" id="vaultNav" type="button">${icon("lock")}<span>כספת</span></button>
   <div class="grow"></div>
   <a class="nav extra" href="/">${icon("chat")}<span>Gemini</span></a>
 </aside>
@@ -770,6 +872,8 @@ async function dashboard(env) {
     <h1 id="pageTitle">תור הורדות</h1>
     <span class="status"><span class="dot" id="agentDot"></span><span id="agentText">…</span></span>
     <button class="btn ghost" id="wakeBtn" type="button">${icon("zap")}<span>הער שרת</span></button>
+    <span class="status" title="מחובר כ">${icon("user")}<span id="profileName"></span></span>
+    <a class="ibtn" href="${BASE}/logout" title="התנתק">${icon("logout")}</a>
   </div>
   <div class="content">
 
@@ -848,10 +952,18 @@ async function dashboard(env) {
   <section data-p="settings" class="hidden">
     <div class="card">
       <h2>${icon("settings")}הורדה והמרה</h2>
-      <div class="setting"><div class="txt"><b>המרה ל-MP3 במחשב</b><span>השרת מוריד את השמע המקורי בלי להמיר, והתוכנה במחשב ממירה תוך שניות. דורש את התוכנה למחשב.</span></div>
-        <label class="switch"><input type="checkbox" id="pcConvert"><i></i></label></div>
       <div class="setting"><div class="txt"><b>הורדה אוטומטית בדפדפן</b><span>כשהדף פתוח בדפדפן, כל קובץ שמוכן יורד לבד — רק כשהתוכנה למחשב לא פועלת, כדי שלא יירד פעמיים. <b id="pcState" style="display:inline"></b></span></div>
         <label class="switch"><input type="checkbox" id="autoDl"><i></i></label></div>
+    </div>
+    <div class="card hidden" id="profilesCard">
+      <h2>${icon("users")}פרופילים</h2>
+      <p class="sub">לכל פרופיל סיסמה משלו, ותור, ערוצים והיסטוריה נפרדים לגמרי. מי שנכנס עם סיסמת פרופיל רואה רק את שלו.</p>
+      <div id="profilesList"></div>
+      <form class="grid" data-action="/profiles/add" style="margin-top:12px">
+        <label class="field">שם<input name="name" placeholder="למשל: אחי" required></label>
+        <label class="field">סיסמה לפרופיל<input name="password" type="password" minlength="4" required></label>
+        <div class="actions-row" style="align-self:end;margin:0"><button class="btn">${icon("add")}<span>צור פרופיל</span></button></div>
+      </form>
     </div>
     <div class="card hidden" id="desktopCard">
       <h2>${icon("monitor")}התוכנה למחשב</h2>
@@ -968,7 +1080,18 @@ function render() {
   box.innerHTML = S.logs.length ? S.logs.map((l) => '<div class="l"><span class="t">' + hhmm(l.t) + '</span>  <span class="src s-' + esc(l.src) + '">' + esc(l.src) + '</span> ' +
     '<span dir="auto" class="m' + (/ERROR|⚠|נכשל|\\[!\\]|שגיא/.test(l.msg) ? " bad" : "") + '">' + esc(l.msg) + '</span></div>').join("") : '<span class="t">אין עדיין לוגים</span>';
   if (atBottom) box.scrollTop = box.scrollHeight;
-  $("pcConvert").checked = !!(S.settings && S.settings.pcConvert);
+  // MP3 only while the desktop app is running (it does the conversion).
+  const mp3ok = !!APP() || pcActive();
+  document.querySelectorAll('select[name=mode] option[value=audio]').forEach((o) => {
+    o.disabled = !mp3ok; o.textContent = mp3ok ? MODES.audio : "שיר · MP3 — זמין רק כשהתוכנה למחשב פועלת";
+    if (!mp3ok && o.selected) o.parentNode.value = "video";
+  });
+  $("profileName").textContent = (S.profile && S.profile.name) || "";
+  $("profilesCard").classList.toggle("hidden", !(S.profile && S.profile.admin));
+  $("profilesList").innerHTML = (S.profiles || []).length ? S.profiles.map((pr) =>
+    '<div class="setting"><div class="avatar">' + esc(pr.name.charAt(0)) + '</div><div class="txt"><b>' + esc(pr.name) + '</b><span>נוצר ' + ago(pr.created) + '</span></div>' +
+    btn("profdel", pr.id, "trash", "מחק פרופיל וכל הנתונים שלו", "danger") + '</div>').join("")
+    : '<div class="sub" style="margin:0">אין עדיין פרופילים נוספים.</div>';
   $("pcState").textContent = pcActive() ? "התוכנה פועלת עכשיו — היא מורידה." : "";
 }
 
@@ -989,7 +1112,8 @@ async function pollProgress() {
 document.querySelectorAll("form[data-action]").forEach((f) => f.onsubmit = async (e) => {
   e.preventDefault();
   const b = f.querySelector("button"); b.disabled = true;
-  try { await post(f.dataset.action, new FormData(f)); f.reset(); toast("נוסף לתור"); showPage("queue"); await refresh(); }
+  const prof = f.dataset.action.startsWith("/profiles");
+  try { await post(f.dataset.action, new FormData(f)); f.reset(); toast(prof ? "הפרופיל נוצר" : "נוסף לתור"); if (!prof) showPage("queue"); await refresh(); }
   catch (err) { toast("שגיאה: " + err.message, 8000); }
   b.disabled = false;
 });
@@ -1000,6 +1124,10 @@ document.addEventListener("click", async (e) => {
   try {
     if (act === "cancel" && !confirm("לבטל את ההורדה?")) return;
     if (act === "remove" && !confirm("להסיר את הערוץ מהמעקב?")) return;
+    if (act === "profdel") {
+      if (!confirm("למחוק את הפרופיל וכל התור, הערוצים וההיסטוריה שלו?")) return;
+      await post("/profiles/remove", d); toast("הפרופיל נמחק"); refresh(); return;
+    }
     if (act === "delete") {
       const job = S.jobs.find((x) => x.videoId === id) || {};
       if (!confirm("למחוק מההיסטוריה את: " + (job.title || id) + "?")) return;
@@ -1045,12 +1173,6 @@ $("copyLogs").onclick = async () => {
     const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); }
   toast("הלוג הועתק");
 };
-$("pcConvert").onchange = async (e) => {
-  try { await fetch(B + "/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pcConvert: e.target.checked }) });
-        toast(e.target.checked ? "שירים יומרו ל-MP3 בתוכנה במחשב" : "שירים יומרו ל-MP3 בשרת"); refresh(); }
-  catch (x) { toast("שגיאה: " + x); }
-};
-
 // ---------- browser auto-download (not needed inside the desktop app) ----------
 const store = (k, v) => { try { v === undefined ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} };
 const load = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
@@ -1081,6 +1203,7 @@ async function initDesktop() {
   try {
     const info = await APP().app_info();
     $("desktopCard").classList.remove("hidden");
+    if (info.vault) { $("vaultNav").classList.remove("hidden"); $("vaultNav").onclick = () => APP().open_vault(); }
     $("folderPath").textContent = info.folder; $("appVersion").textContent = info.version || "פיתוח";
     $("autostart").checked = !!info.autostart;
     $("autostart").onchange = async (e) => { await APP().set_autostart(e.target.checked); toast(e.target.checked ? "תעלה עם Windows" : "לא תעלה עם Windows"); };

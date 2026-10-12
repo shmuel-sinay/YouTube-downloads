@@ -8,3 +8,5 @@ imageio-ffmpeg
 # Tray icon (keeps running in the background) + loading the icon for it
 pystray
 pillow
+# Encrypted vault (AES-GCM + X25519)
+cryptography
