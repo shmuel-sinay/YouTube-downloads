@@ -262,6 +262,10 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
     Chrome TLS impersonation, and the bgutil PO-Token plugin (sidecar)."""
     cmd = ["yt-dlp", job["url"], "--no-playlist",
            "--retries", "8", "--fragment-retries", "8", "--extractor-retries", "3",
+           # Fetch the media in 4MB pieces: a long video arrives as one big
+           # answer otherwise, and the free server's 512MB runs out mid-download
+           # (→ Render restarts the server again and again).
+           "--http-chunk-size", "4M", "--buffer-size", "64K",
            "--output", str(out_dir / "%(title)s [%(id)s].%(ext)s"),
            "--print", "after_move:filepath",
            "--print", "before_dl:DUR %(duration)s",   # for conversion %
@@ -594,9 +598,15 @@ def _handle(job: dict) -> None:
     # routes and client types before giving up, and say in the log which
     # one worked.
     nc = _without(cmd, "--cookies") if "--cookies" in cmd else cmd
-    # Order = what got through on Render (via WARP): tv_simply first.
-    tries = [("לקוח tv_simply (בלי עוגיות)", _with_clients(nc, "tv_simply")),
-             ("לקוח android_vr (בלי עוגיות)", _with_clients(nc, "android_vr")),
+    # The no-cookie clients don't need Chrome impersonation; without it the
+    # download is plain streaming (less memory on the free server).
+    light = _without(nc, "--impersonate")
+    # Order: visionos first — it gets direct stream links (no signature, no
+    # n-challenge, no PO token → no Node run, nothing to 403 on); then
+    # tv_simply, which got through on Render via WARP.
+    tries = [("לקוח visionos (בלי עוגיות)", _with_clients(light, "visionos")),
+             ("לקוח tv_simply (בלי עוגיות)", _with_clients(light, "tv_simply")),
+             ("לקוח android_vr (בלי עוגיות)", _with_clients(light, "android_vr")),
              ("", cmd),
              ("לקוח tv", _with_clients(cmd, "tv")),
              ("לקוח web_safari", _with_clients(cmd, "web_safari"))]
@@ -804,21 +814,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def youtube_selftest() -> None:
-    """On startup, once: does the first route (WARP + tv_simply) get past
+    """On startup, once: does the first route (WARP + visionos) get past
     YouTube? One light check (no download), skipped while a job runs — the
     free server has only 512MB."""
     time.sleep(20)
     if _current.get("proc") and _current["proc"].poll() is None:
         return
     cmd = ["yt-dlp", "https://www.youtube.com/watch?v=jNQXAC9IVRw", "--simulate", "--no-playlist",
-           "--no-warnings", "-q", "--js-runtimes", "node", "--impersonate", "chrome",
-           "--extractor-args", "youtube:player_client=tv_simply"] + net_args()
+           "--no-warnings", "-q",
+           "--extractor-args", "youtube:player_client=visionos"] + net_args()
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         res = "✓" if r.returncode == 0 else "✗" + (" (not a bot)" if "not a bot" in r.stderr else "")
     except Exception:
         res = "✗ (timeout)"
-    log(f"בדיקת יוטיוב ({'WARP' if warp_up() else 'ישיר'}, tv_simply): {res}")
+    log(f"בדיקת יוטיוב ({'WARP' if warp_up() else 'ישיר'}, visionos): {res}")
 
 
 def serve() -> int:

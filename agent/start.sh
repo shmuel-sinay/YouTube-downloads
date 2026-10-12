@@ -20,7 +20,8 @@ if [ "${USE_WARP:-1}" = "1" ]; then
       wgcf register --accept-tos > /tmp/warp.log 2>&1 && wgcf generate >> /tmp/warp.log 2>&1 || exit 1
     fi
     printf 'WGConfig = /tmp/wgcf-profile.conf\n\n[Socks5]\nBindAddress = 127.0.0.1:40000\n' > /tmp/wireproxy.conf
-    exec wireproxy -c /tmp/wireproxy.conf >> /tmp/warp.log 2>&1
+    # Go keeps its memory small when told the limit (default lets it double).
+    GOMEMLIMIT=80MiB GOGC=50 exec wireproxy -c /tmp/wireproxy.conf >> /tmp/warp.log 2>&1
   ) &
 fi
 
