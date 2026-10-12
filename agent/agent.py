@@ -165,6 +165,11 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
     if job.get("mode") == "video":
         cmd += ["-f", f"bv*[height<={RES}]+ba/b[height<={RES}]/bv*+ba/b",
                 "--merge-output-format", "mp4", "--remux-video", "mp4"]
+    elif job.get("mode") == "m4a":
+        # Fast audio: take YouTube's own AAC track as-is (no re-encode).
+        # --extract-audio only re-encodes if no m4a track exists.
+        cmd += ["-f", "bestaudio[ext=m4a]/bestaudio/best", "--extract-audio",
+                "--audio-format", "m4a"]
     else:
         cmd += ["-f", "bestaudio/best", "--extract-audio",
                 "--audio-format", "mp3", "--audio-quality", "0"]

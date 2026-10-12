@@ -334,7 +334,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (!channels.some((c) => c.id === id)) {
         const { name, entries } = await readFeed(id);
         const ch = {
-          id, name, mode: f.get("mode") === "video" ? "video" : "audio",
+          id, name, mode: modeOf(f.get("mode")),
           minMinutes: Math.max(0, parseInt(f.get("minMinutes") || "0", 10) || 0),
           skipShorts: f.get("skipShorts") === "on", added: new Date().toISOString(),
         };
@@ -373,7 +373,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (m) await addJobs(env, [{
         videoId: m[1], channelId: "", channelName: "ידני", title: m[1],
         published: "", url: "https://www.youtube.com/watch?v=" + m[1],
-        mode: f.get("mode") === "video" ? "video" : "audio", minMinutes: 0,
+        mode: modeOf(f.get("mode")), minMinutes: 0,
         status: "queued", updated: new Date().toISOString() }]);
       if (m) wake();
       return redirect(BASE + "/");
@@ -388,6 +388,11 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
 // ---------- HTML ----------
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// Download kinds. "m4a" keeps YouTube's own audio (no MP3 conversion), which
+// is many times faster on a small server.
+const MODES = { audio: "🎵 שיר (MP3)", m4a: "⚡ שיר מהיר (M4A)", video: "🎬 סרטון (MP4)" };
+const modeOf = (v) => (v in MODES ? v : "audio");
 
 const STATUS = { queued: "ממתין", taken: "בהורדה", done: "ירד ✓", failed: "נכשל", skipped: "דולג" };
 
@@ -498,7 +503,7 @@ async function dashboard(env) {
     <b>הוספת ערוץ למעקב</b>
     <div class="row"><input class="grow" name="channel" placeholder="קישור לערוץ / @handle / UC…" required></div>
     <div class="row">
-      <select name="mode"><option value="audio">🎵 שיר (MP3)</option><option value="video">🎬 סרטון (MP4)</option></select>
+      <select name="mode">${Object.entries(MODES).map(([k, v]) => `<option value="${k}">${v}</option>`).join("")}</select>
       <label>אורך מינימלי <input name="minMinutes" type="number" min="0" value="0" style="width:70px"> דק׳</label>
       <label><input type="checkbox" name="skipShorts" checked> בלי Shorts</label>
       <label>להוריד עכשיו את <input name="backfill" type="number" min="0" max="15" value="0" style="width:60px"> האחרונים</label>
@@ -508,7 +513,7 @@ async function dashboard(env) {
   <form class="card" data-action="/jobs/add">
     <b>הורדה חד-פעמית</b>
     <div class="row"><input class="grow" name="url" placeholder="קישור לסרטון ביוטיוב" required>
-    <select name="mode"><option value="audio">🎵 שיר</option><option value="video">🎬 סרטון</option></select>
+    <select name="mode">${Object.entries(MODES).map(([k, v]) => `<option value="${k}">${v}</option>`).join("")}</select>
     <button class="btn">הוסף לתור</button></div>
   </form>
 </section>
@@ -529,6 +534,7 @@ async function dashboard(env) {
 <script>
 const B = ${JSON.stringify(BASE)};
 const STATUS = ${JSON.stringify(STATUS)};
+const MODES = ${JSON.stringify(MODES)};
 let S = ${initial};
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -554,7 +560,7 @@ function render() {
   $("jobs").innerHTML = S.jobs.length ? S.jobs.map((j) =>
     '<div class="job"><img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">' +
     '<div class="info"><div class="title" title="' + esc(j.title) + '">' + esc(j.title) + '</div>' +
-    '<div class="muted">' + esc(j.channelName) + ' · ' + (j.mode === "video" ? "🎬 סרטון" : "🎵 שיר") + ' · ' + ago(j.updated) + '</div>' +
+    '<div class="muted">' + esc(j.channelName) + ' · ' + (MODES[j.mode] || MODES.audio) + ' · ' + ago(j.updated) + '</div>' +
     (j.error ? '<div class="' + (j.status === "failed" ? "err" : "muted") + '">' + esc(j.error) + '</div>' : '') + '</div>' +
     '<span class="chip ' + esc(j.status) + '">' + (STATUS[j.status] || esc(j.status)) + '</span>' +
     (j.fileUrl ? '<a class="btn small" href="' + esc(j.fileUrl) + '">⬇ הורדה</a>' : '') +
@@ -563,7 +569,7 @@ function render() {
   // channels
   $("channels").innerHTML = S.channels.length ? S.channels.map((c) =>
     '<div class="ch"><div><a href="https://www.youtube.com/channel/' + esc(c.id) + '" target="_blank">' + esc(c.name) + '</a>' +
-    '<div class="muted">' + (c.mode === "video" ? "🎬 סרטון" : "🎵 שיר") + (c.minMinutes ? " · " + c.minMinutes + " דק׳ ומעלה" : "") +
+    '<div class="muted">' + (MODES[c.mode] || MODES.audio) + (c.minMinutes ? " · " + c.minMinutes + " דק׳ ומעלה" : "") +
     (c.skipShorts ? " · בלי Shorts" : "") + '</div></div>' +
     '<button class="btn small ghost" data-remove="' + esc(c.id) + '">הסר</button></div>').join("")
     : '<div class="muted">עוד אין ערוצים. הוסף בלשונית ➕ הוספה.</div>';
