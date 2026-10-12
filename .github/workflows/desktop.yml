@@ -30,13 +30,29 @@ jobs:
 
       - name: Stamp version (the app compares it with the latest release to self-update)
         shell: bash
-        run: echo "$GITHUB_SHA" > desktop/version.txt
+        run: |
+          export VERSION="1.${GITHUB_RUN_NUMBER}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          printf '%s\n%s\n' "$GITHUB_SHA" "$VERSION" > desktop/version.txt
+          # The top section of CHANGELOG.md is this version: give it its number,
+          # and use it as the release notes ("what's new" in the app).
+          python - <<'EOF'
+          import os, re, datetime
+          v = os.environ["VERSION"]
+          text = open("desktop/CHANGELOG.md", encoding="utf-8").read()
+          parts = re.split(r"(?m)^## .*$", text, maxsplit=2)
+          notes = parts[1].strip() if len(parts) > 1 else "תיקונים ושיפורים"
+          date = datetime.date.today().strftime("%d.%m.%Y")
+          text = re.sub(r"(?m)^## .*$", f"## גרסה {v} — {date}", text, count=1)
+          open("desktop/CHANGELOG.md", "w", encoding="utf-8").write(text)
+          open("notes.md", "w", encoding="utf-8").write(notes + "\n\nהורדה: YTTracker.exe (או YTTracker.zip אם ה-exe נחסם).\n")
+          EOF
 
       - name: Build YTTracker.exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name YTTracker
           --icon desktop/icon.ico --add-data "desktop/icon.ico;."
-          --add-data "desktop/version.txt;."
+          --add-data "desktop/version.txt;." --add-data "desktop/CHANGELOG.md;."
           --collect-all imageio_ffmpeg --collect-all webview --hidden-import pystray._win32 --hidden-import vault --hidden-import vault_ui --hidden-import netfree --exclude-module tkinter --paths desktop
           desktop/app.py
 
@@ -54,12 +70,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          NOTES="הורד את YTTracker.exe (או YTTracker.zip אם ה-exe נחסם) ופתח בלחיצה כפולה. נבנה מ-${GITHUB_SHA::7}."
+          TITLE="גרסה ${VERSION}"
           gh release delete desktop-latest --yes --cleanup-tag || true
           # Deleting is not instant on GitHub's side — retry creating.
           for i in 1 2 3 4 5 6; do
             if gh release create desktop-latest dist/YTTracker.exe dist/YTTracker.zip \
-                 --target "$GITHUB_SHA" --title "תוכנה למחשב — גרסה אחרונה" --notes "$NOTES"; then
+                 --target "$GITHUB_SHA" --title "$TITLE" --notes-file notes.md; then
               exit 0
             fi
             sleep 10
@@ -67,4 +83,4 @@ jobs:
           # Last resort: update the existing release in place (the app reads
           # target_commitish to decide whether to self-update).
           gh release upload desktop-latest dist/YTTracker.exe dist/YTTracker.zip --clobber
-          gh release edit desktop-latest --target "$GITHUB_SHA" --notes "$NOTES"
+          gh release edit desktop-latest --target "$GITHUB_SHA" --title "$TITLE" --notes-file notes.md

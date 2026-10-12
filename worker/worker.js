@@ -1095,6 +1095,9 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .prow .who{display:flex;align-items:center;gap:10px;min-width:150px;flex:1}
 .prow .nums{display:flex;gap:18px;flex-wrap:wrap}.prow .nums div{text-align:center;min-width:56px}
 .prow .nums b{display:block;font-size:1.15rem;font-variant-numeric:tabular-nums}.prow .nums span{color:var(--muted);font-size:.74rem}
+.vnotes{padding:4px 0 8px}.vnotes details{border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-top:10px;background:var(--bg)}
+.vnotes summary{cursor:pointer;font-weight:500}.vnotes h4{margin:14px 0 6px;font-size:.9rem}.vnotes ul{margin:6px 0;padding-inline-start:20px;color:var(--muted)}.vnotes li{margin:3px 0}
+.vok{color:var(--ok)}.vnew{color:var(--warn)}
 .tag{font-size:.7rem;padding:2px 8px;border-radius:999px;background:var(--panel2);color:var(--muted);margin-inline-start:6px}
 .acts{display:flex;gap:6px}
 .empty{padding:48px 16px;text-align:center;color:var(--muted)}
@@ -1346,7 +1349,12 @@ async function dashboard(env) {
         <button class="btn ghost" id="openFolder" type="button">${icon("folder")}<span>פתח</span></button></span></div>
       <div class="setting hidden" id="nfTestRow"><div class="txt"><b>בדיקת נטפרי</b><span>הדבק קישור לסרטון — התוכנה בודקת דרך החיבור בבית אם הוא פתוח בנטפרי. <span id="nfTestOut" style="white-space:pre-wrap"></span></span></div>
         <span style="display:flex;gap:8px"><input id="nfTestUrl" placeholder="https://youtu.be/…" style="width:200px"><button class="btn ghost" id="nfTestBtn" type="button">בדוק</button></span></div>
-      <div class="setting"><div class="txt"><b>גרסה</b><span id="appVersion"></span></div></div>
+      <div class="setting"><div class="txt"><b>גרסה</b><span id="appVersion"></span></div>
+        <button class="btn hidden" id="updateNow" type="button">${icon("download")}<span>עדכן עכשיו</span></button></div>
+      <div class="vnotes hidden" id="whatsNew">
+        <details open><summary id="newTitle">מה חדש בגרסה האחרונה</summary><div id="newNotes"></div></details>
+        <details><summary>כל השינויים</summary><div id="changelog"></div></details>
+      </div>
     </div>
     <div class="card">
       <h2>${icon("server")}שרת ההורדות</h2>
@@ -1426,6 +1434,8 @@ function jobRow(j) {
   return '<div class="row">' + thumb + '<div class="info"><div class="title" title="' + esc(j.title) + '">' + esc(j.title) + '</div>' +
     '<div class="meta">' + meta + '</div>' +
     (j.error ? '<div class="note' + (["failed", "blocked"].includes(j.status) ? " bad" : "") + '">' + esc(j.error) + '</div>' : '') +
+    (/confirm you.re not a bot|cookies-from-browser/i.test(j.error || "") ? '<div class="note">' + icon("alert") +
+      ' יוטיוב חסם את שרת ההורדות ("תוכיח שאתה לא בוט"). צריך קובץ עוגיות חדש: מייצאים cookies.txt מחלון גלישה בסתר שמחובר ליוטיוב, ומחליפים ב-Render ← Environment ← Secret Files ← cookies.txt. אחר כך "נסה שוב".</div>' : '') +
     (j.status === "nfcheck" ? '<div class="note">התוכנה במחשב בודקת שהסרטון פתוח בנטפרי, ורק אז הוא יורד (אם התוכנה סגורה — ממתין לה).</div>' : '') +
     (j.status === "taken" ? '<div class="prog" data-prog="' + esc(j.videoId) + '">' + progHtml(j.videoId) + '</div>' : '') + '</div>' +
     '<div class="side-col"><span class="badge b-' + esc(j.status) + '">' + (STATUS[j.status] || esc(j.status)) + '</span>' +
@@ -1661,6 +1671,7 @@ async function initDesktop() {
     $("desktopCard").classList.remove("hidden");
     if (info.vault) { $("vaultNav").classList.remove("hidden"); $("vaultNav").onclick = () => APP().open_vault(); }
     $("folderPath").textContent = info.folder; $("appVersion").textContent = info.version || "פיתוח";
+    loadVersion();
     $("autostart").checked = !!info.autostart;
     $("autostart").onchange = async (e) => { await APP().set_autostart(e.target.checked); toast(e.target.checked ? "תעלה עם Windows" : "לא תעלה עם Windows"); };
     $("openFolder").onclick = () => APP().open_folder();
@@ -1673,6 +1684,33 @@ async function initDesktop() {
     $("notifyMode").onchange = async (e) => { await APP().set_notify(e.target.value); toast("ההתראות עודכנו"); };
     render();
   } catch (e) {}
+}
+// Version: installed vs. latest, and what's new (CHANGELOG.md, simple markdown).
+function mdList(text) {
+  let html = "", open = false;
+  for (const raw of String(text || "").split(String.fromCharCode(10))) {
+    const l = raw.trim();
+    if (!l || l.startsWith("<!--") || l.startsWith("# ")) continue;
+    if (l.startsWith("- ")) { if (!open) { html += "<ul>"; open = true; } html += "<li>" + esc(l.slice(2)) + "</li>"; continue; }
+    if (open) { html += "</ul>"; open = false; }
+    html += l.startsWith("## ") ? "<h4>" + esc(l.slice(3)) + "</h4>" : "<p>" + esc(l) + "</p>";
+  }
+  return html + (open ? "</ul>" : "");
+}
+async function loadVersion() {
+  let v; try { v = await APP().version_info(); } catch (e) { return; }
+  $("appVersion").innerHTML = 'מותקנת: <span style="font-weight:600;color:var(--text)">' + esc(v.installed) + "</span>" +
+    (v.latest ? (v.update ? ' · <span class="vnew">יש גרסה חדשה: ' + esc(v.latest) + '</span>' : ' · <span class="vok">' + icon("check") + ' זו הגרסה האחרונה</span>') : (v.error ? " · " + esc(v.error) : ""));
+  $("updateNow").classList.toggle("hidden", !v.update);
+  $("updateNow").onclick = async () => {
+    $("updateNow").disabled = true; toast("מוריד את גרסה " + v.latest + "…", 60000);
+    const r = await APP().update_now();
+    toast(r === "ok" ? "מתקין ומפעיל מחדש… (ההורדות ממשיכות)" : r, 8000); $("updateNow").disabled = false;
+  };
+  $("newTitle").textContent = "מה חדש בגרסה " + (v.latest || v.installed);
+  $("newNotes").innerHTML = mdList(v.notes) || '<span class="sub">אין פירוט</span>';
+  $("changelog").innerHTML = mdList(v.changelog) || '<span class="sub">אין פירוט</span>';
+  $("whatsNew").classList.remove("hidden");
 }
 window.addEventListener("pywebviewready", initDesktop);
 

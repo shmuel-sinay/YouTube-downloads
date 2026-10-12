@@ -610,7 +610,7 @@ class Downloader(threading.Thread):
                 continue
             self.s.post(self.base + "/nf/result", timeout=30,
                         json={"pid": it["pid"], "videoId": vid, "ok": verdict == "open",
-                              "detail": f"חסום בנטפרי ({detail} · גרסה {bundled_version()[:7] or 'פיתוח'})"})
+                              "detail": f"חסום בנטפרי ({detail} · גרסה {bundled_version_name()})"})
             self.log(f"נטפרי: {'פתוח' if verdict == 'open' else 'חסום'} — {it.get('title') or vid} ({detail})")
 
     def check_for_update(self) -> None:
@@ -622,7 +622,7 @@ class Downloader(threading.Thread):
         try:
             sha, _ = latest_release()
             mine = bundled_version()
-            if sha and mine and not sha.startswith(mine) and not mine.startswith(sha):
+            if sha and mine and not same_version(sha, mine):
                 self.log("יש גרסה חדשה לתוכנה — היא תותקן אוטומטית בפתיחה הבאה")
         except Exception:
             pass
@@ -777,7 +777,7 @@ def _do_install(src: Path) -> int:
         for name, val in (("DisplayName", "מעקב ערוצים (YTTracker)"), ("DisplayIcon", str(target)),
                           ("Publisher", "YTTracker"), ("InstallLocation", str(INSTALL_DIR)),
                           ("UninstallString", f'"{target}" --uninstall'),
-                          ("DisplayVersion", bundled_version()[:7] or "1")):
+                          ("DisplayVersion", bundled_version_name())):
             winreg.SetValueEx(k, name, 0, winreg.REG_SZ, val)
         winreg.SetValueEx(k, "NoModify", 0, winreg.REG_DWORD, 1)
         winreg.SetValueEx(k, "NoRepair", 0, winreg.REG_DWORD, 1)
@@ -1069,7 +1069,7 @@ class Api:
         if pid and pid != self._active:
             raise PermissionError("פרופיל אחר")
         return {"folder": "כספת מוצפנת" if dl.cfg.get("vault_dir") else str(dl.folder()),
-                "vault": bool(dl.cfg.get("vault_dir")), "version": bundled_version()[:7], "autostart": get_autostart(),
+                "vault": bool(dl.cfg.get("vault_dir")), "version": bundled_version_name(), "autostart": get_autostart(),
                 "notify": dl.cfg.get("notify") or "each", "admin": dl.pid == "main"}
 
     def get_notify(self) -> str:
@@ -1085,6 +1085,28 @@ class Api:
     def set_autostart(self, on: bool) -> bool:
         set_autostart(bool(on))
         return get_autostart()
+
+    def version_info(self) -> dict:
+        """Installed version vs. the newest one, with what's new (the same
+        request the app makes anyway to update itself; cached 10 minutes)."""
+        out = {"installed": bundled_version_name(), "changelog": _bundled("CHANGELOG.md"), "frozen": getattr(sys, "frozen", False)}
+        try:
+            lat = latest_release_info(max_age=600)
+            out.update(latest=lat["name"] or lat["sha"][:7], notes=lat["notes"], published=lat["published"],
+                       update=getattr(sys, "frozen", False) and not same_version(bundled_version(), lat["sha"]))
+        except Exception as e:
+            out.update(latest="", error=f"אין חיבור לבדיקת גרסה ({type(e).__name__})", update=False)
+        return out
+
+    def update_now(self) -> str:
+        """Install the newest version now and restart (in the background)."""
+        if not getattr(sys, "frozen", False):
+            return "לא זמין בהרצה מקוד"
+        if self_update(["--after-update", str(os.getpid())]):
+            if _QUIT.get("fn"):
+                threading.Timer(1.0, _QUIT["fn"]).start()
+            return "ok"
+        return "אין גרסה חדשה, או שההורדה נכשלה (פרטים בלוג)"
 
     def nf_test(self, link: str) -> str:
         """Admin: check one video against NetFree right now (to calibrate)."""
@@ -1104,6 +1126,7 @@ class Api:
 
 
 _VAULT: dict = {}          # pid -> {"win", "api"}
+_QUIT: dict = {}           # "fn": closes the app (set by open_window)
 
 
 def lock_all_vaults() -> None:
@@ -1160,7 +1183,7 @@ def make_tray(on_open, on_quit):
         menu = pystray.Menu(
             pystray.MenuItem("פתח", lambda: on_open(), default=True),
             pystray.MenuItem("יציאה", lambda: on_quit()))
-        return pystray.Icon(APP, img, "מעקב ערוצים — מוריד ברקע", menu)
+        return pystray.Icon(APP, img, f"מעקב ערוצים {bundled_version_name()} — מוריד ברקע", menu)
     except Exception:
         traceback.print_exc()
         return None
@@ -1204,6 +1227,17 @@ def open_window(accounts: Accounts, background: bool) -> None:
 
     tray = make_tray(show, quit_app)
 
+    def quit_for_update():
+        state["quit"] = True
+        lock_all_vaults()
+        if tray:
+            tray.stop()
+        try:
+            win.destroy()
+        finally:
+            threading.Timer(10, lambda: os._exit(0)).start()
+    _QUIT["fn"] = quit_for_update
+
     def on_closing():
         # Closing the window signs out (next time: "who's signing in?") and
         # locks the vaults; every profile keeps downloading in the tray.
@@ -1231,14 +1265,7 @@ def open_window(accounts: Accounts, background: bool) -> None:
             time.sleep(UPDATE_CHECK_HOURS * 3600)
             try:
                 if self_update(["--background", "--after-update", str(os.getpid())]):
-                    state["quit"] = True
-                    lock_all_vaults()
-                    if tray:
-                        tray.stop()
-                    try:
-                        win.destroy()
-                    finally:
-                        threading.Timer(10, lambda: os._exit(0)).start()
+                    quit_for_update()
                     return
             except Exception:
                 traceback.print_exc()
@@ -1256,24 +1283,55 @@ def open_window(accounts: Accounts, background: bool) -> None:
 
 # ---------------------------------------------------------------- updates
 
-def bundled_version() -> str:
-    """Commit this build was made from (version.txt, written by the build)."""
+def _bundled(name: str) -> str:
     try:
         base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-        return (base / "version.txt").read_text().strip()
+        return (base / name).read_text(encoding="utf-8")
     except Exception:
         return ""
 
 
-def latest_release() -> tuple[str, str]:
-    """(commit, exe download URL) of the newest published build."""
+def bundled_version() -> str:
+    """Commit this build was made from (version.txt line 1, written by the build)."""
+    return (_bundled("version.txt").strip().splitlines() or [""])[0].strip()
+
+
+def bundled_version_name() -> str:
+    """The version people see, e.g. "1.16" (version.txt line 2)."""
+    lines = _bundled("version.txt").strip().splitlines()
+    return lines[1].strip() if len(lines) > 1 else (lines[0][:7] if lines else "פיתוח")
+
+
+_LATEST: dict = {}
+
+
+def latest_release_info(max_age: int = 0) -> dict:
+    """The newest published build: commit, version name, what's new, download
+    URL. One small request to GitHub (cached for max_age seconds)."""
+    if max_age and _LATEST and time.time() - _LATEST.get("at", 0) < max_age:
+        return _LATEST
     r = requests.get(RELEASE_API, timeout=15, headers={"User-Agent": "yt-tracker-desktop"})
     r.raise_for_status()
     rel = r.json()
-    sha = rel.get("target_commitish", "")
     url = next((a["browser_download_url"] for a in rel.get("assets", []) if a["name"] == "YTTracker.exe"), "")
     zurl = next((a["browser_download_url"] for a in rel.get("assets", []) if a["name"] == "YTTracker.zip"), "")
-    return sha, url or zurl
+    import re
+    m = re.search(r"\d+\.\d+", rel.get("name") or "")
+    notes = (rel.get("body") or "").split("\nהורדה:")[0].strip()
+    _LATEST.clear()
+    _LATEST.update(at=time.time(), sha=rel.get("target_commitish", ""), name=m.group(0) if m else "",
+                   notes=notes, url=url or zurl, published=rel.get("published_at", ""))
+    return _LATEST
+
+
+def latest_release() -> tuple[str, str]:
+    """(commit, exe download URL) of the newest published build."""
+    info = latest_release_info()
+    return info["sha"], info["url"]
+
+
+def same_version(a: str, b: str) -> bool:
+    return bool(a and b) and (a.startswith(b) or b.startswith(a))
 
 
 def self_update(extra_args: list | None = None) -> bool:
