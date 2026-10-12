@@ -501,7 +501,18 @@ def _handle(job: dict) -> None:
                  mode="m4a" if job.get("pcConvert") else job.get("mode", "audio"))
     OUT.mkdir(parents=True, exist_ok=True)
     _current.clear()
-    r = run_ytdlp(ytdlp_cmd(job, OUT), vid)
+    cmd = ytdlp_cmd(job, OUT)
+    r = run_ytdlp(cmd, vid)
+    if (not _current.get("stopped") and "--cookies" in cmd
+            and "confirm you" in (r.stdout + r.stderr) and "not a bot" in (r.stdout + r.stderr)):
+        # A bad/rotated cookie file makes YouTube ask "not a bot" even where
+        # the server would pass without it (PO tokens do the job). Try again
+        # without cookies before giving up.
+        i = cmd.index("--cookies")
+        log("   יוטיוב דחה את העוגיות — מנסה שוב בלי עוגיות")
+        r = run_ytdlp(cmd[:i] + cmd[i + 2:], vid)
+        if not _current.get("stopped") and "not a bot" not in (r.stdout + r.stderr):
+            log("   ✓ עבד בלי עוגיות — כדאי להחליף את קובץ העוגיות ב-Render (או למחוק אותו)")
     stopped = _current.get("stopped")
     if stopped:
         if stopped in ("cancelled", "missing"):
