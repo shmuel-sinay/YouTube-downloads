@@ -651,7 +651,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     for (const q of await profileIds(rootEnv)) {
       if (!(await profileInfo(rootEnv, q)).netfree) continue;
       const groups = new Set();
-      const jobs = (await listJobs(profileEnv(rootEnv, q))).filter((j) => j.status === "nfcheck")
+      const jobs = (await listJobs(profileEnv(rootEnv, q)))
+        .filter((j) => j.status === "nfcheck" || (j.status === "queued" && !j.kind && j.nf !== "ok"))
         .sort((a, b) => (a.rank || 0) - (b.rank || 0));
       for (const j of jobs) {
         if (j.group) { if (groups.has(j.group)) continue; groups.add(j.group); }   // best search result first
@@ -665,7 +666,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const b = await req.json();
     const penv = profileEnv(rootEnv, String(b.pid || ""));
     const j = await getJSON(penv, "job:" + b.videoId, null);
-    if (!j || j.status !== "nfcheck") return json({ ok: true, ignored: true });
+    if (!j || !(j.status === "nfcheck" || (j.status === "queued" && j.nf !== "ok"))) return json({ ok: true, ignored: true });
     const now = new Date().toISOString();
     const mates = j.group ? (await listJobs(penv)).filter((x) => x.group === j.group && x.videoId !== j.videoId) : [];
     if (b.ok) {
@@ -796,7 +797,12 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     }
     if (p === "/jobs/retry") {
       const j = await getJSON(env, "job:" + f.get("id"), null);
-      if (j) { j.status = "queued"; j.error = ""; j.updated = new Date().toISOString(); await putJSON(env, "job:" + j.videoId, j); wake(); }
+      if (j) {
+        // NetFree-only profile: back to the check right away (not via the download server).
+        j.status = !j.kind && j.nf !== "ok" && (await profileInfo(env, env.PROFILE)).netfree ? "nfcheck" : "queued";
+        j.error = ""; j.updated = new Date().toISOString(); await putJSON(env, "job:" + j.videoId, j);
+        if (j.status === "queued") wake();
+      }
       return redirect(BASE + "/");
     }
     if (p === "/jobs/batch") {

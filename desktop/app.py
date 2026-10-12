@@ -51,7 +51,7 @@ TMP = USERDATA / "tmp"                 # decrypted copies for playing — wiped 
 DEFAULT_SITE = "https://my-gemini.g47ben.workers.dev"
 # Where new versions are published (GitHub release built by desktop.yml).
 RELEASE_API = "https://api.github.com/repos/shmuel-sinay/YouTube-downloads/releases/tags/desktop-latest"
-UPDATE_CHECK_HOURS = 6
+UPDATE_CHECK_HOURS = 1
 POLL_SECONDS = 20
 WAKE_EVERY = 300          # nudge the download server while work is waiting
 RETRY_404_HOURS = 24      # re-queue a vanished file only if it finished recently
@@ -558,7 +558,6 @@ class Downloader(threading.Thread):
                 self.notify_from(st)
             except Exception as e:
                 self.log(f"שגיאה: {e}", remote=False)
-            self.check_for_update()
             self.flush_logs()
             time.sleep(POLL_SECONDS)
 
@@ -610,8 +609,9 @@ class Downloader(threading.Thread):
                 self.log(f"נטפרי: לא הצלחתי להכריע על {it.get('title') or vid} — אנסה שוב ({detail})")
                 continue
             self.s.post(self.base + "/nf/result", timeout=30,
-                        json={"pid": it["pid"], "videoId": vid, "ok": verdict == "open", "detail": "חסום בנטפרי"})
-            self.log(f"נטפרי: {'פתוח' if verdict == 'open' else 'חסום'} — {it.get('title') or vid} ({detail})", remote=False)
+                        json={"pid": it["pid"], "videoId": vid, "ok": verdict == "open",
+                              "detail": f"חסום בנטפרי ({detail} · גרסה {bundled_version()[:7] or 'פיתוח'})"})
+            self.log(f"נטפרי: {'פתוח' if verdict == 'open' else 'חסום'} — {it.get('title') or vid} ({detail})")
 
     def check_for_update(self) -> None:
         """While running, just announce a new version; it installs itself
@@ -1222,6 +1222,28 @@ def open_window(accounts: Accounts, background: bool) -> None:
         return False
 
     win.events.closing += on_closing
+
+    def keep_updated():
+        """A new version installs itself even while the app keeps running
+        in the tray: download, swap, start the new one in the background,
+        close this one. (Downloads continue where they stopped.)"""
+        while not state["quit"]:
+            time.sleep(UPDATE_CHECK_HOURS * 3600)
+            try:
+                if self_update(["--background", "--after-update", str(os.getpid())]):
+                    state["quit"] = True
+                    lock_all_vaults()
+                    if tray:
+                        tray.stop()
+                    try:
+                        win.destroy()
+                    finally:
+                        threading.Timer(10, lambda: os._exit(0)).start()
+                    return
+            except Exception:
+                traceback.print_exc()
+    if getattr(sys, "frozen", False):
+        threading.Thread(target=keep_updated, daemon=True).start()
     if tray:
         accounts.notify = lambda t, m: tray.notify(m, t)
         tray.run_detached()
@@ -1254,7 +1276,7 @@ def latest_release() -> tuple[str, str]:
     return sha, url or zurl
 
 
-def self_update() -> bool:
+def self_update(extra_args: list | None = None) -> bool:
     """If a newer build exists, download it, swap it in and restart.
     Windows can't overwrite a running .exe but can rename it, so: rename
     current → .old, put the new one in its place, start it, exit."""
@@ -1293,7 +1315,8 @@ def self_update() -> bool:
         # Unique name: an older .old.exe may still be running for another user.
         exe.replace(exe.with_name(f"YTTracker.old-{int(time.time())}.exe"))
         tmp.replace(exe)
-        subprocess.Popen([str(exe)] + sys.argv[1:], close_fds=True)
+        args = [a for a in sys.argv[1:] if a not in ("--after-update",) and not a.isdigit()]
+        subprocess.Popen([str(exe)] + args + (extra_args or []), close_fds=True)
         return True
     except Exception as e:
         with LOGFILE.open("a", encoding="utf-8") as f:
@@ -1321,6 +1344,18 @@ def main() -> None:
         return uninstall()
     if getattr(sys, "frozen", False) and not is_installed_copy():
         close_other_copies()             # old versions would block installing
+    if "--after-update" in sys.argv:
+        # Started by the previous version, which is closing now: wait for it
+        # (it still holds the "already running" port for a moment).
+        try:
+            import ctypes
+            old_pid = int(sys.argv[sys.argv.index("--after-update") + 1])
+            h = ctypes.windll.kernel32.OpenProcess(0x00100000, False, old_pid)   # SYNCHRONIZE
+            if h:
+                ctypes.windll.kernel32.WaitForSingleObject(h, 30000)
+                ctypes.windll.kernel32.CloseHandle(h)
+        except Exception:
+            time.sleep(5)
     if already_running():
         return                           # the running copy shows its window
     if install_if_needed():
