@@ -14,7 +14,8 @@
 //   * Optional: serves downloaded files from an R2 bucket (binding "FILES").
 //
 // Setup (Cloudflare dashboard, see README.md):
-//   KV namespace binding:  DB
+//   D1 database binding:   SQL  (recommended — free: 5M reads, 100k writes a day)
+//   KV namespace binding:  DB   (the original store; copied to D1 automatically)
 //   Secrets:               GEMINI_API_KEY, GEMINI_PASSWORD (the Gemini chat)
 //                          ADMIN_PASSWORD (tracker login), AGENT_TOKEN (agent API)
 //   Variable:              RENDER_URL — the download server, e.g.
@@ -31,19 +32,150 @@ const CLAIM_TIMEOUT_MS = 3 * 60 * 60 * 1000;  // re-queue a "taken" job after 3h
 
 export default {
   async fetch(req, env, ctx) {
+    let store;
     try {
-      return await route(req, env, ctx);
+      env = await withStore(env);
+      store = env.DB;
+      const res = await route(req, env, ctx);
+      if (store && store.flush) await store.flush();
+      return res;
     } catch (e) {
+      try { if (store && store.flush) await store.flush(); } catch (x) {}
       return new Response("Error: " + (e && e.message || e), { status: 500 });
     }
   },
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
+      env = await withStore(env);
       for (const pid of await profileIds(env)) await checkAllChannels(profileEnv(env, pid));
+      if (env.DB && env.DB.flush) await env.DB.flush();
       await wakeAgent(env);
     })());
   },
 };
+
+// ---------- storage ----------
+// Where the data lives:
+//   * D1 (binding "SQL") when connected — free tier: 5M reads and 100k
+//     writes a day. On first use everything is copied over from KV.
+//   * otherwise KV (binding "DB") — free tier: only 1,000 writes a day.
+// On top of either, each profile's queue/history is ONE record ("jobsdb")
+// instead of one record per video: showing the page costs a few reads, not
+// hundreds, and changes are written once at the end of the request.
+
+function d1Backend(db) {
+  return {
+    get: async (k) => { const r = await db.prepare("SELECT v FROM kv WHERE k = ?1").bind(k).first(); return r ? r.v : null; },
+    put: (k, v) => db.prepare("INSERT INTO kv (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = ?2").bind(k, String(v)).run(),
+    delete: (k) => db.prepare("DELETE FROM kv WHERE k = ?1").bind(k).run(),
+    deletePrefix: (pre) => db.prepare("DELETE FROM kv WHERE substr(k, 1, ?1) = ?2").bind(pre.length, pre).run(),
+    list: async ({ prefix = "" } = {}) => {
+      const r = await db.prepare("SELECT k FROM kv WHERE substr(k, 1, ?1) = ?2").bind(prefix.length, prefix).all();
+      return { keys: r.results.map((x) => ({ name: x.k })), list_complete: true };
+    },
+  };
+}
+
+// KV → D1, a few hundred records per request (the free plan limits work per
+// request). Until it's complete the site keeps using KV.
+let D1_STATE = "";     // "", "ready" (remembered per Worker instance)
+async function d1Ready(env) {
+  if (D1_STATE === "ready") return true;
+  const db = env.SQL;
+  await db.prepare("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)").run();
+  if (await db.prepare("SELECT 1 AS x FROM kv WHERE k = '_migrated'").first()) { D1_STATE = "ready"; return true; }
+  if (!env.DB) {
+    await db.prepare("INSERT OR IGNORE INTO kv (k, v) VALUES ('_migrated', ?1)").bind(new Date().toISOString()).run();
+    D1_STATE = "ready"; return true;
+  }
+  const kvKeys = [];
+  let cursor;
+  do { const r = await env.DB.list({ cursor }); kvKeys.push(...r.keys.map((x) => x.name)); cursor = r.list_complete ? null : r.cursor; } while (cursor);
+  const have = new Set((await db.prepare("SELECT k FROM kv").all()).results.map((x) => x.k));
+  const todo = kvKeys.filter((k) => !have.has(k)).slice(0, 250);
+  const vals = await Promise.all(todo.map((k) => env.DB.get(k)));
+  const rows = todo.map((k, i) => [k, vals[i]]).filter((r) => r[1] != null);
+  for (let i = 0; i < rows.length; i += 40) {          // 40 rows (80 values) per statement
+    const part = rows.slice(i, i + 40);
+    await db.prepare("INSERT OR IGNORE INTO kv (k, v) VALUES " + part.map((_, j) => `(?${2 * j + 1}, ?${2 * j + 2})`).join(", "))
+      .bind(...part.flat()).run();
+  }
+  if (kvKeys.length - have.size <= todo.length) {
+    // Per-video records already folded into a "jobsdb" record aren't needed.
+    const all = (await db.prepare("SELECT k FROM kv").all()).results.map((x) => x.k);
+    for (const pre of new Set(all.filter((k) => /^(p:[^:]+:)?jobsdb$/.test(k)).map((k) => k.slice(0, -6))))
+      await db.prepare("DELETE FROM kv WHERE substr(k, 1, ?1) = ?2").bind(pre.length + 4, pre + "job:").run();
+    await db.prepare("INSERT OR IGNORE INTO kv (k, v) VALUES ('_migrated', ?1)").bind(new Date().toISOString()).run();
+    D1_STATE = "ready"; return true;
+  }
+  return false;
+}
+
+async function withStore(env) {
+  let base = null;
+  if (env.SQL) {
+    try { if (await d1Ready(env)) base = d1Backend(env.SQL); }
+    catch (e) { console.log("D1: " + (e && e.message || e)); }
+  }
+  if (!base && env.DB) base = env.DB;
+  if (!base) return env;                       // nothing connected — route() explains
+  return { ...env, KV: env.DB, DB: jobLayer(base) };
+}
+
+function jobLayer(base) {
+  const blobs = new Map(), dirty = new Set(), converted = [];
+  const parse = (key) => { const m = /^((?:p:[^:]+:)?)(?:jobs|job:(.+))$/.exec(key); return m && { pre: m[1], id: m[2] }; };
+  function load(pre) {
+    const bk = pre + "jobsdb";
+    if (!blobs.has(bk)) blobs.set(bk, (async () => {
+      const raw = await base.get(bk);
+      if (raw) return JSON.parse(raw);
+      // Old layout ("jobs" = ids, "job:<id>" each): converted once.
+      const ids = JSON.parse((await base.get(pre + "jobs")) || "[]");
+      const vals = await Promise.all(ids.map((id) => base.get(pre + "job:" + id)));
+      const b = { order: [], map: {} };
+      ids.forEach((id, i) => { if (vals[i]) { b.order.push(id); b.map[id] = JSON.parse(vals[i]); } });
+      if (ids.length) { dirty.add(bk); converted.push(pre); }
+      return b;
+    })());
+    return blobs.get(bk);
+  }
+  return {
+    async get(key) {
+      const p = parse(key);
+      if (!p) return base.get(key);
+      const b = await load(p.pre);
+      if (p.id === undefined) return JSON.stringify(b.order);
+      return b.map[p.id] ? JSON.stringify(b.map[p.id]) : null;
+    },
+    async put(key, v) {
+      const p = parse(key);
+      if (!p) return base.put(key, v);
+      const b = await load(p.pre);
+      if (p.id === undefined) {
+        b.order = JSON.parse(v);
+        const keep = new Set(b.order);
+        for (const id of Object.keys(b.map)) if (!keep.has(id)) delete b.map[id];
+      } else {
+        b.map[p.id] = JSON.parse(v);
+      }
+      dirty.add(p.pre + "jobsdb");
+    },
+    async delete(key) {
+      const p = parse(key);
+      if (!p) return base.delete(key);
+      const b = await load(p.pre);
+      if (p.id !== undefined) { delete b.map[p.id]; b.order = b.order.filter((x) => x !== p.id); }
+      dirty.add(p.pre + "jobsdb");
+    },
+    list: (opts) => base.list(opts),
+    async flush() {
+      for (const bk of dirty) await base.put(bk, JSON.stringify(await blobs.get(bk)));
+      dirty.clear();
+      if (base.deletePrefix) for (const pre of converted.splice(0)) await base.deletePrefix(pre + "job:");   // old records (D1 only)
+    },
+  };
+}
 
 // ---------- storage helpers ----------
 
@@ -235,7 +367,7 @@ async function wakeAgent(env) {
   } catch (e) {
     res = "אין תשובה מ-Render: " + (e.message || e);
   }
-  await addLog(env, "worker", "השכמת שרת ההורדות: " + (res === "ok" ? "✓ ענה" : res));
+  if (res !== "ok") await addLog(env, "worker", "השכמת שרת ההורדות: " + res);   // success isn't logged (saves writes)
   return res;
 }
 
@@ -332,7 +464,7 @@ async function route(req, env, ctx) {
   }
   const p = bareApi ? url.pathname : url.pathname.slice(BASE.length) || "/";
   const wake = () => ctx.waitUntil(wakeAgent(env));
-  if (!env.DB) {
+  if (!env.DB && !env.SQL) {
     return page("הגדרה חסרה", `<p>חסר חיבור למסד נתונים (KV) בשם <b>DB</b>.</p>
 <p>ב-Cloudflare: <b>Workers & Pages ← my-gemini ← Settings ← Bindings ← Add ← KV namespace</b>,
 Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Storage & databases ← Workers KV ← Create). אחר כך מרעננים.</p>`);
@@ -345,7 +477,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       return json({ error: "unauthorized" }, 401);
     }
     const agent = await getJSON(env, "agent", {});
-    if (!agent.seen || Date.now() - Date.parse(agent.seen) > 60000) {
+    if (!agent.seen || Date.now() - Date.parse(agent.seen) > 180000) {
       agent.seen = new Date().toISOString();
       await putJSON(env, "agent", agent);
     }
@@ -789,7 +921,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       // Heartbeat from the desktop app (written at most every 3 minutes to
       // stay inside the free KV write quota).
       const pc = await getJSON(env, "pc", {});
-      if (!pc.seen || Date.now() - Date.parse(pc.seen) > 180000) {
+      if (!pc.seen || Date.now() - Date.parse(pc.seen) > 600000) {
         await putJSON(env, "pc", { seen: new Date().toISOString() });
       }
     }
@@ -1498,7 +1630,7 @@ $("autoDl").checked = !!load("autoDlSince");
 $("autoDl").onchange = (e) => store("autoDlSince", e.target.checked ? new Date().toISOString() : undefined);
 let dlBusy = false;
 // The desktop app pings every few minutes; while it's running it downloads.
-const pcActive = () => S.pc && S.pc.seen && Date.now() - Date.parse(S.pc.seen) < 8 * 60000;
+const pcActive = () => S.pc && S.pc.seen && Date.now() - Date.parse(S.pc.seen) < 25 * 60000;
 async function autoDownload() {
   const since = load("autoDlSince");
   if (!since || dlBusy || APP() || pcActive()) return;   // the desktop app handles it
@@ -1539,7 +1671,9 @@ async function initDesktop() {
 window.addEventListener("pywebviewready", initDesktop);
 
 render(); autoDownload(); initDesktop();
-setInterval(refresh, 8000); setInterval(pollProgress, 3000);
+// Only while the page is on screen (every refresh costs database reads).
+setInterval(() => { if (!document.hidden) refresh(); }, 8000); setInterval(() => { if (!document.hidden) pollProgress(); }, 3000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 </script>`;
 }
 
