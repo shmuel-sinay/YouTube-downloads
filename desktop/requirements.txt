@@ -5,3 +5,6 @@ truststore
 pywebview
 # ffmpeg bundled inside the app, for converting to MP3 on the PC
 imageio-ffmpeg
+# Tray icon (keeps running in the background) + loading the icon for it
+pystray
+pillow

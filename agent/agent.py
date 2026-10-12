@@ -381,8 +381,52 @@ def handle(job: dict) -> None:
         PROGRESS.pop(job["videoId"], None)
 
 
+def handle_list(job: dict) -> None:
+    """A 'download N videos from this channel' request: list the channel
+    with yt-dlp (no download), pick the newest N that fit the filters and
+    hand them to the Worker as regular jobs."""
+    vid, count, min_s = job["videoId"], int(job.get("count") or 10), int(job.get("minMinutes") or 0) * 60
+    log(f"-> מחפש {count} סרטונים: {job.get('channelName')}")
+    set_progress(vid, stage="start", pct=None, started=time.time(), mode="m4a")
+    cmd = ["yt-dlp", job["url"], "--flat-playlist", "--no-warnings",
+           "--playlist-end", str(min(count * (3 if min_s else 1) + 5, 600)),
+           "--print", "%(id)s\t%(duration)s\t%(title)s",
+           "--js-runtimes", "node", "--impersonate", "chrome"]
+    cookies = cookies_path()
+    if cookies:
+        cmd += ["--cookies", cookies]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    items = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3 or len(parts[0]) != 11:
+            continue
+        try:
+            dur = float(parts[1])
+        except ValueError:
+            dur = None                  # unknown here; the real download still filters
+        if min_s and dur is not None and dur < min_s:
+            continue
+        items.append({"videoId": parts[0], "title": parts[2], "duration": dur})
+        if len(items) >= count:
+            break
+    if not items:
+        errs = [l for l in r.stderr.splitlines() if "ERROR" in l]
+        api("/api/report", {"videoId": vid, "status": "failed",
+                            "error": errs[-1] if errs else "לא נמצאו סרטונים מתאימים"})
+        log("   לא נמצאו סרטונים")
+        return
+    res = api("/api/enqueue", {"items": items, "mode": job.get("mode"), "minMinutes": job.get("minMinutes"),
+                                "channelId": job.get("channelId"), "channelName": job.get("channelName")})
+    msg = f"נוספו לתור {res.get('added', 0)} סרטונים" + (f" ({res['skipped']} כבר היו)" if res.get("skipped") else "")
+    api("/api/report", {"videoId": vid, "status": "done", "error": msg})
+    log("   " + msg)
+
+
 def _handle(job: dict) -> None:
     vid = job["videoId"]
+    if job.get("kind") == "list":
+        return handle_list(job)
     log(f"-> מוריד: {job['title']} ({job['url']})")
     # pcConvert jobs skip the MP3 encode here — weigh them like fast audio.
     set_progress(vid, stage="start", pct=None, started=time.time(),

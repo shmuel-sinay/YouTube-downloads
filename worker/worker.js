@@ -282,6 +282,17 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (out.length) await addLog(env, "worker", `הסוכן לקח ${out.length} משימות: ` + out.map((j) => j.title).join(" | "));
       return json({ jobs: out });
     }
+    if (p === "/api/enqueue" && req.method === "POST") {
+      // Videos found by a 'list' job. Skip ones already in the list.
+      const b = await req.json();
+      const known = new Set(await getJobIds(env));
+      const fresh = (b.items || []).filter((it) => it.videoId && !known.has(it.videoId)).map((it) => ({
+        videoId: it.videoId, channelId: b.channelId || "", channelName: b.channelName || "",
+        title: it.title || it.videoId, published: "", url: "https://www.youtube.com/watch?v=" + it.videoId,
+        mode: modeOf(b.mode), minMinutes: b.minMinutes || 0, status: "queued", updated: new Date().toISOString() }));
+      await addJobs(env, fresh);
+      return json({ added: fresh.length, skipped: (b.items || []).length - fresh.length });
+    }
     if (p === "/api/check" && req.method === "POST") {
       // The agent asks every few seconds whether its job was cancelled.
       const b = await req.json();
@@ -351,6 +362,10 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     // The desktop app reports what it downloaded / why it couldn't.
     const b = await req.json();
     await addLogs(env, "pc", (b.lines || []).slice(-50).map(String));
+    for (const id of (b.got || []).slice(0, 100)) {      // files now on the PC
+      const j = await getJSON(env, "job:" + id, null);
+      if (j && !j.pcGot) { j.pcGot = true; await putJSON(env, "job:" + id, j); }
+    }
     return json({ ok: true });
   }
   if (req.method === "POST") {
@@ -392,6 +407,26 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (p === "/jobs/retry") {
       const j = await getJSON(env, "job:" + f.get("id"), null);
       if (j) { j.status = "queued"; j.error = ""; j.updated = new Date().toISOString(); await putJSON(env, "job:" + j.videoId, j); wake(); }
+      return redirect(BASE + "/");
+    }
+    if (p === "/jobs/batch") {
+      // "Download N videos from a channel": one 'list' job; the agent lists
+      // the channel with yt-dlp (any number — RSS only shows the last 15)
+      // and sends the videos back to /api/enqueue as regular jobs.
+      const id = await resolveChannelId(String(f.get("channel") || ""));
+      const { name } = await readFeed(id).catch(() => ({ name: id }));
+      const count = Math.max(1, Math.min(300, parseInt(f.get("count") || "10", 10) || 10));
+      const skipShorts = f.get("skipShorts") === "on";
+      const lid = "list-" + id + "-" + Date.now().toString(36);
+      await addJobs(env, [{
+        videoId: lid, kind: "list", channelId: id, channelName: name,
+        title: `${count} סרטונים אחרונים מ-${name}`,
+        // the "videos" tab has no Shorts; the uploads playlist (UU…) has everything
+        url: skipShorts ? `https://www.youtube.com/channel/${id}/videos` : `https://www.youtube.com/playlist?list=UU${id.slice(2)}`,
+        count, mode: modeOf(f.get("mode")), minMinutes: Math.max(0, parseInt(f.get("minMinutes") || "0", 10) || 0),
+        status: "queued", priority: Date.now(), updated: new Date().toISOString() }]);
+      await addLog(env, "worker", `בקשה: ${count} סרטונים מ-${name}`);
+      wake();
       return redirect(BASE + "/");
     }
     if (p === "/jobs/pause") {
@@ -456,351 +491,522 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     }
   }
 
-  if (p === "/status") return json(await state(env));
+  if (p === "/status") {
+    if (url.searchParams.get("client") === "pc") {
+      // Heartbeat from the desktop app (written at most every 3 minutes to
+      // stay inside the free KV write quota).
+      const pc = await getJSON(env, "pc", {});
+      if (!pc.seen || Date.now() - Date.parse(pc.seen) > 180000) {
+        await putJSON(env, "pc", { seen: new Date().toISOString() });
+      }
+    }
+    return json(await state(env));
+  }
   if (p === "/") return page("מעקב ערוצים", await dashboard(env));
   return new Response("Not found", { status: 404 });
+}
+
+// Download kinds. "m4a" keeps YouTube's own audio (no MP3 conversion), which
+// is many times faster on a small server.
+const MODES = { audio: "שיר · MP3", m4a: "שיר מהיר · M4A", video: "סרטון · MP4" };
+const modeOf = (v) => (v in MODES ? v : "audio");
+
+const STATUS = { queued: "ממתין", taken: "בהורדה", done: "הושלם", failed: "נכשל", skipped: "דולג", cancelled: "בוטל", paused: "מושהה" };
+
+// Everything the page shows — also polled by the page every few seconds.
+async function state(env) {
+  const [channels, jobs, logs, agent, lastCheck, settings, pc] = await Promise.all([
+    getChannels(env), listJobs(env), getJSON(env, "logs", []),
+    getJSON(env, "agent", {}), getJSON(env, "lastCheck", null), getJSON(env, "settings", {}), getJSON(env, "pc", {})]);
+  return { channels, jobs: jobs.slice(0, 200), logs: logs.slice(-LOG_CAP), agent, lastCheck, settings, pc,
+           renderUrl: env.RENDER_URL || "", now: new Date().toISOString() };
 }
 
 // ---------- HTML ----------
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-// Download kinds. "m4a" keeps YouTube's own audio (no MP3 conversion), which
-// is many times faster on a small server.
-const MODES = { audio: "🎵 שיר (MP3)", m4a: "⚡ שיר מהיר (M4A)", video: "🎬 סרטון (MP4)" };
-const modeOf = (v) => (v in MODES ? v : "audio");
-
-const STATUS = { queued: "ממתין", taken: "בהורדה", done: "ירד ✓", failed: "נכשל", skipped: "דולג", cancelled: "בוטל", paused: "מושהה" };
-
-// Everything the page shows — also polled by the page every few seconds.
-async function state(env) {
-  const [channels, jobs, logs, agent, lastCheck, settings] = await Promise.all([
-    getChannels(env), listJobs(env), getJSON(env, "logs", []),
-    getJSON(env, "agent", {}), getJSON(env, "lastCheck", null), getJSON(env, "settings", {})]);
-  return { channels, jobs: jobs.slice(0, 150), logs: logs.slice(-LOG_CAP), agent, lastCheck, settings,
-           renderUrl: env.RENDER_URL || "", now: new Date().toISOString() };
-}
+// Line icons (24×24, stroke) — drawn inline so nothing is loaded from outside.
+const IC = {
+  queue: '<path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/>',
+  channels: '<rect x="2" y="7" width="20" height="14" rx="2"/><path d="M17 2l-5 5-5-5"/>',
+  add: '<path d="M12 5v14M5 12h14"/>',
+  logs: '<path d="M4 17l6-6-6-6M12 19h8"/>',
+  settings: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
+  pause: '<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>',
+  play: '<path d="M6 4l14 8-14 8z"/>',
+  x: '<path d="M18 6L6 18M6 6l12 12"/>',
+  retry: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/>',
+  now: '<path d="M17 11l-5-5-5 5M17 18l-5-5-5 5"/>',
+  refresh: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/>',
+  zap: '<path d="M13 2L3 14h9l-1 8 10-12h-9z"/>',
+  chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  trash: '<path d="M3 6h18M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6M9 6V4h6v2"/>',
+  music: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
+  video: '<path d="M23 7l-7 5 7 5z"/><rect x="1" y="5" width="15" height="14" rx="2"/>',
+  layers: '<path d="M12 2L2 7l10 5 10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  folder: '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>',
+  server: '<rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+  check: '<path d="M20 6L9 17l-5-5"/>',
+  alert: '<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>',
+  link: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/>',
+  monitor: '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>',
+};
+const icon = (n, cls = "") => `<svg class="i ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${IC[n] || ""}</svg>`;
 
 // The app icon (same as desktop/icon.svg), used as the browser-tab icon.
 const ICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E %3Cdefs%3E %3ClinearGradient id='bg' x1='0' y1='0' x2='1' y2='1'%3E %3Cstop offset='0' stop-color='%238ab4f8'/%3E %3Cstop offset='1' stop-color='%233367d6'/%3E %3C/linearGradient%3E %3ClinearGradient id='badge' x1='0' y1='0' x2='0' y2='1'%3E %3Cstop offset='0' stop-color='%23ff6b5e'/%3E %3Cstop offset='1' stop-color='%23e2382b'/%3E %3C/linearGradient%3E %3C/defs%3E %3Crect x='8' y='8' width='240' height='240' rx='56' fill='url%28%23bg%29'/%3E %3Cpath d='M128 52 v92' stroke='%23fff' stroke-width='26' stroke-linecap='round'/%3E %3Cpath d='M84 104 L128 148 L172 104' fill='none' stroke='%23fff' stroke-width='26' stroke-linecap='round' stroke-linejoin='round'/%3E %3Cpath d='M58 156 v26 a14 14 0 0 0 14 14 h112 a14 14 0 0 0 14 -14 v-26' fill='none' stroke='%23fff' stroke-width='22' stroke-linecap='round' stroke-linejoin='round'/%3E %3Ccircle cx='196' cy='62' r='40' fill='url%28%23badge%29' stroke='%23fff' stroke-width='8'/%3E %3Cpath d='M184 44 L216 62 L184 80 Z' fill='%23fff' stroke='%23fff' stroke-width='6' stroke-linejoin='round'/%3E %3C/svg%3E";
 
 const CSS = `
-:root{--bg:#131314;--panel:#1e1f20;--panel2:#26272a;--line:#3a3b3d;--text:#e3e3e3;--muted:#9aa0a6;
---primary:#8ab4f8;--ok:#81c995;--warn:#fdd663;--bad:#f28b82;--radius:14px}
-*{box-sizing:border-box}
-body{margin:0;font-family:Rubik,system-ui,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:15px}
-a{color:var(--primary)}
-.wrap{max-width:980px;margin:0 auto;padding:16px}
-header.top{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:14px}
-header.top h1{margin:0;font-size:1.35rem;color:var(--primary)}
-.btn{font:inherit;border:0;border-radius:999px;padding:8px 16px;cursor:pointer;background:var(--primary);color:#202124;font-weight:600;text-decoration:none;display:inline-block}
-.btn.ghost{background:transparent;color:var(--primary);border:1px solid var(--line)}
-.btn.small{padding:4px 12px;font-size:.85rem}
-.btn:disabled{opacity:.5;cursor:wait}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px;margin-bottom:14px}
-.status-bar{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-.pill{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:999px;background:var(--panel2);font-size:.85rem;color:var(--muted)}
-.dot{width:9px;height:9px;border-radius:50%;background:var(--muted)}
-.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
-.tabs{display:flex;gap:6px;margin:6px 0 14px;flex-wrap:wrap}
-.tab{background:transparent;border:1px solid var(--line);color:var(--muted);border-radius:999px;padding:7px 16px;cursor:pointer;font:inherit}
-.tab.on{background:var(--primary);color:#202124;border-color:var(--primary);font-weight:600}
-.hidden{display:none!important}
-input,select{font:inherit;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:8px 10px}
-input:focus,select:focus{outline:none;border-color:var(--primary)}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
-.grow{flex:1;min-width:200px}
-.muted{color:var(--muted);font-size:.85rem}
-.job{display:flex;gap:12px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)}
-.job:last-child{border-bottom:0}
-.thumb{width:96px;height:54px;border-radius:8px;object-fit:cover;background:var(--panel2);flex:none}
-.job .info{flex:1;min-width:0}
-.job .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.chip{font-size:.8rem;padding:3px 10px;border-radius:999px;background:var(--panel2);white-space:nowrap}
-.chip.done{color:var(--ok)}.chip.failed{color:var(--bad)}.chip.cancelled{color:var(--muted);text-decoration:line-through}.chip.paused{color:var(--primary)}
-.job .acts{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.chip.queued,.chip.taken{color:var(--warn)}.chip.skipped{color:var(--muted)}
-.err{color:var(--bad);font-size:.8rem;margin-top:2px;word-break:break-word}
-.ch{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);gap:10px}
+:root{--bg:#0e1015;--side:#12151b;--panel:#171a21;--panel2:#1e222b;--line:#262b36;--text:#e7e9ee;--muted:#8a92a3;
+--primary:#4f8cff;--primary2:#3b74e0;--ok:#2fbf87;--warn:#f0b43c;--bad:#f06464;--radius:12px;--shadow:0 1px 2px #0004,0 4px 16px #0003}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;font-family:Rubik,"Segoe UI",system-ui,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:14.5px;-webkit-font-smoothing:antialiased}
+a{color:var(--primary);text-decoration:none}
+.i{width:18px;height:18px;flex:none;vertical-align:middle}
+.app{display:flex;min-height:100vh}
+/* sidebar */
+.side{width:232px;flex:none;background:var(--side);border-inline-end:1px solid var(--line);padding:18px 12px;display:flex;flex-direction:column;gap:4px;position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 10px 18px;font-weight:700;font-size:1.05rem}
+.brand img{width:30px;height:30px}
+.nav{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:10px;color:var(--muted);cursor:pointer;border:0;background:none;font:inherit;width:100%;text-align:start}
+.nav:hover{background:var(--panel);color:var(--text)}
+.nav.on{background:#4f8cff1f;color:var(--primary);font-weight:600}
+.nav .count{margin-inline-start:auto;background:var(--panel2);color:var(--text);border-radius:999px;padding:1px 8px;font-size:.75rem}
+.side .grow{flex:1}
+/* main */
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{display:flex;align-items:center;gap:12px;padding:16px 28px;border-bottom:1px solid var(--line);background:var(--bg);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+.topbar h1{margin:0;font-size:1.25rem;font-weight:600;flex:1}
+.content{padding:24px 28px;max-width:1100px;width:100%}
+.status{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:.85rem;background:var(--panel)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}.dot.ok{background:var(--ok);box-shadow:0 0 0 3px #2fbf8726}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
+/* buttons */
+.btn{display:inline-flex;align-items:center;gap:8px;font:inherit;font-weight:500;border:1px solid transparent;border-radius:10px;padding:8px 14px;cursor:pointer;background:var(--primary);color:#fff;transition:background .15s,border-color .15s}
+.btn:hover{background:var(--primary2)}.btn:disabled{opacity:.5;cursor:wait}
+.btn.ghost{background:var(--panel);border-color:var(--line);color:var(--text)}.btn.ghost:hover{border-color:#3a4150;background:var(--panel2)}
+.ibtn{display:inline-grid;place-items:center;width:34px;height:34px;border-radius:9px;border:1px solid var(--line);background:var(--panel);color:var(--muted);cursor:pointer;transition:all .15s}
+.ibtn:hover{color:var(--text);border-color:#3a4150;background:var(--panel2)}
+.ibtn.primary{color:var(--primary)}.ibtn.danger:hover{color:var(--bad);border-color:#f0646466}.ibtn.go{background:var(--primary);border-color:var(--primary);color:#fff}
+.ibtn .i{width:16px;height:16px}
+/* cards & forms */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:20px;margin-bottom:16px;box-shadow:var(--shadow)}
+.card h2{margin:0 0 4px;font-size:1rem;font-weight:600;display:flex;align-items:center;gap:8px}
+.card .sub{color:var(--muted);font-size:.85rem;margin:0 0 16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.field{display:flex;flex-direction:column;gap:6px;font-size:.82rem;color:var(--muted)}
+.field.wide{grid-column:1/-1}
+input,select{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:9px 11px;width:100%}
+input:focus,select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px #4f8cff26}
+.check{display:flex;align-items:center;gap:8px;color:var(--text);font-size:.9rem;cursor:pointer}
+.check input{width:auto}
+.actions-row{display:flex;justify-content:flex-end;margin-top:16px}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+/* segmented filter */
+.seg{display:inline-flex;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:3px;gap:2px;margin-bottom:14px}
+.seg button{border:0;background:none;color:var(--muted);font:inherit;padding:6px 14px;border-radius:7px;cursor:pointer}
+.seg button.on{background:var(--panel2);color:var(--text);font-weight:500}
+/* queue */
+.list{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}
+.row{display:flex;gap:14px;align-items:flex-start;padding:14px 16px;border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:0}.row:hover{background:#ffffff05}
+.thumb{width:112px;height:63px;border-radius:8px;object-fit:cover;background:var(--panel2);flex:none;display:grid;place-items:center;color:var(--muted)}
+.thumb .i{width:24px;height:24px}
+.info{flex:1;min-width:0}
+.title{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;color:var(--muted);font-size:.8rem;margin-top:4px}
+.meta .i{width:13px;height:13px}
+.sep{opacity:.4}
+.note{font-size:.8rem;margin-top:6px;color:var(--muted);word-break:break-word}.note.bad{color:var(--bad)}
+.badge{display:inline-flex;align-items:center;gap:6px;font-size:.76rem;font-weight:500;padding:3px 10px;border-radius:999px;white-space:nowrap;background:var(--panel2);color:var(--muted)}
+.badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.b-done{color:var(--ok);background:#2fbf871a}.b-failed{color:var(--bad);background:#f064641a}.b-taken{color:var(--primary);background:#4f8cff1f}
+.b-queued{color:var(--warn);background:#f0b43c1a}.b-paused{color:#a78bfa;background:#a78bfa1f}
+.side-col{display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex:none}
+.acts{display:flex;gap:6px}
+.empty{padding:48px 16px;text-align:center;color:var(--muted)}
+.empty .i{width:36px;height:36px;margin-bottom:8px;opacity:.6}
+/* progress */
+.prog{margin-top:10px;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.steps{display:flex;gap:4px;margin-bottom:10px}
+.step{flex:1;font-size:.72rem;color:var(--muted);text-align:center;padding-top:6px;border-top:3px solid var(--line)}
+.step.done{border-color:var(--ok);color:var(--ok)}.step.now{border-color:var(--primary);color:var(--text);font-weight:600}
+.pline{display:flex;justify-content:space-between;font-size:.8rem;margin:6px 0 4px}
+.pline b{font-weight:600}
+.bar{height:8px;border-radius:999px;background:var(--panel2);overflow:hidden}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--primary),#7aa8ff);border-radius:999px;transition:width .6s}
+.bar.thin{height:4px}.bar.busy>i{animation:pulse 1s ease-in-out infinite alternate}
+@keyframes pulse{from{opacity:.35}to{opacity:1}}
+.nums{font-size:.75rem;color:var(--muted);margin-top:6px;direction:ltr;text-align:right;font-variant-numeric:tabular-nums}
+/* channels */
+.ch{display:flex;align-items:center;gap:14px;padding:14px 16px;border-bottom:1px solid var(--line)}
 .ch:last-child{border-bottom:0}
-.logs{font-family:ui-monospace,Consolas,monospace;font-size:.82rem;direction:ltr;text-align:left;background:#0d0d0e;border-radius:10px;padding:10px;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
-.logs .l{padding:2px 0;border-bottom:1px solid #1b1b1d}
-.logs .t{color:var(--muted)}.logs .s-render{color:var(--primary)}.logs .s-worker{color:var(--ok)}.logs .s-pc{color:var(--warn)}
-.logs .bad{color:var(--bad)}
-#toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);padding:10px 16px;border-radius:12px;display:none;max-width:90%}
-.login{max-width:380px;margin:12vh auto;text-align:center}
-.prog{margin-top:8px;background:var(--panel2);border-radius:10px;padding:8px 10px}
-.steps{display:flex;gap:4px;flex-wrap:wrap;font-size:.75rem;margin-bottom:6px}
-.step{padding:2px 8px;border-radius:999px;color:var(--muted);background:var(--bg)}
-.step.done{color:var(--ok)}.step.now{background:var(--primary);color:#202124;font-weight:600}
-.bar{height:8px;border-radius:999px;background:var(--bg);overflow:hidden}
-.bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--primary),var(--ok));border-radius:999px;transition:width .6s}
-.bar.thin{height:5px}
-.bar.busy>i{opacity:.55;animation:pulse 1s ease-in-out infinite alternate}
-@keyframes pulse{from{opacity:.25}to{opacity:.8}}
-.pline{font-size:.8rem;margin:6px 0 3px;display:flex;justify-content:space-between}
-.prog .nums{font-size:.78rem;color:var(--muted);margin-top:4px;direction:ltr;text-align:right}
-.logs .m{unicode-bidi:isolate}
-@media (max-width:600px){.job{flex-wrap:wrap}.job .info{flex-basis:calc(100% - 100px)}.thumb{width:80px;height:45px}
-.job .chip{margin-inline-start:92px}}
-.login input{width:100%;margin:14px 0}
+.avatar{width:40px;height:40px;border-radius:50%;background:var(--panel2);display:grid;place-items:center;color:var(--primary);font-weight:700;flex:none}
+/* logs */
+.term{font-family:ui-monospace,"Cascadia Mono",Consolas,monospace;font-size:.8rem;background:#0a0c10;border:1px solid var(--line);border-radius:10px;padding:12px;height:62vh;overflow:auto;direction:ltr;text-align:left}
+.term .l{padding:3px 0;border-bottom:1px solid #ffffff08;white-space:pre-wrap;word-break:break-word}
+.term .t{color:#5d6576}.term .src{display:inline-block;min-width:62px}.term .s-worker{color:var(--ok)}.term .s-render{color:var(--primary)}.term .s-pc{color:var(--warn)}
+.term .m{unicode-bidi:isolate}.term .bad{color:var(--bad)}
+/* settings */
+.setting{display:flex;align-items:center;gap:16px;padding:14px 0;border-bottom:1px solid var(--line)}
+.setting:last-child{border-bottom:0}
+.setting .txt{flex:1}.setting .txt b{display:block;font-weight:500;margin-bottom:2px}.setting .txt span{color:var(--muted);font-size:.83rem}
+.switch{position:relative;width:42px;height:24px;flex:none}
+.switch input{opacity:0;width:0;height:0}
+.switch i{position:absolute;inset:0;background:var(--panel2);border:1px solid var(--line);border-radius:999px;cursor:pointer;transition:.2s}
+.switch i::before{content:"";position:absolute;width:18px;height:18px;top:2px;right:2px;background:var(--muted);border-radius:50%;transition:.2s}
+.switch input:checked+i{background:var(--primary);border-color:var(--primary)}
+.switch input:checked+i::before{background:#fff;transform:translateX(-18px)}
+/* toast & login */
+#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);box-shadow:var(--shadow);padding:10px 18px;border-radius:10px;display:none;max-width:90%;z-index:50}
+.login{max-width:380px;margin:14vh auto;text-align:center}
+.login img{width:56px;height:56px;margin-bottom:10px}
+.login input{margin:16px 0 12px}.login .btn{width:100%;justify-content:center}
+.hidden{display:none!important}
+/* mobile: sidebar becomes a bottom bar */
+@media (max-width:760px){
+  .side{position:fixed;bottom:0;top:auto;height:auto;width:100%;flex-direction:row;padding:6px;border:0;border-top:1px solid var(--line);z-index:20;justify-content:space-around}
+  .brand,.side .grow,.side .extra{display:none}
+  .nav{flex-direction:column;gap:3px;font-size:.68rem;padding:6px 4px;width:auto;flex:1;align-items:center}
+  .nav .count{display:none}
+  .content{padding:16px 14px 90px}.topbar{padding:12px 14px}
+  .thumb{width:84px;height:47px}
+  .row{flex-wrap:wrap}.side-col{flex-direction:row;align-items:center;width:100%;justify-content:space-between;padding-inline-start:98px}
+}
 `;
 
 function page(title, body) {
   return new Response(`<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>
 <link rel="icon" href="${ICON}">
-<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;700&display=swap" rel="stylesheet">
-<style>${CSS}</style></head><body><div class="wrap">${body}</div></body></html>`,
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>${CSS}</style></head><body>${body}</body></html>`,
     { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
 function loginForm(msg) {
   return `<form class="card login" method="post" action="${BASE}/login">
-<h2 style="color:var(--primary);margin-top:0">📺 מעקב ערוצים</h2>
-${msg ? `<p style="color:var(--bad)">${esc(msg)}</p>` : ""}
+<img src="${ICON}" alt=""><h2 style="justify-content:center">מעקב ערוצים</h2>
+<p class="sub">הכנס סיסמה כדי להמשיך</p>
+${msg ? `<p style="color:var(--bad);margin:0">${esc(msg)}</p>` : ""}
 <input type="password" name="password" placeholder="סיסמה" autofocus>
-<button class="btn" style="width:100%">כניסה</button>
-<p><a href="/">💬 מעבר ל-Gemini</a></p></form>`;
+<button class="btn">כניסה</button>
+<p style="margin:16px 0 0"><a href="/">${icon("chat")} מעבר ל-Gemini</a></p></form>`;
 }
 
 async function dashboard(env) {
   const initial = JSON.stringify(await state(env)).replace(/</g, "\\u003c");
-  return `
-<header class="top"><h1>📺 מעקב ערוצים</h1><a class="btn ghost" href="/">💬 מעבר ל-Gemini</a></header>
-
-<div class="card status-bar">
-  <span class="pill"><span class="dot" id="agentDot"></span><span id="agentText">…</span></span>
-  <span class="pill" id="checkText">…</span>
-  <button class="btn small" id="wakeBtn" type="button">⏰ הער את שרת ההורדות</button>
-  <label class="pill" style="cursor:pointer"><input type="checkbox" id="autoDl" style="margin:0"> הורדה אוטומטית למחשב</label>
-  <label class="pill" style="cursor:pointer" title="השרת מוריד את השמע המקורי בלי להמיר, והתוכנה במחשב ממירה ל-MP3 — הרבה יותר מהיר. דורש את התוכנה למחשב."><input type="checkbox" id="pcConvert" style="margin:0"> ⚡ המרה ל-MP3 במחשב (בתוכנה)</label>
-</div>
-
-<div class="tabs">
-  <button class="tab on" data-tab="queue">📥 תור והורדות <span id="qCount"></span></button>
-  <button class="tab" data-tab="channels">📡 ערוצים <span id="cCount"></span></button>
-  <button class="tab" data-tab="add">➕ הוספה</button>
-  <button class="tab" data-tab="logs">📜 לוגים</button>
-</div>
-
-<section id="tab-queue"><div class="card" id="jobs"></div></section>
-
-<section id="tab-channels" class="hidden">
-  <div class="card" id="channels"></div>
-  <div class="card row" style="margin-top:0"><button class="btn small" id="checkBtn" type="button">🔄 בדוק עכשיו</button>
-  <span class="muted">בדיקה אוטומטית כל 3 שעות</span></div>
-</section>
-
-<section id="tab-add" class="hidden">
-  <form class="card" data-action="/channels/add">
-    <b>הוספת ערוץ למעקב</b>
-    <div class="row"><input class="grow" name="channel" placeholder="קישור לערוץ / @handle / UC…" required></div>
-    <div class="row">
-      <select name="mode">${Object.entries(MODES).map(([k, v]) => `<option value="${k}">${v}</option>`).join("")}</select>
-      <label>אורך מינימלי <input name="minMinutes" type="number" min="0" value="0" style="width:70px"> דק׳</label>
-      <label><input type="checkbox" name="skipShorts" checked> בלי Shorts</label>
-      <label>להוריד עכשיו את <input name="backfill" type="number" min="0" max="15" value="0" style="width:60px"> האחרונים</label>
-    </div>
-    <div class="row"><button class="btn">הוסף ערוץ</button></div>
-  </form>
-  <form class="card" data-action="/jobs/add">
-    <b>הורדה חד-פעמית</b>
-    <div class="row"><input class="grow" name="url" placeholder="קישור לסרטון ביוטיוב" required>
-    <select name="mode">${Object.entries(MODES).map(([k, v]) => `<option value="${k}">${v}</option>`).join("")}</select>
-    <button class="btn">הוסף לתור</button></div>
-  </form>
-</section>
-
-<section id="tab-logs" class="hidden">
-  <div class="card">
-    <div class="row" style="margin:0 0 10px;justify-content:space-between">
-      <span class="muted"><span style="color:var(--ok)">worker</span> = Cloudflare · <span style="color:var(--primary)">render</span> = שרת ההורדות · <span style="color:var(--warn)">pc</span> = התוכנה במחשב</span>
-      <span><button class="btn small" id="copyLogs" type="button">📋 העתק הכל</button>
-      <button class="btn small ghost" id="clearLogs" type="button">ניקוי</button></span>
-    </div>
-    <div class="logs" id="logs"></div>
+  const modeOptions = Object.entries(MODES).map(([k, v]) => `<option value="${k}">${v}</option>`).join("");
+  return `<div class="app">
+<aside class="side">
+  <div class="brand"><img src="${ICON}" alt="">מעקב ערוצים</div>
+  <button class="nav on" data-page="queue">${icon("queue")}<span>תור הורדות</span><span class="count" id="qCount"></span></button>
+  <button class="nav" data-page="channels">${icon("channels")}<span>ערוצים</span><span class="count" id="cCount"></span></button>
+  <button class="nav" data-page="add">${icon("add")}<span>הוספה</span></button>
+  <button class="nav" data-page="logs">${icon("logs")}<span>לוגים</span></button>
+  <button class="nav" data-page="settings">${icon("settings")}<span>הגדרות</span></button>
+  <div class="grow"></div>
+  <a class="nav extra" href="/">${icon("chat")}<span>Gemini</span></a>
+</aside>
+<main class="main">
+  <div class="topbar">
+    <h1 id="pageTitle">תור הורדות</h1>
+    <span class="status"><span class="dot" id="agentDot"></span><span id="agentText">…</span></span>
+    <button class="btn ghost" id="wakeBtn" type="button">${icon("zap")}<span>הער שרת</span></button>
   </div>
-</section>
+  <div class="content">
 
+  <section data-p="queue">
+    <div class="seg" id="filter">
+      <button class="on" data-f="all">הכל</button><button data-f="active">פעילים</button>
+      <button data-f="done">הושלמו</button><button data-f="problem">בעיות</button>
+    </div>
+    <div class="list" id="jobs"></div>
+  </section>
+
+  <section data-p="channels" class="hidden">
+    <div class="list" id="channels"></div>
+    <div class="actions-row" style="justify-content:space-between;align-items:center">
+      <span class="sub" id="checkText" style="margin:0"></span>
+      <button class="btn ghost" id="checkBtn" type="button">${icon("refresh")}<span>בדוק עכשיו</span></button>
+    </div>
+  </section>
+
+  <section data-p="add" class="hidden">
+    <div class="cols">
+      <form class="card" data-action="/jobs/add">
+        <h2>${icon("download")}סרטון בודד</h2><p class="sub">קישור לסרטון ביוטיוב — יורד מיד.</p>
+        <div class="grid">
+          <label class="field wide">קישור<input name="url" placeholder="https://www.youtube.com/watch?v=…" required></label>
+          <label class="field">סוג<select name="mode">${modeOptions}</select></label>
+        </div>
+        <div class="actions-row"><button class="btn">${icon("add")}<span>הוסף לתור</span></button></div>
+      </form>
+      <form class="card" data-action="/jobs/batch">
+        <h2>${icon("layers")}כמות סרטונים מערוץ</h2><p class="sub">מוריד את הסרטונים האחרונים של ערוץ — כמה שתבחר.</p>
+        <div class="grid">
+          <label class="field wide">ערוץ<input name="channel" placeholder="קישור לערוץ / ‎@handle" required></label>
+          <label class="field">כמה סרטונים<input name="count" type="number" min="1" max="300" value="10"></label>
+          <label class="field">סוג<select name="mode">${modeOptions}</select></label>
+          <label class="field">אורך מינימלי (דקות)<input name="minMinutes" type="number" min="0" value="0"></label>
+          <label class="check" style="align-self:end;padding-bottom:10px"><input type="checkbox" name="skipShorts" checked>בלי Shorts</label>
+        </div>
+        <div class="actions-row"><button class="btn">${icon("download")}<span>הורד</span></button></div>
+      </form>
+      <form class="card" data-action="/channels/add">
+        <h2>${icon("channels")}ערוץ למעקב</h2><p class="sub">כל סרטון חדש שיעלה בערוץ יירד אוטומטית.</p>
+        <div class="grid">
+          <label class="field wide">ערוץ<input name="channel" placeholder="קישור לערוץ / ‎@handle / UC…" required></label>
+          <label class="field">סוג<select name="mode">${modeOptions}</select></label>
+          <label class="field">אורך מינימלי (דקות)<input name="minMinutes" type="number" min="0" value="0"></label>
+          <label class="field">להוריד עכשיו את האחרונים<input name="backfill" type="number" min="0" max="15" value="0"></label>
+          <label class="check" style="align-self:end;padding-bottom:10px"><input type="checkbox" name="skipShorts" checked>בלי Shorts</label>
+        </div>
+        <div class="actions-row"><button class="btn">${icon("add")}<span>הוסף ערוץ</span></button></div>
+      </form>
+    </div>
+  </section>
+
+  <section data-p="logs" class="hidden">
+    <div class="actions-row" style="margin:0 0 12px;gap:8px;justify-content:space-between;align-items:center">
+      <span class="sub" style="margin:0">worker = Cloudflare · render = שרת ההורדות · pc = התוכנה במחשב</span>
+      <span style="display:flex;gap:8px"><button class="btn ghost" id="copyLogs" type="button">${icon("copy")}<span>העתק</span></button>
+      <button class="btn ghost" id="clearLogs" type="button">${icon("trash")}<span>ניקוי</span></button></span>
+    </div>
+    <div class="term" id="logs"></div>
+  </section>
+
+  <section data-p="settings" class="hidden">
+    <div class="card">
+      <h2>${icon("settings")}הורדה והמרה</h2>
+      <div class="setting"><div class="txt"><b>המרה ל-MP3 במחשב</b><span>השרת מוריד את השמע המקורי בלי להמיר, והתוכנה במחשב ממירה תוך שניות. דורש את התוכנה למחשב.</span></div>
+        <label class="switch"><input type="checkbox" id="pcConvert"><i></i></label></div>
+      <div class="setting"><div class="txt"><b>הורדה אוטומטית בדפדפן</b><span>כשהדף פתוח בדפדפן, כל קובץ שמוכן יורד לבד — רק כשהתוכנה למחשב לא פועלת, כדי שלא יירד פעמיים. <b id="pcState" style="display:inline"></b></span></div>
+        <label class="switch"><input type="checkbox" id="autoDl"><i></i></label></div>
+    </div>
+    <div class="card hidden" id="desktopCard">
+      <h2>${icon("monitor")}התוכנה למחשב</h2>
+      <div class="setting"><div class="txt"><b>הפעלה עם Windows</b><span>התוכנה תעלה ברקע כשהמחשב נדלק ותמשיך להוריד גם כשהחלון סגור (אייקון ליד השעון).</span></div>
+        <label class="switch"><input type="checkbox" id="autostart"><i></i></label></div>
+      <div class="setting"><div class="txt"><b>תיקיית הורדות</b><span id="folderPath"></span></div>
+        <button class="btn ghost" id="openFolder" type="button">${icon("folder")}<span>פתח</span></button></div>
+      <div class="setting"><div class="txt"><b>גרסה</b><span id="appVersion"></span></div></div>
+    </div>
+    <div class="card">
+      <h2>${icon("server")}שרת ההורדות</h2>
+      <div class="setting"><div class="txt"><b>מצב</b><span id="agentInfo"></span></div>
+        <button class="btn ghost" id="wakeBtn2" type="button">${icon("zap")}<span>הער</span></button></div>
+    </div>
+  </section>
+
+  </div>
+</main>
+</div>
 <div id="toast"></div>
-
 <script>
-const B = ${JSON.stringify(BASE)};
-const STATUS = ${JSON.stringify(STATUS)};
-const MODES = ${JSON.stringify(MODES)};
-let S = ${initial};
+const B = ${JSON.stringify(BASE)}, STATUS = ${JSON.stringify(STATUS)}, MODES = ${JSON.stringify(MODES)}, IC = ${JSON.stringify(IC)};
+let S = ${initial}, P = {}, FILTER = "all", HAVE = new Set();
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const icon = (n) => '<svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + (IC[n] || "") + '</svg>';
 const ago = (iso) => { if (!iso) return "אף פעם"; const m = Math.round((Date.now() - Date.parse(iso)) / 60000);
   return m < 1 ? "עכשיו" : m < 60 ? "לפני " + m + " דק׳" : m < 1440 ? "לפני " + Math.round(m / 60) + " שע׳" : "לפני " + Math.round(m / 1440) + " ימים"; };
 const hhmm = (iso) => new Date(iso).toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-function toast(msg, ms = 4000) { const t = $("toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", ms); }
-
-function render() {
-  // agent status
-  const seen = S.agent && S.agent.seen, mins = seen ? (Date.now() - Date.parse(seen)) / 60000 : Infinity;
-  const busy = S.jobs.some((j) => j.status === "taken");
-  $("agentDot").className = "dot " + (mins < 5 ? "ok" : mins < 30 ? "warn" : "bad");
-  const info = S.agent && S.agent.info;
-  $("agentText").textContent = !S.renderUrl ? "RENDER_URL לא מוגדר" :
-    "שרת ההורדות: " + (busy ? "מוריד…" : mins < 5 ? "ער" : "ישן") + " · נראה " + ago(seen) +
-    (info && !info.cookies ? " · ⚠ אין עוגיות" : "");
-  $("checkText").textContent = "בדיקת ערוצים: " + ago(S.lastCheck && S.lastCheck.at);
-  // queue
-  const active = S.jobs.filter((j) => j.status === "queued" || j.status === "taken").length;
-  $("qCount").textContent = active ? "(" + active + ")" : "";
-  $("cCount").textContent = "(" + S.channels.length + ")";
-  $("jobs").innerHTML = S.jobs.length ? S.jobs.map((j) =>
-    '<div class="job"><img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">' +
-    '<div class="info"><div class="title" title="' + esc(j.title) + '">' + esc(j.title) + '</div>' +
-    '<div class="muted">' + esc(j.channelName) + ' · ' + (MODES[j.mode] || MODES.audio) + (j.pcConvert ? ' · ⚡ המרה במחשב' : '') + ' · ' + ago(j.updated) + '</div>' +
-    (j.error ? '<div class="' + (j.status === "failed" ? "err" : "muted") + '">' + esc(j.error) + '</div>' : '') +
-    (j.status === "taken" ? '<div class="prog" data-prog="' + esc(j.videoId) + '">' + progHtml(j.videoId) + '</div>' : '') + '</div>' +
-    '<span class="chip ' + esc(j.status) + '">' + (STATUS[j.status] || esc(j.status)) + '</span>' +
-    (j.fileUrl ? '<a class="btn small" href="' + esc(j.fileUrl) + '">⬇ הורדה</a>' : '') +
-    (["failed", "skipped", "taken", "cancelled"].includes(j.status) ? '<button class="btn small ghost" data-retry="' + esc(j.videoId) + '">שוב</button>' : '') +
-    (j.status === "queued" ? '<button class="btn small ghost" data-act="priority" data-id="' + esc(j.videoId) + '" title="להוריד את זה עכשיו, לפני כל השאר">⏫ עכשיו</button>' : '') +
-    (["queued", "taken"].includes(j.status) ? '<button class="btn small ghost" data-act="pause" data-id="' + esc(j.videoId) + '">⏸ השהה</button>' : '') +
-    (j.status === "paused" ? '<button class="btn small" data-act="resume" data-id="' + esc(j.videoId) + '">▶ המשך</button>' +
-      '<button class="btn small ghost" data-act="priority" data-id="' + esc(j.videoId) + '">⏫ עכשיו</button>' : '') +
-    (["queued", "taken", "paused"].includes(j.status) ? '<button class="btn small ghost" data-cancel="' + esc(j.videoId) + '" style="color:var(--bad)">✖ ביטול</button>' : '') +
-    '</div>').join("") : '<div class="muted">התור ריק. הוסף ערוץ או קישור בלשונית ➕ הוספה.</div>';
-  // channels
-  $("channels").innerHTML = S.channels.length ? S.channels.map((c) =>
-    '<div class="ch"><div><a href="https://www.youtube.com/channel/' + esc(c.id) + '" target="_blank">' + esc(c.name) + '</a>' +
-    '<div class="muted">' + (MODES[c.mode] || MODES.audio) + (c.minMinutes ? " · " + c.minMinutes + " דק׳ ומעלה" : "") +
-    (c.skipShorts ? " · בלי Shorts" : "") + '</div></div>' +
-    '<button class="btn small ghost" data-remove="' + esc(c.id) + '">הסר</button></div>').join("")
-    : '<div class="muted">עוד אין ערוצים. הוסף בלשונית ➕ הוספה.</div>';
-  // logs (newest at the bottom)
-  const box = $("logs"), atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
-  box.innerHTML = S.logs.length ? S.logs.map((l) => '<div class="l"><span class="t">' + hhmm(l.t) + '</span> <span class="s-' + esc(l.src) + '">[' + esc(l.src) + ']</span> ' +
-    '<span dir="auto" class="m ' + (/ERROR|⚠|נכשל|\\[!\\]|שגיא/.test(l.msg) ? "bad" : "") + '">' + esc(l.msg) + '</span></div>').join("") : '<span class="t">אין עדיין לוגים</span>';
-  if (atBottom) box.scrollTop = box.scrollHeight;
-}
-
-// ---- live progress panel: read straight from the download server ----
-let P = {};
-const STAGES = [["start", "⏳ מתחיל"], ["download", "⬇ הורדה"], ["convert", "⚙ המרה"], ["zip", "📦 אריזה ל-zip"], ["finish", "✓ סיום"]];
 const mmss = (s) => Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+function toast(msg, ms) { const t = $("toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", ms || 3500); }
+const APP = () => window.pywebview && window.pywebview.api;   // running inside the desktop app?
+
+// ---------- pages ----------
+const TITLES = { queue: "תור הורדות", channels: "ערוצים", add: "הוספה", logs: "לוגים", settings: "הגדרות" };
+function showPage(name) {
+  document.querySelectorAll(".nav[data-page]").forEach((n) => n.classList.toggle("on", n.dataset.page === name));
+  document.querySelectorAll("section[data-p]").forEach((s) => s.classList.toggle("hidden", s.dataset.p !== name));
+  $("pageTitle").textContent = TITLES[name];
+  try { localStorage.setItem("page", name); } catch (e) {}
+  if (name === "logs") { const b = $("logs"); b.scrollTop = b.scrollHeight; }
+}
+document.querySelectorAll(".nav[data-page]").forEach((n) => n.onclick = () => showPage(n.dataset.page));
+try { const p = localStorage.getItem("page"); if (p && TITLES[p]) showPage(p); } catch (e) {}
+document.querySelectorAll("#filter button").forEach((b) => b.onclick = () => {
+  FILTER = b.dataset.f; document.querySelectorAll("#filter button").forEach((x) => x.classList.toggle("on", x === b)); render(); });
+
+// ---------- rendering ----------
+const STAGES = [["start", "התחלה"], ["download", "הורדה"], ["convert", "המרה"], ["zip", "אריזה"], ["finish", "סיום"]];
 function progHtml(id) {
   const p = P[id];
-  if (!p) return '<div class="muted">⏳ ממתין לשרת ההורדות…</div>';
-  const at = STAGES.findIndex(([k]) => k === p.stage);
-  const steps = STAGES.map(([k, label], i) => '<span class="step ' + (i < at ? "done" : i === at ? "now" : "") + '">' + label + '</span>').join("");
-  const known = typeof p.pct === "number";
-  const overall = typeof p.overall === "number" ? p.overall : 0;
-  const stageName = (STAGES[at] || ["", ""])[1].replace(/^\\S+\\s/, "");
-  // Overall bar (whole job) + a thin bar for the current stage.
-  const big = '<div class="bar"><i style="width:' + overall + '%"></i></div>';
-  const small = '<div class="bar thin' + (known ? "" : " busy") + '"><i style="width:' + (known ? p.pct : 100) + '%"></i></div>';
-  const dl = p.stage === "download";
-  const nums = [dl && p.size ? p.size : "", dl && p.speed ? p.speed : "",
-    dl && p.eta && p.eta !== "NA" ? "ETA " + p.eta : "", p.part > 1 ? "part " + p.part + "/2" : "",
-    "⏱ " + mmss(p.elapsed || 0)].filter(Boolean).join(" · ");
+  if (!p) return '<div class="pline"><span>ממתין לשרת ההורדות…</span></div><div class="bar thin busy"><i style="width:100%"></i></div>';
+  const at = STAGES.findIndex((s) => s[0] === p.stage);
+  const steps = STAGES.map((s, i) => '<div class="step ' + (i < at ? "done" : i === at ? "now" : "") + '">' + s[1] + '</div>').join("");
+  const known = typeof p.pct === "number", overall = typeof p.overall === "number" ? p.overall : 0, dl = p.stage === "download";
+  const nums = [dl && p.size ? p.size : "", dl && p.speed ? p.speed : "", dl && p.eta && p.eta !== "NA" ? "ETA " + p.eta : "",
+    p.part > 1 ? "part " + p.part + "/2" : "", mmss(p.elapsed || 0)].filter(Boolean).join("  ·  ");
   return '<div class="steps">' + steps + '</div>' +
-    '<div class="pline"><b>סה״כ ' + overall.toFixed(0) + '%</b></div>' + big +
-    '<div class="pline">' + esc(stageName) + ': ' + (known ? p.pct.toFixed(1) + '%' : 'עובד…') + '</div>' + small +
+    '<div class="pline"><b>התקדמות כוללת</b><b>' + overall.toFixed(0) + '%</b></div><div class="bar"><i style="width:' + overall + '%"></i></div>' +
+    '<div class="pline"><span>' + ((STAGES[at] || ["", ""])[1]) + '</span><span>' + (known ? p.pct.toFixed(1) + "%" : "עובד…") + '</span></div>' +
+    '<div class="bar thin' + (known ? "" : " busy") + '"><i style="width:' + (known ? p.pct : 100) + '%"></i></div>' +
     '<div class="nums">' + esc(nums) + '</div>';
 }
-async function pollProgress() {
-  if (!S.renderUrl || !S.jobs.some((j) => j.status === "taken")) return;
-  try {
-    const r = await fetch(S.renderUrl.replace(/\\/$/, "") + "/progress", { cache: "no-store" });
-    P = (await r.json()).jobs || {};
-  } catch (e) { return; }
-  document.querySelectorAll("[data-prog]").forEach((el) => { el.innerHTML = progHtml(el.dataset.prog); });
+function btn(act, id, ic, title, cls) { return '<button class="ibtn ' + (cls || "") + '" data-act="' + act + '" data-id="' + esc(id) + '" title="' + title + '">' + icon(ic) + '</button>'; }
+function jobRow(j) {
+  const list = j.kind === "list";
+  const thumb = list ? '<div class="thumb">' + icon("layers") + '</div>'
+    : '<img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">';
+  const modeIc = j.mode === "video" ? "video" : "music";
+  const meta = [esc(j.channelName || "קישור ידני"), icon(modeIc) + " " + esc(MODES[j.mode] || MODES.audio),
+    j.pcConvert ? icon("zap") + " המרה במחשב" : "", j.pcGot ? icon("monitor") + " במחשב" : "",
+    icon("clock") + " " + ago(j.updated)].filter(Boolean).join('<span class="sep">•</span>');
+  const a = [];
+  if (j.status === "done" && APP() && HAVE.has(j.videoId)) a.push(btn("showfile", j.videoId, "folder", "פתח תיקייה", "primary"));
+  if (j.status === "done" && j.fileUrl) a.push(APP() ? btn("pcdl", j.videoId, "download", HAVE.has(j.videoId) ? "הורד שוב למחשב" : "הורד עכשיו למחשב", HAVE.has(j.videoId) ? "" : "go")
+    : '<a class="ibtn go" href="' + esc(j.fileUrl) + '" target="_blank" rel="noopener" title="הורדה">' + icon("download") + '</a>');
+  if (j.status === "queued") a.push(btn("priority", j.videoId, "now", "הורד עכשיו — לפני כל השאר", "primary"));
+  if (j.status === "paused") a.push(btn("resume", j.videoId, "play", "המשך", "primary"), btn("priority", j.videoId, "now", "הורד עכשיו"));
+  if (j.status === "queued" || j.status === "taken") a.push(btn("pause", j.videoId, "pause", "השהה"));
+  if (["failed", "skipped", "cancelled"].includes(j.status)) a.push(btn("retry", j.videoId, "retry", "נסה שוב"));
+  if (["queued", "taken", "paused"].includes(j.status)) a.push(btn("cancel", j.videoId, "x", "ביטול", "danger"));
+  return '<div class="row">' + thumb + '<div class="info"><div class="title" title="' + esc(j.title) + '">' + esc(j.title) + '</div>' +
+    '<div class="meta">' + meta + '</div>' +
+    (j.error ? '<div class="note' + (j.status === "failed" ? " bad" : "") + '">' + esc(j.error) + '</div>' : '') +
+    (j.status === "taken" ? '<div class="prog" data-prog="' + esc(j.videoId) + '">' + progHtml(j.videoId) + '</div>' : '') + '</div>' +
+    '<div class="side-col"><span class="badge b-' + esc(j.status) + '">' + (STATUS[j.status] || esc(j.status)) + '</span>' +
+    '<div class="acts">' + a.join("") + '</div></div></div>';
 }
-setInterval(pollProgress, 3000);
-
-async function refresh() {
-  try { S = await (await fetch(B + "/status")).json(); render(); autoDownload(); } catch (e) {}
+const IN = { all: () => true, active: (j) => ["queued", "taken", "paused"].includes(j.status), done: (j) => j.status === "done",
+             problem: (j) => ["failed", "skipped", "cancelled"].includes(j.status) };
+function render() {
+  const seen = S.agent && S.agent.seen, mins = seen ? (Date.now() - Date.parse(seen)) / 60000 : Infinity;
+  const busy = S.jobs.some((j) => j.status === "taken"), info = S.agent && S.agent.info;
+  $("agentDot").className = "dot " + (busy || mins < 5 ? "ok" : mins < 30 ? "warn" : "bad");
+  $("agentText").textContent = !S.renderUrl ? "RENDER_URL לא מוגדר" : busy ? "מוריד" : mins < 5 ? "שרת ער" : "שרת ישן";
+  $("agentInfo").textContent = "נראה " + ago(seen) + (info ? " · yt-dlp " + (info.ytdlp || "?") + " · עוגיות: " + (info.cookies ? "יש" : "אין!") : "");
+  const active = S.jobs.filter(IN.active).length;
+  $("qCount").textContent = active || ""; $("cCount").textContent = S.channels.length || "";
+  $("checkText").textContent = "בדיקה אחרונה: " + ago(S.lastCheck && S.lastCheck.at) + " · אוטומטית כל 3 שעות";
+  const jobs = S.jobs.filter(IN[FILTER]);
+  $("jobs").innerHTML = jobs.length ? jobs.map(jobRow).join("")
+    : '<div class="empty">' + icon("queue") + '<div>' + (FILTER === "all" ? "התור ריק — הוסף סרטון, ערוץ או כמות סרטונים בעמוד \\"הוספה\\"." : "אין פריטים כאן") + '</div></div>';
+  $("channels").innerHTML = S.channels.length ? S.channels.map((c) =>
+    '<div class="ch"><div class="avatar">' + esc((c.name || "?").trim().charAt(0)) + '</div><div class="info">' +
+    '<div class="title"><a href="https://www.youtube.com/channel/' + esc(c.id) + '" target="_blank" rel="noopener">' + esc(c.name) + '</a></div>' +
+    '<div class="meta">' + icon(c.mode === "video" ? "video" : "music") + ' ' + esc(MODES[c.mode] || MODES.audio) +
+    (c.minMinutes ? '<span class="sep">•</span>' + c.minMinutes + ' דק׳ ומעלה' : '') + (c.skipShorts ? '<span class="sep">•</span>בלי Shorts' : '') + '</div></div>' +
+    '<div class="acts">' + btn("batch", c.id, "download", "הורד כמות סרטונים מהערוץ", "primary") + btn("remove", c.id, "trash", "הסר ערוץ", "danger") + '</div></div>').join("")
+    : '<div class="empty">' + icon("channels") + '<div>עוד אין ערוצים במעקב</div></div>';
+  const box = $("logs"), atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  box.innerHTML = S.logs.length ? S.logs.map((l) => '<div class="l"><span class="t">' + hhmm(l.t) + '</span>  <span class="src s-' + esc(l.src) + '">' + esc(l.src) + '</span> ' +
+    '<span dir="auto" class="m' + (/ERROR|⚠|נכשל|\\[!\\]|שגיא/.test(l.msg) ? " bad" : "") + '">' + esc(l.msg) + '</span></div>').join("") : '<span class="t">אין עדיין לוגים</span>';
+  if (atBottom) box.scrollTop = box.scrollHeight;
+  $("pcConvert").checked = !!(S.settings && S.settings.pcConvert);
+  $("pcState").textContent = pcActive() ? "התוכנה פועלת עכשיו — היא מורידה." : "";
 }
 
+// ---------- data ----------
+async function refresh() { try { S = await (await fetch(B + "/status")).json(); render(); autoDownload(); } catch (e) {} }
 async function post(path, data) {
   const r = await fetch(B + path, { method: "POST", body: data });
   if (!r.ok) throw new Error((await r.text()).replace(/^Error: /, ""));
   return r;
 }
-
-// tabs (remembered in this browser)
-function showTab(name) {
-  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t.dataset.tab === name));
-  document.querySelectorAll("section[id^=tab-]").forEach((s) => s.classList.toggle("hidden", s.id !== "tab-" + name));
-  try { localStorage.setItem("tab", name); } catch (e) {}
-  if (name === "logs") { const b = $("logs"); b.scrollTop = b.scrollHeight; }
+async function pollProgress() {
+  if (!S.renderUrl || !S.jobs.some((j) => j.status === "taken")) return;
+  try { P = (await (await fetch(S.renderUrl.replace(/\\/$/, "") + "/progress", { cache: "no-store" })).json()).jobs || {}; } catch (e) { return; }
+  document.querySelectorAll("[data-prog]").forEach((el) => { el.innerHTML = progHtml(el.dataset.prog); });
 }
-document.querySelectorAll(".tab").forEach((t) => t.onclick = () => showTab(t.dataset.tab));
-try { const t = localStorage.getItem("tab"); if (t) showTab(t); } catch (e) {}
 
-// forms
+// ---------- actions ----------
 document.querySelectorAll("form[data-action]").forEach((f) => f.onsubmit = async (e) => {
   e.preventDefault();
-  const btn = f.querySelector("button"); btn.disabled = true;
-  try { await post(f.dataset.action, new FormData(f)); f.reset(); toast("✓ נוסף"); showTab("queue"); await refresh(); }
-  catch (err) { toast("✗ " + err.message, 8000); }
-  btn.disabled = false;
+  const b = f.querySelector("button"); b.disabled = true;
+  try { await post(f.dataset.action, new FormData(f)); f.reset(); toast("נוסף לתור"); showPage("queue"); await refresh(); }
+  catch (err) { toast("שגיאה: " + err.message, 8000); }
+  b.disabled = false;
 });
+const MSG = { pause: "הושהה", resume: "ממשיך", priority: "יורד עכשיו", retry: "חזר לתור", cancel: "בוטל", remove: "הוסר" };
 document.addEventListener("click", async (e) => {
-  const r = e.target.dataset.retry, rm = e.target.dataset.remove, cx = e.target.dataset.cancel;
-  const act = e.target.dataset.act;
-  if (act) {
-    const d = new FormData(); d.append("id", e.target.dataset.id);
-    await post("/jobs/" + act, d).catch((x) => toast(x.message));
-    toast({ pause: "⏸ הושהה", resume: "▶ ממשיך", priority: "⏫ יורד עכשיו" }[act]); refresh();
-  }
-  if (cx && confirm("לבטל את ההורדה?")) { const d = new FormData(); d.append("id", cx); await post("/jobs/cancel", d).catch((x) => toast(x.message)); toast("✖ בוטל"); refresh(); }
-  if (r) { const d = new FormData(); d.append("id", r); await post("/jobs/retry", d).catch((x) => toast(x.message)); refresh(); }
-  if (rm && confirm("להסיר את הערוץ?")) { const d = new FormData(); d.append("id", rm); await post("/channels/remove", d).catch((x) => toast(x.message)); refresh(); }
+  const el = e.target.closest("[data-act]"); if (!el) return;
+  const act = el.dataset.act, id = el.dataset.id, d = new FormData(); d.append("id", id);
+  try {
+    if (act === "cancel" && !confirm("לבטל את ההורדה?")) return;
+    if (act === "remove" && !confirm("להסיר את הערוץ מהמעקב?")) return;
+    if (act === "pcdl") { toast("מוריד למחשב…"); const r = await APP().download_now(id); toast(r || "ירד"); await loadHave(); render(); return; }
+    if (act === "showfile") { await APP().show_file(id); return; }
+    if (act === "batch") {
+      const n = prompt("כמה סרטונים אחרונים להוריד מהערוץ?", "10"); if (!n) return;
+      const c = S.channels.find((x) => x.id === id) || {};
+      d.append("channel", id); d.append("count", n); d.append("mode", c.mode || "audio");
+      d.append("minMinutes", c.minMinutes || 0); if (c.skipShorts) d.append("skipShorts", "on");
+      await post("/jobs/batch", d); toast("נוסף לתור"); showPage("queue"); refresh(); return;
+    }
+    const path = act === "remove" ? "/channels/remove" : act === "retry" ? "/jobs/retry" : "/jobs/" + act;
+    await post(path, d); toast(MSG[act] || "בוצע"); refresh();
+  } catch (x) { toast("שגיאה: " + x.message, 6000); }
 });
-$("wakeBtn").onclick = async () => {
-  const b = $("wakeBtn"); b.disabled = true; toast("מעיר את שרת ההורדות… (עד דקה)", 60000);
-  try { const r = await (await fetch(B + "/wake", { method: "POST" })).json(); toast(r.result === "ok" ? "✓ השרת ער ובודק את התור" : "✗ " + r.result, 10000); }
-  catch (e) { toast("✗ " + e); }
-  b.disabled = false; refresh();
-};
-$("checkBtn").onclick = async () => {
-  const b = $("checkBtn"); b.disabled = true;
-  try { await post("/check", new FormData()); toast("✓ נבדק"); } catch (e) { toast("✗ " + e.message); }
-  b.disabled = false; refresh();
-};
-$("pcConvert").checked = !!(S.settings && S.settings.pcConvert);
-$("pcConvert").onchange = async (e) => {
-  try { await fetch(B + "/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pcConvert: e.target.checked }) });
-        toast(e.target.checked ? "✓ שירים יומרו ל-MP3 בתוכנה במחשב" : "✓ שירים יומרו ל-MP3 בשרת"); }
-  catch (x) { toast("✗ " + x); }
-};
+async function wake(btnEl) {
+  btnEl.disabled = true; toast("מעיר את שרת ההורדות… (עד דקה)", 60000);
+  try { const r = await (await fetch(B + "/wake", { method: "POST" })).json(); toast(r.result === "ok" ? "השרת ער ובודק את התור" : "שגיאה: " + r.result, 8000); }
+  catch (e) { toast("שגיאה: " + e); }
+  btnEl.disabled = false; refresh();
+}
+$("wakeBtn").onclick = () => wake($("wakeBtn")); $("wakeBtn2").onclick = () => wake($("wakeBtn2"));
+$("checkBtn").onclick = async () => { const b = $("checkBtn"); b.disabled = true;
+  try { await post("/check", new FormData()); toast("נבדק"); } catch (e) { toast("שגיאה: " + e.message); } b.disabled = false; refresh(); };
 $("clearLogs").onclick = async () => { await fetch(B + "/logs/clear", { method: "POST" }); refresh(); };
 $("copyLogs").onclick = async () => {
   const text = S.logs.map((l) => hhmm(l.t) + " [" + l.src + "] " + l.msg).join("\\n");
-  try { await navigator.clipboard.writeText(text); toast("✓ הועתק — אפשר להדביק"); }
-  catch (e) { const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); toast("✓ הועתק"); }
+  try { await navigator.clipboard.writeText(text); } catch (e) {
+    const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); }
+  toast("הלוג הועתק");
+};
+$("pcConvert").onchange = async (e) => {
+  try { await fetch(B + "/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pcConvert: e.target.checked }) });
+        toast(e.target.checked ? "שירים יומרו ל-MP3 בתוכנה במחשב" : "שירים יומרו ל-MP3 בשרת"); refresh(); }
+  catch (x) { toast("שגיאה: " + x); }
 };
 
-// Auto-download: each newly finished file is downloaded once (remembered in
-// this browser) — only files finished after the box was ticked.
+// ---------- browser auto-download (not needed inside the desktop app) ----------
 const store = (k, v) => { try { v === undefined ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} };
 const load = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
 $("autoDl").checked = !!load("autoDlSince");
 $("autoDl").onchange = (e) => store("autoDlSince", e.target.checked ? new Date().toISOString() : undefined);
 let dlBusy = false;
+// The desktop app pings every few minutes; while it's running it downloads.
+const pcActive = () => S.pc && S.pc.seen && Date.now() - Date.parse(S.pc.seen) < 8 * 60000;
 async function autoDownload() {
   const since = load("autoDlSince");
-  if (!since || dlBusy) return;
+  if (!since || dlBusy || APP() || pcActive()) return;   // the desktop app handles it
   dlBusy = true;
   const got = JSON.parse(load("autoDlGot") || "[]");
   for (const j of S.jobs) {
-    if (j.status !== "done" || !j.fileUrl || j.updated < since || got.includes(j.videoId)) continue;
+    if (j.status !== "done" || !j.fileUrl || j.pcGot || j.updated < since || got.includes(j.videoId)) continue;
     const f = document.createElement("iframe"); f.style.display = "none"; f.src = j.fileUrl; document.body.appendChild(f);
     got.push(j.videoId); store("autoDlGot", JSON.stringify(got.slice(-500)));
-    toast("⬇ מוריד: " + j.title);
-    await new Promise((r) => setTimeout(r, 1500));
+    toast("מוריד: " + j.title); await new Promise((r) => setTimeout(r, 1500));
   }
   dlBusy = false;
 }
 
-render(); autoDownload();
-setInterval(refresh, 8000);
+// ---------- desktop app extras ----------
+async function loadHave() { try { HAVE = new Set(await APP().downloaded()); } catch (e) {} }
+async function initDesktop() {
+  if (!APP()) return;
+  await loadHave(); setInterval(async () => { await loadHave(); render(); }, 15000);
+  try {
+    const info = await APP().app_info();
+    $("desktopCard").classList.remove("hidden");
+    $("folderPath").textContent = info.folder; $("appVersion").textContent = info.version || "פיתוח";
+    $("autostart").checked = !!info.autostart;
+    $("autostart").onchange = async (e) => { await APP().set_autostart(e.target.checked); toast(e.target.checked ? "תעלה עם Windows" : "לא תעלה עם Windows"); };
+    $("openFolder").onclick = () => APP().open_folder();
+    render();
+  } catch (e) {}
+}
+window.addEventListener("pywebviewready", initDesktop);
+
+render(); autoDownload(); initDesktop();
+setInterval(refresh, 8000); setInterval(pollProgress, 3000);
 </script>`;
 }
 

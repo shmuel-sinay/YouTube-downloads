@@ -115,9 +115,13 @@ class Downloader(threading.Thread):
         self.s = requests.Session()
         self.s.headers["User-Agent"] = "yt-tracker-desktop/1.0"
         self.state = load_json(STATE, {"got": [], "requeued": {}})
+        self.state.setdefault("files", {})       # videoId -> where the file was saved
+        self.pending_got: list[str] = []         # reported to the site (browser then skips them)
         self.pending_logs: list[str] = []
         self.last_wake = 0.0
         self.last_update_check = time.time()
+        self.lock = threading.Lock()          # one download at a time
+        self.notify = lambda title, msg: None  # set by the tray icon
 
     # -- helpers
     def log(self, msg: str, remote: bool = True) -> None:
@@ -131,13 +135,14 @@ class Downloader(threading.Thread):
             self.pending_logs.append(msg)
 
     def flush_logs(self) -> None:
-        if not self.pending_logs:
+        if not self.pending_logs and not self.pending_got:
             return
         lines, self.pending_logs = self.pending_logs[:], []
+        got, self.pending_got = self.pending_got[:], []
         try:
-            self.s.post(self.base + "/clientlog", json={"lines": lines}, timeout=20)
+            self.s.post(self.base + "/clientlog", json={"lines": lines, "got": got}, timeout=20)
         except Exception:
-            pass
+            self.pending_got = got + self.pending_got
 
     def login(self) -> bool:
         r = self.s.post(self.base + "/login", data={"password": self.cfg["password"]},
@@ -147,12 +152,14 @@ class Downloader(threading.Thread):
         return ok
 
     def status(self) -> dict:
-        r = self.s.get(self.base + "/status", timeout=30)
+        # "?client=pc" tells the site the app is running, so an open browser
+        # tab doesn't auto-download the same files too.
+        r = self.s.get(self.base + "/status?client=pc", timeout=30)
         if r.status_code != 200 or not r.headers.get("content-type", "").startswith("application/json"):
             # Cookie expired / wrong password → the login page comes back.
             if not self.login():
                 raise RuntimeError("לא מחובר")
-            r = self.s.get(self.base + "/status", timeout=30)
+            r = self.s.get(self.base + "/status?client=pc", timeout=30)
         return r.json()
 
     def save_state(self) -> None:
@@ -160,7 +167,23 @@ class Downloader(threading.Thread):
         save_json(STATE, self.state)
 
     # -- work
+    def download_now(self, vid: str) -> str:
+        """The site's download button inside the app: fetch this file now,
+        even if it was downloaded before."""
+        try:
+            job = next((j for j in self.status().get("jobs", []) if j.get("videoId") == vid), None)
+            if not job or not job.get("fileUrl"):
+                return "הקובץ לא מוכן"
+            self.download(job)
+            return "ירד לתיקייה"
+        except Exception as e:
+            return f"שגיאה: {e}"
+
     def download(self, job: dict) -> None:
+        with self.lock:
+            self._download(job)
+
+    def _download(self, job: dict) -> None:
         folder = Path(self.cfg["folder"])
         folder.mkdir(parents=True, exist_ok=True)
         url = job["fileUrl"]
@@ -189,8 +212,11 @@ class Downloader(threading.Thread):
             except zipfile.BadZipFile:
                 pass  # keep the file as it is
         self.state["got"].append(job["videoId"])
+        self.state["files"][job["videoId"]] = str(final)
         self.save_state()
+        self.pending_got.append(job["videoId"])
         self.log(f"ירד למחשב: {final.name}")
+        self.notify("ירד קובץ חדש", final.name)
 
     def convert_to_mp3(self, zpath: Path, folder: Path) -> Path:
         """The server sent the original audio (no MP3 encode, to save its
@@ -309,28 +335,245 @@ def _parse_iso(s) -> float:
 
 # ---------------------------------------------------------------- window
 
-def open_window(cfg: dict) -> None:
+# ---------------------------------------------------------------- install
+
+INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Programs" / APP
+UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\YTTracker"
+
+
+def _shortcut(lnk: Path, target: Path) -> None:
+    """Create a .lnk with Windows' own scripting object (no extra libraries)."""
+    ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:LNK);"
+          "$s.TargetPath=$env:TGT;$s.IconLocation=$env:TGT+',0';$s.WorkingDirectory=$env:DIR;$s.Save()")
+    env = {**os.environ, "LNK": str(lnk), "TGT": str(target), "DIR": str(target.parent)}
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], env=env,
+                   capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _shortcut_paths() -> list[Path]:
+    appdata = Path(os.environ.get("APPDATA") or Path.home())
+    desktop = Path(os.environ.get("USERPROFILE") or Path.home()) / "Desktop"
+    return [desktop / "מעקב ערוצים.lnk",
+            appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "מעקב ערוצים.lnk"]
+
+
+def install_if_needed() -> bool:
+    """First run from Downloads (or anywhere): copy the app to a permanent
+    place, add Desktop + Start-menu shortcuts and an Apps & features entry,
+    then restart from there. Returns True if this copy should exit."""
+    if not getattr(sys, "frozen", False):
+        return False
+    exe = Path(sys.executable).resolve()
+    target = INSTALL_DIR / "YTTracker.exe"
+    if exe.parent == INSTALL_DIR.resolve():
+        return False                     # already the installed copy
+    try:
+        INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(exe, target)
+        for lnk in _shortcut_paths():
+            lnk.parent.mkdir(parents=True, exist_ok=True)
+            _shortcut(lnk, target)
+        import winreg
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as k:
+            for name, val in (("DisplayName", "מעקב ערוצים (YTTracker)"), ("DisplayIcon", str(target)),
+                              ("Publisher", "YTTracker"), ("InstallLocation", str(INSTALL_DIR)),
+                              ("UninstallString", f'"{target}" --uninstall'),
+                              ("DisplayVersion", bundled_version()[:7] or "1")):
+                winreg.SetValueEx(k, name, 0, winreg.REG_SZ, val)
+            winreg.SetValueEx(k, "NoModify", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(k, "NoRepair", 0, winreg.REG_DWORD, 1)
+        if get_autostart():
+            set_autostart(True)          # point autostart at the installed copy
+        subprocess.Popen([str(target)] + [a for a in sys.argv[1:] if a != "--background"], close_fds=True)
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False                     # couldn't install — just run from here
+
+
+def uninstall() -> None:
+    """Apps & features → Uninstall. Settings in %APPDATA% are kept."""
+    import tkinter as tk
+    from tkinter import messagebox
+    r = tk.Tk(); set_tk_icon(r); r.withdraw()
+    if not messagebox.askyesno(APP, "להסיר את התוכנה מהמחשב?\n(הקבצים שהורדו לא יימחקו)", parent=r):
+        return
+    try:
+        set_autostart(False)
+    except Exception:
+        pass
+    for lnk in _shortcut_paths():
+        lnk.unlink(missing_ok=True)
+    try:
+        import winreg
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
+    except Exception:
+        pass
+    # A running exe can't delete itself: let cmd remove the folder after we exit.
+    subprocess.Popen(f'cmd /c timeout /t 2 /nobreak >nul & rmdir /s /q "{INSTALL_DIR}"', shell=True,
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    messagebox.showinfo(APP, "התוכנה הוסרה.", parent=r)
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+SINGLE_PORT = 47321   # local port that marks "already running"
+
+
+def get_autostart() -> bool:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, APP)
+        return True
+    except Exception:
+        return False
+
+
+def set_autostart(on: bool) -> None:
+    """Start with Windows, hidden in the tray (--background)."""
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if on:
+            winreg.SetValueEx(k, APP, 0, winreg.REG_SZ, f'"{sys.executable}" --background')
+        else:
+            try:
+                winreg.DeleteValue(k, APP)
+            except FileNotFoundError:
+                pass
+
+
+def already_running() -> bool:
+    """If another copy is running, ask it to show its window and say so."""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", SINGLE_PORT), timeout=1) as c:
+            c.sendall(b"show")
+        return True
+    except OSError:
+        return False
+
+
+def listen_for_show(show) -> None:
+    import socket
+    srv = socket.socket()
+    try:
+        srv.bind(("127.0.0.1", SINGLE_PORT))
+    except OSError:
+        return
+    srv.listen(1)
+
+    def loop():
+        while True:
+            c, _ = srv.accept()
+            c.close()
+            show()
+    threading.Thread(target=loop, daemon=True).start()
+
+
+class Api:
+    """Functions the site can call when it runs inside the app
+    (window.pywebview.api.…)."""
+    def __init__(self, cfg: dict, dl: "Downloader"):
+        self.cfg, self.dl = cfg, dl
+
+    def download_now(self, vid: str) -> str:
+        return self.dl.download_now(vid)
+
+    def open_folder(self) -> None:
+        os.startfile(self.cfg["folder"])
+
+    def show_file(self, vid: str) -> bool:
+        """Open the downloads folder with this video's file selected."""
+        path = self.dl.state.get("files", {}).get(vid)
+        if path and Path(path).exists():
+            subprocess.Popen(["explorer", "/select,", path])
+            return True
+        os.startfile(self.cfg["folder"])
+        return False
+
+    def downloaded(self) -> list:
+        """Which videos this computer already has (the site shows a folder button)."""
+        return [v for v, p in self.dl.state.get("files", {}).items() if Path(p).exists()]
+
+    def app_info(self) -> dict:
+        return {"folder": self.cfg["folder"], "version": bundled_version()[:7], "autostart": get_autostart()}
+
+    def set_autostart(self, on: bool) -> bool:
+        set_autostart(bool(on))
+        return get_autostart()
+
+
+def make_tray(on_open, on_quit, cfg: dict):
+    """Icon next to the clock: keeps the app running with the window closed."""
+    try:
+        import pystray
+        from PIL import Image
+        img = Image.open(icon_path())
+        menu = pystray.Menu(
+            pystray.MenuItem("פתח", lambda: on_open(), default=True),
+            pystray.MenuItem("פתח את תיקיית ההורדות", lambda: os.startfile(cfg["folder"])),
+            pystray.MenuItem("יציאה", lambda: on_quit()))
+        return pystray.Icon(APP, img, "מעקב ערוצים — מוריד ברקע", menu)
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def open_window(cfg: dict, dl: "Downloader", background: bool) -> None:
     url = cfg["site"].rstrip("/") + "/yt/"
+    state = {"quit": False}
     try:
         import webview  # pywebview — uses Edge WebView2, built into Windows 10/11
-
-        webview.create_window("מעקב ערוצים", url, width=1100, height=800, min_size=(420, 500))
-        # private_mode=False + storage_path: the site's login is remembered.
-        webview.start(private_mode=False, storage_path=str(DATA / "web"))
     except Exception:
-        # No WebView2: use the normal browser, keep a small window open so
-        # the downloader keeps running until it's closed.
-        traceback.print_exc()
-        webbrowser.open(url)
-        import tkinter as tk
-        root = tk.Tk()
-        set_tk_icon(root)
-        root.title(APP)
-        tk.Label(root, text="התוכנה מורידה ברקע לתיקייה:\n" + cfg["folder"] +
-                 "\n\nסגירת החלון עוצרת את ההורדות.", padx=20, pady=20).pack()
-        tk.Button(root, text="פתח את האתר", command=lambda: webbrowser.open(url)).pack(pady=(0, 6))
-        tk.Button(root, text="פתח את התיקייה", command=lambda: os.startfile(cfg["folder"])).pack(pady=(0, 16))
-        root.mainloop()
+        webview = None
+
+    if webview is None:
+        # No WebView2: tray only; "open" uses the normal browser.
+        tray = make_tray(lambda: webbrowser.open(url), lambda: tray.stop(), cfg)
+        if not background:
+            webbrowser.open(url)
+        if tray:
+            dl.notify = lambda t, m: tray.notify(m, t)
+            tray.run()
+        else:
+            while True:
+                time.sleep(3600)
+        return
+
+    win = webview.create_window("מעקב ערוצים", url, width=1200, height=820, min_size=(420, 520),
+                                hidden=background, js_api=Api(cfg, dl), background_color="#0e1015")
+
+    def show():
+        win.show()
+        win.restore()
+
+    def quit_app():
+        state["quit"] = True
+        if tray:
+            tray.stop()
+        win.destroy()
+
+    tray = make_tray(show, quit_app, cfg)
+
+    def on_closing():
+        # Closing the window hides it — downloads keep running in the tray.
+        if state["quit"] or tray is None:
+            return True
+        win.hide()
+        if not state.get("told"):
+            state["told"] = True
+            tray.notify("התוכנה ממשיכה להוריד ברקע. ליציאה: לחיצה ימנית על האייקון ליד השעון ← יציאה.", APP)
+        return False
+
+    win.events.closing += on_closing
+    if tray:
+        dl.notify = lambda t, m: tray.notify(m, t)
+        tray.run_detached()
+    listen_for_show(show)
+    # private_mode=False + storage_path: the site's login is remembered.
+    webview.start(private_mode=False, storage_path=str(DATA / "web"))
+    if tray:
+        tray.stop()
 
 
 # ---------------------------------------------------------------- updates
@@ -407,13 +650,32 @@ def self_update() -> bool:
 
 def main() -> None:
     DATA.mkdir(parents=True, exist_ok=True)
+    if "--uninstall" in sys.argv:
+        return uninstall()
+    if already_running():
+        return                           # the running copy shows its window
+    if install_if_needed():
+        return                           # the installed copy is starting
     if self_update():
         return                           # the new version is starting
     cfg = load_json(CONFIG, {})
     if "--setup" in sys.argv or not all(cfg.get(k) for k in ("site", "password", "folder")):
         cfg = first_run_setup(cfg)
-    Downloader(cfg).start()
-    open_window(cfg)
+        if not cfg.get("asked_autostart"):
+            cfg["asked_autostart"] = True
+            save_json(CONFIG, cfg)
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+                r = tk.Tk(); set_tk_icon(r); r.withdraw()
+                if messagebox.askyesno(APP, "להפעיל את התוכנה אוטומטית עם Windows?\n(היא תרוץ ברקע ותוריד גם כשהחלון סגור)", parent=r):
+                    set_autostart(True)
+                r.destroy()
+            except Exception:
+                pass
+    dl = Downloader(cfg)
+    dl.start()
+    open_window(cfg, dl, background="--background" in sys.argv)
 
 
 if __name__ == "__main__":
