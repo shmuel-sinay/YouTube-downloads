@@ -379,6 +379,13 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     }
     return json({ ok: true });
   }
+  if (p === "/jobs/clear" && req.method === "POST") {
+    // "Clear history": everything finished (done / failed / skipped / cancelled).
+    const done = (await listJobs(env)).filter((j) => ["done", "failed", "skipped", "cancelled"].includes(j.status));
+    await deleteJobs(env, done.map((j) => j.videoId));
+    await addLog(env, "worker", `ההיסטוריה נוקתה: ${done.length} פריטים`);
+    return json({ deleted: done.map((j) => j.videoId) });
+  }
   if (req.method === "POST") {
     const f = await req.formData();
     if (p === "/channels/add") {
@@ -474,13 +481,6 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       await deleteJobs(env, ids);
       await addLog(env, "worker", `נמחקו מההיסטוריה: ${ids.length}`);
       return redirect(BASE + "/");
-    }
-    if (p === "/jobs/clear") {
-      // "Clear history": everything finished (done / failed / skipped / cancelled).
-      const done = (await listJobs(env)).filter((j) => ["done", "failed", "skipped", "cancelled"].includes(j.status));
-      await deleteJobs(env, done.map((j) => j.videoId));
-      await addLog(env, "worker", `ההיסטוריה נוקתה: ${done.length} פריטים`);
-      return json({ deleted: done.map((j) => j.videoId) });
     }
     if (p === "/jobs/pause") {
       // Waiting job: just set aside. Downloading job: the agent sees this
