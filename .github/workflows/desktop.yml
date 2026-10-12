@@ -54,7 +54,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete desktop-latest --yes --cleanup-tag 2>/dev/null || true
-          gh release create desktop-latest dist/YTTracker.exe dist/YTTracker.zip \
-            --target "$GITHUB_SHA" --title "תוכנה למחשב — גרסה אחרונה" \
-            --notes "הורד את YTTracker.exe (או YTTracker.zip אם ה-exe נחסם) ופתח בלחיצה כפולה. נבנה מ-${GITHUB_SHA::7}."
+          NOTES="הורד את YTTracker.exe (או YTTracker.zip אם ה-exe נחסם) ופתח בלחיצה כפולה. נבנה מ-${GITHUB_SHA::7}."
+          gh release delete desktop-latest --yes --cleanup-tag || true
+          # Deleting is not instant on GitHub's side — retry creating.
+          for i in 1 2 3 4 5 6; do
+            if gh release create desktop-latest dist/YTTracker.exe dist/YTTracker.zip \
+                 --target "$GITHUB_SHA" --title "תוכנה למחשב — גרסה אחרונה" --notes "$NOTES"; then
+              exit 0
+            fi
+            sleep 10
+          done
+          # Last resort: update the existing release in place (the app reads
+          # target_commitish to decide whether to self-update).
+          gh release upload desktop-latest dist/YTTracker.exe dist/YTTracker.zip --clobber
+          gh release edit desktop-latest --target "$GITHUB_SHA" --notes "$NOTES"
