@@ -28,10 +28,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r desktop/requirements.txt pyinstaller
 
+      - name: Stamp version (the app compares it with the latest release to self-update)
+        shell: bash
+        run: echo "$GITHUB_SHA" > desktop/version.txt
+
       - name: Build YTTracker.exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name YTTracker
           --icon desktop/icon.ico --add-data "desktop/icon.ico;."
+          --add-data "desktop/version.txt;."
           --collect-all imageio_ffmpeg --collect-all webview
           desktop/app.py
 

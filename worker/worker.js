@@ -265,7 +265,10 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const settings = await getJSON(env, "settings", {});
       const now = Date.now();
       const out = [];
-      for (const j of (await listJobs(env)).reverse()) {   // oldest first
+      // "⏫ הורד עכשיו" jobs first (newest bump wins), then oldest first.
+      const ordered = (await listJobs(env)).reverse()
+        .sort((a, b) => (b.priority || 0) - (a.priority || 0));
+      for (const j of ordered) {
         const stale = j.status === "taken" && now - Date.parse(j.updated) > CLAIM_TIMEOUT_MS;
         if (j.status !== "queued" && !stale) continue;
         j.status = "taken"; j.updated = new Date().toISOString();
@@ -391,9 +394,48 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (j) { j.status = "queued"; j.error = ""; j.updated = new Date().toISOString(); await putJSON(env, "job:" + j.videoId, j); wake(); }
       return redirect(BASE + "/");
     }
-    if (p === "/jobs/cancel") {
+    if (p === "/jobs/pause") {
+      // Waiting job: just set aside. Downloading job: the agent sees this
+      // within seconds, stops, and keeps the partial file to resume later.
       const j = await getJSON(env, "job:" + f.get("id"), null);
       if (j && (j.status === "queued" || j.status === "taken")) {
+        j.status = "paused"; j.updated = new Date().toISOString();
+        await putJSON(env, "job:" + j.videoId, j);
+        await addLog(env, "worker", `⏸ הושהה: ${j.title}`);
+      }
+      return redirect(BASE + "/");
+    }
+    if (p === "/jobs/resume") {
+      const j = await getJSON(env, "job:" + f.get("id"), null);
+      if (j && j.status === "paused") {
+        j.status = "queued"; j.updated = new Date().toISOString();
+        await putJSON(env, "job:" + j.videoId, j);
+        await addLog(env, "worker", `▶ ממשיך: ${j.title}`);
+        wake();
+      }
+      return redirect(BASE + "/");
+    }
+    if (p === "/jobs/priority") {
+      // Download this one next. Whatever is downloading now steps back into
+      // the queue (keeping its partial file) and continues right after.
+      const id = String(f.get("id"));
+      const jobs = await listJobs(env);
+      const j = jobs.find((x) => x.videoId === id);
+      if (j && ["queued", "paused", "failed", "cancelled", "skipped"].includes(j.status)) {
+        for (const other of jobs.filter((x) => x.status === "taken")) {
+          other.status = "queued"; other.updated = new Date().toISOString();
+          await putJSON(env, "job:" + other.videoId, other);
+        }
+        j.status = "queued"; j.error = ""; j.priority = Date.now(); j.updated = new Date().toISOString();
+        await putJSON(env, "job:" + j.videoId, j);
+        await addLog(env, "worker", `⏫ הורד עכשיו: ${j.title}`);
+        wake();
+      }
+      return redirect(BASE + "/");
+    }
+    if (p === "/jobs/cancel") {
+      const j = await getJSON(env, "job:" + f.get("id"), null);
+      if (j && ["queued", "taken", "paused"].includes(j.status)) {
         const was = j.status;
         j.status = "cancelled"; j.error = ""; j.updated = new Date().toISOString();
         await putJSON(env, "job:" + j.videoId, j);
@@ -428,7 +470,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const MODES = { audio: "🎵 שיר (MP3)", m4a: "⚡ שיר מהיר (M4A)", video: "🎬 סרטון (MP4)" };
 const modeOf = (v) => (v in MODES ? v : "audio");
 
-const STATUS = { queued: "ממתין", taken: "בהורדה", done: "ירד ✓", failed: "נכשל", skipped: "דולג", cancelled: "בוטל" };
+const STATUS = { queued: "ממתין", taken: "בהורדה", done: "ירד ✓", failed: "נכשל", skipped: "דולג", cancelled: "בוטל", paused: "מושהה" };
 
 // Everything the page shows — also polled by the page every few seconds.
 async function state(env) {
@@ -475,7 +517,8 @@ input:focus,select:focus{outline:none;border-color:var(--primary)}
 .job .info{flex:1;min-width:0}
 .job .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .chip{font-size:.8rem;padding:3px 10px;border-radius:999px;background:var(--panel2);white-space:nowrap}
-.chip.done{color:var(--ok)}.chip.failed{color:var(--bad)}.chip.cancelled{color:var(--muted);text-decoration:line-through}.chip.queued,.chip.taken{color:var(--warn)}.chip.skipped{color:var(--muted)}
+.chip.done{color:var(--ok)}.chip.failed{color:var(--bad)}.chip.cancelled{color:var(--muted);text-decoration:line-through}.chip.paused{color:var(--primary)}
+.job .acts{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.chip.queued,.chip.taken{color:var(--warn)}.chip.skipped{color:var(--muted)}
 .err{color:var(--bad);font-size:.8rem;margin-top:2px;word-break:break-word}
 .ch{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);gap:10px}
 .ch:last-child{border-bottom:0}
@@ -616,7 +659,11 @@ function render() {
     '<span class="chip ' + esc(j.status) + '">' + (STATUS[j.status] || esc(j.status)) + '</span>' +
     (j.fileUrl ? '<a class="btn small" href="' + esc(j.fileUrl) + '">⬇ הורדה</a>' : '') +
     (["failed", "skipped", "taken", "cancelled"].includes(j.status) ? '<button class="btn small ghost" data-retry="' + esc(j.videoId) + '">שוב</button>' : '') +
-    (["queued", "taken"].includes(j.status) ? '<button class="btn small ghost" data-cancel="' + esc(j.videoId) + '" style="color:var(--bad)">✖ ביטול</button>' : '') +
+    (j.status === "queued" ? '<button class="btn small ghost" data-act="priority" data-id="' + esc(j.videoId) + '" title="להוריד את זה עכשיו, לפני כל השאר">⏫ עכשיו</button>' : '') +
+    (["queued", "taken"].includes(j.status) ? '<button class="btn small ghost" data-act="pause" data-id="' + esc(j.videoId) + '">⏸ השהה</button>' : '') +
+    (j.status === "paused" ? '<button class="btn small" data-act="resume" data-id="' + esc(j.videoId) + '">▶ המשך</button>' +
+      '<button class="btn small ghost" data-act="priority" data-id="' + esc(j.videoId) + '">⏫ עכשיו</button>' : '') +
+    (["queued", "taken", "paused"].includes(j.status) ? '<button class="btn small ghost" data-cancel="' + esc(j.videoId) + '" style="color:var(--bad)">✖ ביטול</button>' : '') +
     '</div>').join("") : '<div class="muted">התור ריק. הוסף ערוץ או קישור בלשונית ➕ הוספה.</div>';
   // channels
   $("channels").innerHTML = S.channels.length ? S.channels.map((c) =>
@@ -696,6 +743,12 @@ document.querySelectorAll("form[data-action]").forEach((f) => f.onsubmit = async
 });
 document.addEventListener("click", async (e) => {
   const r = e.target.dataset.retry, rm = e.target.dataset.remove, cx = e.target.dataset.cancel;
+  const act = e.target.dataset.act;
+  if (act) {
+    const d = new FormData(); d.append("id", e.target.dataset.id);
+    await post("/jobs/" + act, d).catch((x) => toast(x.message));
+    toast({ pause: "⏸ הושהה", resume: "▶ ממשיך", priority: "⏫ יורד עכשיו" }[act]); refresh();
+  }
   if (cx && confirm("לבטל את ההורדה?")) { const d = new FormData(); d.append("id", cx); await post("/jobs/cancel", d).catch((x) => toast(x.message)); toast("✖ בוטל"); refresh(); }
   if (r) { const d = new FormData(); d.append("id", r); await post("/jobs/retry", d).catch((x) => toast(x.message)); refresh(); }
   if (rm && confirm("להסיר את הערוץ?")) { const d = new FormData(); d.append("id", rm); await post("/channels/remove", d).catch((x) => toast(x.message)); refresh(); }

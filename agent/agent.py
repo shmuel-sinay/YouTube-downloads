@@ -314,11 +314,13 @@ def run_ytdlp(cmd: list[str], vid: str = "") -> _Result:
                 pass
 
     def cancel_watch() -> None:
-        """Every few seconds ask the Worker whether the job was cancelled."""
+        """Every few seconds ask the Worker whether this job is still ours:
+        cancelled (✖), paused (⏸) or moved back in line for another (⏫)."""
         while not done.wait(4):
             try:
-                if vid and api("/api/check", {"videoId": vid}).get("status") == "cancelled":
-                    _current["cancelled"] = True
+                st = api("/api/check", {"videoId": vid}).get("status") if vid else "taken"
+                if st in ("cancelled", "paused", "queued"):
+                    _current["stopped"] = st
                     os.killpg(proc.pid, signal.SIGTERM)
                     return
             except Exception:
@@ -388,10 +390,16 @@ def _handle(job: dict) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     _current.clear()
     r = run_ytdlp(ytdlp_cmd(job, OUT), vid)
-    if _current.get("cancelled"):
-        for leftover in OUT.glob(f"*[[]{vid}[]]*"):   # partial files of this video
-            leftover.unlink(missing_ok=True)
-        log(f"   ✖ בוטל: {job['title']}")
+    stopped = _current.get("stopped")
+    if stopped:
+        if stopped == "cancelled":
+            for leftover in OUT.glob(f"*[[]{vid}[]]*"):   # partial files of this video
+                leftover.unlink(missing_ok=True)
+            log(f"   ✖ בוטל: {job['title']}")
+        else:
+            # The .part file stays; yt-dlp continues from it next time
+            # (unless Render restarts in between and wipes the disk).
+            log(f"   {'⏸ הושהה' if stopped == 'paused' else '⏭ פינה מקום להורדה אחרת'}: {job['title']}")
         return
     files = [Path(l.strip()) for l in r.stdout.splitlines()
              if l.strip().startswith(str(OUT)) and Path(l.strip()).is_file()]

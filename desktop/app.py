@@ -41,6 +41,9 @@ CONFIG = DATA / "config.json"
 STATE = DATA / "state.json"
 LOGFILE = DATA / "app.log"
 DEFAULT_SITE = "https://my-gemini.g47ben.workers.dev"
+# Where new versions are published (GitHub release built by desktop.yml).
+RELEASE_API = "https://api.github.com/repos/shmuel-sinay/YouTube-downloads/releases/tags/desktop-latest"
+UPDATE_CHECK_HOURS = 6
 POLL_SECONDS = 20
 WAKE_EVERY = 300          # nudge the download server while work is waiting
 RETRY_404_HOURS = 24      # re-queue a vanished file only if it finished recently
@@ -114,6 +117,7 @@ class Downloader(threading.Thread):
         self.state = load_json(STATE, {"got": [], "requeued": {}})
         self.pending_logs: list[str] = []
         self.last_wake = 0.0
+        self.last_update_check = time.time()
 
     # -- helpers
     def log(self, msg: str, remote: bool = True) -> None:
@@ -251,8 +255,23 @@ class Downloader(threading.Thread):
                     self.s.post(self.base + "/wake", timeout=90)
             except Exception as e:
                 self.log(f"שגיאה: {e}", remote=False)
+            self.check_for_update()
             self.flush_logs()
             time.sleep(POLL_SECONDS)
+
+    def check_for_update(self) -> None:
+        """While running, just announce a new version; it installs itself
+        the next time the app is opened."""
+        if not getattr(sys, "frozen", False) or time.time() - self.last_update_check < UPDATE_CHECK_HOURS * 3600:
+            return
+        self.last_update_check = time.time()
+        try:
+            sha, _ = latest_release()
+            mine = bundled_version()
+            if sha and mine and not sha.startswith(mine) and not mine.startswith(sha):
+                self.log("יש גרסה חדשה לתוכנה — היא תותקן אוטומטית בפתיחה הבאה")
+        except Exception:
+            pass
 
 
 def ffmpeg_exe() -> str:
@@ -314,8 +333,82 @@ def open_window(cfg: dict) -> None:
         root.mainloop()
 
 
+# ---------------------------------------------------------------- updates
+
+def bundled_version() -> str:
+    """Commit this build was made from (version.txt, written by the build)."""
+    try:
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+        return (base / "version.txt").read_text().strip()
+    except Exception:
+        return ""
+
+
+def latest_release() -> tuple[str, str]:
+    """(commit, exe download URL) of the newest published build."""
+    r = requests.get(RELEASE_API, timeout=15, headers={"User-Agent": "yt-tracker-desktop"})
+    r.raise_for_status()
+    rel = r.json()
+    sha = rel.get("target_commitish", "")
+    url = next((a["browser_download_url"] for a in rel.get("assets", []) if a["name"] == "YTTracker.exe"), "")
+    zurl = next((a["browser_download_url"] for a in rel.get("assets", []) if a["name"] == "YTTracker.zip"), "")
+    return sha, url or zurl
+
+
+def self_update() -> bool:
+    """If a newer build exists, download it, swap it in and restart.
+    Windows can't overwrite a running .exe but can rename it, so: rename
+    current → .old, put the new one in its place, start it, exit."""
+    if not getattr(sys, "frozen", False):
+        return False                     # running from source — nothing to do
+    exe = Path(sys.executable)
+    exe.with_suffix(".old.exe").unlink(missing_ok=True)   # leftover from last update
+    mine = bundled_version()
+    try:
+        sha, url = latest_release()
+    except Exception:
+        return False                     # offline / blocked — try next time
+    if not sha or not url or not mine or sha.startswith(mine) or mine.startswith(sha):
+        return False
+    import tkinter as tk
+    root = tk.Tk()
+    set_tk_icon(root)
+    root.title(APP)
+    tk.Label(root, text="מוריד גרסה חדשה של התוכנה…", padx=30, pady=24).pack()
+    root.update()
+    try:
+        tmp = exe.with_name(exe.stem + ".new" + (".zip" if url.endswith(".zip") else ".exe"))
+        with requests.get(url, stream=True, timeout=(30, 300), headers={"User-Agent": "yt-tracker-desktop"}) as r:
+            r.raise_for_status()
+            with tmp.open("wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    f.write(chunk)
+        if tmp.suffix == ".zip":         # the .exe was blocked; the zip wasn't
+            with zipfile.ZipFile(tmp) as z:
+                data = z.read("YTTracker.exe")
+            tmp.unlink()
+            tmp = exe.with_name(exe.stem + ".new.exe")
+            tmp.write_bytes(data)
+        if tmp.stat().st_size < 5_000_000:
+            raise RuntimeError("קובץ העדכון קטן מדי — כנראה נחסם")
+        exe.replace(exe.with_suffix(".old.exe"))
+        tmp.replace(exe)
+        root.destroy()
+        subprocess.Popen([str(exe)] + sys.argv[1:], close_fds=True)
+        return True
+    except Exception as e:
+        root.destroy()
+        with LOGFILE.open("a", encoding="utf-8") as f:
+            f.write(time.strftime("%H:%M:%S ") + f"עדכון נכשל: {e}\n")
+        if not exe.exists() and exe.with_suffix(".old.exe").exists():
+            exe.with_suffix(".old.exe").replace(exe)   # put the working one back
+        return False
+
+
 def main() -> None:
     DATA.mkdir(parents=True, exist_ok=True)
+    if self_update():
+        return                           # the new version is starting
     cfg = load_json(CONFIG, {})
     if "--setup" in sys.argv or not all(cfg.get(k) for k in ("site", "password", "folder")):
         cfg = first_run_setup(cfg)
