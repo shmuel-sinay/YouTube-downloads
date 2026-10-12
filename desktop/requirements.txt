@@ -1,0 +1,7 @@
+requests
+# Use Windows' certificate store (works behind NetFree's HTTPS inspection)
+truststore
+# The app window (Edge WebView2, built into Windows 10/11)
+pywebview
+# ffmpeg bundled inside the app, for converting to MP3 on the PC
+imageio-ffmpeg

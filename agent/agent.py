@@ -35,6 +35,7 @@ import json
 import re
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -147,6 +148,10 @@ def api(path: str, body: dict | None = None) -> dict:
         raise
 
 
+def prog_file(vid: str) -> Path:
+    return Path("/tmp") / f"ffprog-{vid}.txt"
+
+
 def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
     """yt-dlp with the free anti-bot stack learned in the zmani project:
     cookies, Node for the JS challenge (yt-dlp[default] ships the solver),
@@ -155,6 +160,7 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
            "--retries", "8", "--fragment-retries", "8", "--extractor-retries", "3",
            "--output", str(out_dir / "%(title)s [%(id)s].%(ext)s"),
            "--print", "after_move:filepath",
+           "--print", "before_dl:DUR %(duration)s",   # for conversion %
            "--no-warnings", "--no-quiet",
            # One progress line at a time, in a form run_ytdlp() can parse.
            "--progress", "--newline", "--progress-template",
@@ -166,7 +172,7 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
     if job.get("mode") == "video":
         cmd += ["-f", f"bv*[height<={RES}]+ba/b[height<={RES}]/bv*+ba/b",
                 "--merge-output-format", "mp4", "--remux-video", "mp4"]
-    elif job.get("mode") == "m4a":
+    elif job.get("mode") == "m4a" or job.get("pcConvert"):
         # Fast audio: take YouTube's own AAC track as-is (no re-encode).
         # --extract-audio only re-encodes if no m4a track exists.
         cmd += ["-f", "bestaudio[ext=m4a]/bestaudio/best", "--extract-audio",
@@ -174,6 +180,11 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
     else:
         cmd += ["-f", "bestaudio/best", "--extract-audio",
                 "--audio-format", "mp3", "--audio-quality", "0"]
+    # ffmpeg writes its position to a file while converting/merging; the
+    # progress monitor turns it into a percentage of the video's duration.
+    pf = str(prog_file(job.get("videoId", "x")))
+    for pp in ("ExtractAudio", "Merger", "VideoRemuxer"):
+        cmd += ["--ppa", f"{pp}+ffmpeg:-progress {pf} -nostats"]
     if job.get("minMinutes"):
         cmd += ["--match-filter", f"duration >= {int(job['minMinutes']) * 60}"]
     if AGE_LIMIT:
@@ -184,13 +195,21 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
     return cmd
 
 
-def to_zip(path: Path) -> Path:
+def to_zip(path: Path, vid: str = "") -> Path:
     """Wrap the media file in a .zip and delete the original. Some filters
     (e.g. NetFree) block audio/video downloads but let zip files through.
     ZIP_STORED: media is already compressed, so this is just a fast copy."""
     z = path.with_name(path.stem + ".zip")
-    with zipfile.ZipFile(z, "w", zipfile.ZIP_STORED) as zf:
-        zf.write(path, path.name)
+    total = max(path.stat().st_size, 1)
+    done, last = 0, 0.0
+    with zipfile.ZipFile(z, "w", zipfile.ZIP_STORED) as zf, path.open("rb") as src, \
+            zf.open(zipfile.ZipInfo.from_file(path, path.name), "w", force_zip64=True) as dst:
+        while chunk := src.read(4 << 20):
+            dst.write(chunk)
+            done += len(chunk)
+            if vid and time.time() - last > 1:
+                set_progress(vid, stage="zip", pct=round(100 * done / total, 1))
+                last = time.time()
     path.unlink(missing_ok=True)
     return z
 
@@ -216,8 +235,33 @@ def upload_r2(path: Path) -> str | None:
 PROGRESS: dict = {}
 
 
+# Share of the whole job each stage takes (rough, per mode): used for the
+# overall percentage. Video downloads come in two parts (video, then audio).
+WEIGHTS = {
+    "audio": {"download": (0, 50), "convert": (50, 45), "zip": (95, 5)},
+    "m4a":   {"download": (0, 88), "convert": (88, 6), "zip": (94, 6)},
+    "video": {"download": (0, 85), "convert": (85, 10), "zip": (95, 5)},
+}
+
+
 def set_progress(vid: str, **kw) -> None:
-    PROGRESS[vid] = {**PROGRESS.get(vid, {}), **kw, "t": time.time()}
+    p = {**PROGRESS.get(vid, {}), **kw, "t": time.time()}
+    w = WEIGHTS.get(p.get("mode"), WEIGHTS["audio"]).get(p.get("stage"))
+    pct = p.get("pct")
+    if p.get("stage") == "finish":
+        p["overall"] = 100.0
+    elif p.get("stage") == "start":
+        p["overall"] = 0.0
+    elif w:
+        frac = (pct or 0) / 100
+        if p.get("stage") == "download" and p.get("mode") == "video":
+            # part 1 (video) ≈ 80% of the bytes, part 2 (audio) ≈ 20%
+            frac = (0.8 * frac) if p.get("part", 1) <= 1 else (0.8 + 0.2 * frac)
+        p["overall"] = round(w[0] + w[1] * frac, 1)
+    PROGRESS[vid] = p
+
+
+_current: dict = {}   # the yt-dlp process being run, and whether it was cancelled
 
 
 class _Result:
@@ -244,7 +288,45 @@ def run_ytdlp(cmd: list[str], vid: str = "") -> _Result:
             if time.time() - state["last_log"] >= 120:
                 say(f"   … עדיין עובד ({int((time.time() - start) // 60)} דק׳)")
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    # Own process group, so cancelling also stops the ffmpeg it starts.
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                            start_new_session=True)
+    _current["proc"] = proc
+    pf = prog_file(vid) if vid else None
+    if pf:
+        pf.unlink(missing_ok=True)
+
+    def ffmpeg_monitor() -> None:
+        """While converting, read ffmpeg's -progress file → percent of the
+        duration yt-dlp printed (DUR …)."""
+        while not done.wait(2):
+            p = PROGRESS.get(vid, {})
+            dur = p.get("duration")
+            if p.get("stage") != "convert" or not dur or not pf or not pf.exists():
+                continue
+            try:
+                txt = pf.read_text(errors="ignore")
+                us = [int(l.split("=", 1)[1]) for l in txt.splitlines()
+                      if l.startswith("out_time_us=") and l.split("=", 1)[1].strip().lstrip("-").isdigit()]
+                if us:
+                    set_progress(vid, pct=round(min(100.0, max(0.0, us[-1] / 1e6 / dur * 100)), 1))
+            except Exception:
+                pass
+
+    def cancel_watch() -> None:
+        """Every few seconds ask the Worker whether the job was cancelled."""
+        while not done.wait(4):
+            try:
+                if vid and api("/api/check", {"videoId": vid}).get("status") == "cancelled":
+                    _current["cancelled"] = True
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    return
+            except Exception:
+                pass
+
+    if vid:
+        threading.Thread(target=ffmpeg_monitor, daemon=True).start()
+        threading.Thread(target=cancel_watch, daemon=True).start()
     t_err = threading.Thread(target=lambda: err_lines.extend(proc.stderr), daemon=True)
     t_err.start()
     threading.Thread(target=heartbeat, daemon=True).start()
@@ -268,16 +350,25 @@ def run_ytdlp(cmd: list[str], vid: str = "") -> _Result:
                 last_prog = time.time()
                 state["logged100"] = finished
             continue
+        if line.startswith("DUR "):
+            try:
+                if vid:
+                    set_progress(vid, duration=float(line[4:]))
+            except ValueError:
+                pass  # "NA" — no duration known
+            continue
         out_lines.append(line)
         if line.startswith("[download] Destination:"):
             parts += 1  # video+audio downloads come in two parts
         if vid and line.startswith(("[ExtractAudio]", "[Merger]", "[VideoRemuxer]")):
-            set_progress(vid, stage="convert", pct=None)
+            set_progress(vid, stage="convert", pct=0.0 if PROGRESS.get(vid, {}).get("duration") else None)
         if line.startswith(("[ExtractAudio]", "[Merger]", "[VideoRemuxer]")):
             say("   ⚙ ממיר/מאחד (בשרת חלש זה יכול לקחת כמה דקות)…")
     proc.wait()
     t_err.join(timeout=5)
     done.set()
+    if pf:
+        pf.unlink(missing_ok=True)
     return _Result(proc.returncode, "\n".join(out_lines), "".join(err_lines))
 
 
@@ -291,14 +382,22 @@ def handle(job: dict) -> None:
 def _handle(job: dict) -> None:
     vid = job["videoId"]
     log(f"-> מוריד: {job['title']} ({job['url']})")
-    set_progress(vid, stage="start", pct=None, started=time.time(), mode=job.get("mode", "audio"))
+    # pcConvert jobs skip the MP3 encode here — weigh them like fast audio.
+    set_progress(vid, stage="start", pct=None, started=time.time(),
+                 mode="m4a" if job.get("pcConvert") else job.get("mode", "audio"))
     OUT.mkdir(parents=True, exist_ok=True)
+    _current.clear()
     r = run_ytdlp(ytdlp_cmd(job, OUT), vid)
+    if _current.get("cancelled"):
+        for leftover in OUT.glob(f"*[[]{vid}[]]*"):   # partial files of this video
+            leftover.unlink(missing_ok=True)
+        log(f"   ✖ בוטל: {job['title']}")
+        return
     files = [Path(l.strip()) for l in r.stdout.splitlines()
              if l.strip().startswith(str(OUT)) and Path(l.strip()).is_file()]
     if files:
         set_progress(vid, stage="zip", pct=None)
-        f = to_zip(files[-1])
+        f = to_zip(files[-1], vid)
         set_progress(vid, stage="finish", pct=100)
         try:
             url = upload_r2(f) or ""

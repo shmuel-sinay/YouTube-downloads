@@ -262,12 +262,16 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     }
     if (p === "/api/next" && req.method === "POST") {
       const limit = Math.min(+(url.searchParams.get("limit") || 3), 20);
+      const settings = await getJSON(env, "settings", {});
       const now = Date.now();
       const out = [];
       for (const j of (await listJobs(env)).reverse()) {   // oldest first
         const stale = j.status === "taken" && now - Date.parse(j.updated) > CLAIM_TIMEOUT_MS;
         if (j.status !== "queued" && !stale) continue;
         j.status = "taken"; j.updated = new Date().toISOString();
+        // "Convert on the PC": the server skips the slow MP3 encode and the
+        // desktop app converts after downloading.
+        j.pcConvert = j.mode === "audio" && !!settings.pcConvert;
         await putJSON(env, "job:" + j.videoId, j);
         out.push(j);
         if (out.length >= limit) break;
@@ -275,10 +279,17 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (out.length) await addLog(env, "worker", `הסוכן לקח ${out.length} משימות: ` + out.map((j) => j.title).join(" | "));
       return json({ jobs: out });
     }
+    if (p === "/api/check" && req.method === "POST") {
+      // The agent asks every few seconds whether its job was cancelled.
+      const b = await req.json();
+      const j = await getJSON(env, "job:" + b.videoId, null);
+      return json({ status: j ? j.status : "missing" });
+    }
     if (p === "/api/report" && req.method === "POST") {
       const b = await req.json();
       const j = await getJSON(env, "job:" + b.videoId, null);
       if (!j) return json({ error: "no such job" }, 404);
+      if (j.status === "cancelled") return json({ ok: true, ignored: "cancelled" });
       Object.assign(j, {
         status: ["done", "failed", "skipped"].includes(b.status) ? b.status : "failed",
         fileUrl: b.fileUrl || "", fileName: b.fileName || "", error: (b.error || "").slice(0, 300),
@@ -326,6 +337,19 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     await putJSON(env, "logs", []);
     return json({ ok: true });
   }
+  if (p === "/settings" && req.method === "POST") {
+    const b = await req.json();
+    const settings = { ...(await getJSON(env, "settings", {})), pcConvert: !!b.pcConvert };
+    await putJSON(env, "settings", settings);
+    await addLog(env, "worker", "המרה ל-MP3 " + (settings.pcConvert ? "במחשב (בתוכנה)" : "בשרת"));
+    return json(settings);
+  }
+  if (p === "/clientlog" && req.method === "POST") {
+    // The desktop app reports what it downloaded / why it couldn't.
+    const b = await req.json();
+    await addLogs(env, "pc", (b.lines || []).slice(-50).map(String));
+    return json({ ok: true });
+  }
   if (req.method === "POST") {
     const f = await req.formData();
     if (p === "/channels/add") {
@@ -367,6 +391,16 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (j) { j.status = "queued"; j.error = ""; j.updated = new Date().toISOString(); await putJSON(env, "job:" + j.videoId, j); wake(); }
       return redirect(BASE + "/");
     }
+    if (p === "/jobs/cancel") {
+      const j = await getJSON(env, "job:" + f.get("id"), null);
+      if (j && (j.status === "queued" || j.status === "taken")) {
+        const was = j.status;
+        j.status = "cancelled"; j.error = ""; j.updated = new Date().toISOString();
+        await putJSON(env, "job:" + j.videoId, j);
+        await addLog(env, "worker", `בוטל: ${j.title}` + (was === "taken" ? " (השרת יעצור תוך כמה שניות)" : ""));
+      }
+      return redirect(BASE + "/");
+    }
     if (p === "/jobs/add") {
       // Manual one-off: paste a video link.
       const m = String(f.get("url") || "").match(/(?:v=|youtu\.be\/|shorts\/)([\w-]{11})/);
@@ -394,14 +428,14 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const MODES = { audio: "🎵 שיר (MP3)", m4a: "⚡ שיר מהיר (M4A)", video: "🎬 סרטון (MP4)" };
 const modeOf = (v) => (v in MODES ? v : "audio");
 
-const STATUS = { queued: "ממתין", taken: "בהורדה", done: "ירד ✓", failed: "נכשל", skipped: "דולג" };
+const STATUS = { queued: "ממתין", taken: "בהורדה", done: "ירד ✓", failed: "נכשל", skipped: "דולג", cancelled: "בוטל" };
 
 // Everything the page shows — also polled by the page every few seconds.
 async function state(env) {
-  const [channels, jobs, logs, agent, lastCheck] = await Promise.all([
+  const [channels, jobs, logs, agent, lastCheck, settings] = await Promise.all([
     getChannels(env), listJobs(env), getJSON(env, "logs", []),
-    getJSON(env, "agent", {}), getJSON(env, "lastCheck", null)]);
-  return { channels, jobs: jobs.slice(0, 150), logs: logs.slice(-LOG_CAP), agent, lastCheck,
+    getJSON(env, "agent", {}), getJSON(env, "lastCheck", null), getJSON(env, "settings", {})]);
+  return { channels, jobs: jobs.slice(0, 150), logs: logs.slice(-LOG_CAP), agent, lastCheck, settings,
            renderUrl: env.RENDER_URL || "", now: new Date().toISOString() };
 }
 
@@ -438,13 +472,13 @@ input:focus,select:focus{outline:none;border-color:var(--primary)}
 .job .info{flex:1;min-width:0}
 .job .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .chip{font-size:.8rem;padding:3px 10px;border-radius:999px;background:var(--panel2);white-space:nowrap}
-.chip.done{color:var(--ok)}.chip.failed{color:var(--bad)}.chip.queued,.chip.taken{color:var(--warn)}.chip.skipped{color:var(--muted)}
+.chip.done{color:var(--ok)}.chip.failed{color:var(--bad)}.chip.cancelled{color:var(--muted);text-decoration:line-through}.chip.queued,.chip.taken{color:var(--warn)}.chip.skipped{color:var(--muted)}
 .err{color:var(--bad);font-size:.8rem;margin-top:2px;word-break:break-word}
 .ch{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);gap:10px}
 .ch:last-child{border-bottom:0}
 .logs{font-family:ui-monospace,Consolas,monospace;font-size:.82rem;direction:ltr;text-align:left;background:#0d0d0e;border-radius:10px;padding:10px;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
 .logs .l{padding:2px 0;border-bottom:1px solid #1b1b1d}
-.logs .t{color:var(--muted)}.logs .s-render{color:var(--primary)}.logs .s-worker{color:var(--ok)}
+.logs .t{color:var(--muted)}.logs .s-render{color:var(--primary)}.logs .s-worker{color:var(--ok)}.logs .s-pc{color:var(--warn)}
 .logs .bad{color:var(--bad)}
 #toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);padding:10px 16px;border-radius:12px;display:none;max-width:90%}
 .login{max-width:380px;margin:12vh auto;text-align:center}
@@ -454,8 +488,10 @@ input:focus,select:focus{outline:none;border-color:var(--primary)}
 .step.done{color:var(--ok)}.step.now{background:var(--primary);color:#202124;font-weight:600}
 .bar{height:8px;border-radius:999px;background:var(--bg);overflow:hidden}
 .bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--primary),var(--ok));border-radius:999px;transition:width .6s}
-.bar.busy>i{width:35%!important;animation:slide 1.4s ease-in-out infinite}
-@keyframes slide{0%{margin-inline-start:-35%}100%{margin-inline-start:100%}}
+.bar.thin{height:5px}
+.bar.busy>i{opacity:.55;animation:pulse 1s ease-in-out infinite alternate}
+@keyframes pulse{from{opacity:.25}to{opacity:.8}}
+.pline{font-size:.8rem;margin:6px 0 3px;display:flex;justify-content:space-between}
 .prog .nums{font-size:.78rem;color:var(--muted);margin-top:4px;direction:ltr;text-align:right}
 .logs .m{unicode-bidi:isolate}
 @media (max-width:600px){.job{flex-wrap:wrap}.job .info{flex-basis:calc(100% - 100px)}.thumb{width:80px;height:45px}
@@ -490,6 +526,7 @@ async function dashboard(env) {
   <span class="pill" id="checkText">…</span>
   <button class="btn small" id="wakeBtn" type="button">⏰ הער את שרת ההורדות</button>
   <label class="pill" style="cursor:pointer"><input type="checkbox" id="autoDl" style="margin:0"> הורדה אוטומטית למחשב</label>
+  <label class="pill" style="cursor:pointer" title="השרת מוריד את השמע המקורי בלי להמיר, והתוכנה במחשב ממירה ל-MP3 — הרבה יותר מהיר. דורש את התוכנה למחשב."><input type="checkbox" id="pcConvert" style="margin:0"> ⚡ המרה ל-MP3 במחשב (בתוכנה)</label>
 </div>
 
 <div class="tabs">
@@ -530,7 +567,7 @@ async function dashboard(env) {
 <section id="tab-logs" class="hidden">
   <div class="card">
     <div class="row" style="margin:0 0 10px;justify-content:space-between">
-      <span class="muted"><span style="color:var(--ok)">worker</span> = Cloudflare · <span style="color:var(--primary)">render</span> = שרת ההורדות</span>
+      <span class="muted"><span style="color:var(--ok)">worker</span> = Cloudflare · <span style="color:var(--primary)">render</span> = שרת ההורדות · <span style="color:var(--warn)">pc</span> = התוכנה במחשב</span>
       <span><button class="btn small" id="copyLogs" type="button">📋 העתק הכל</button>
       <button class="btn small ghost" id="clearLogs" type="button">ניקוי</button></span>
     </div>
@@ -569,12 +606,13 @@ function render() {
   $("jobs").innerHTML = S.jobs.length ? S.jobs.map((j) =>
     '<div class="job"><img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">' +
     '<div class="info"><div class="title" title="' + esc(j.title) + '">' + esc(j.title) + '</div>' +
-    '<div class="muted">' + esc(j.channelName) + ' · ' + (MODES[j.mode] || MODES.audio) + ' · ' + ago(j.updated) + '</div>' +
+    '<div class="muted">' + esc(j.channelName) + ' · ' + (MODES[j.mode] || MODES.audio) + (j.pcConvert ? ' · ⚡ המרה במחשב' : '') + ' · ' + ago(j.updated) + '</div>' +
     (j.error ? '<div class="' + (j.status === "failed" ? "err" : "muted") + '">' + esc(j.error) + '</div>' : '') +
     (j.status === "taken" ? '<div class="prog" data-prog="' + esc(j.videoId) + '">' + progHtml(j.videoId) + '</div>' : '') + '</div>' +
     '<span class="chip ' + esc(j.status) + '">' + (STATUS[j.status] || esc(j.status)) + '</span>' +
     (j.fileUrl ? '<a class="btn small" href="' + esc(j.fileUrl) + '">⬇ הורדה</a>' : '') +
-    (["failed", "skipped", "taken"].includes(j.status) ? '<button class="btn small ghost" data-retry="' + esc(j.videoId) + '">שוב</button>' : '') +
+    (["failed", "skipped", "taken", "cancelled"].includes(j.status) ? '<button class="btn small ghost" data-retry="' + esc(j.videoId) + '">שוב</button>' : '') +
+    (["queued", "taken"].includes(j.status) ? '<button class="btn small ghost" data-cancel="' + esc(j.videoId) + '" style="color:var(--bad)">✖ ביטול</button>' : '') +
     '</div>').join("") : '<div class="muted">התור ריק. הוסף ערוץ או קישור בלשונית ➕ הוספה.</div>';
   // channels
   $("channels").innerHTML = S.channels.length ? S.channels.map((c) =>
@@ -599,12 +637,20 @@ function progHtml(id) {
   if (!p) return '<div class="muted">⏳ ממתין לשרת ההורדות…</div>';
   const at = STAGES.findIndex(([k]) => k === p.stage);
   const steps = STAGES.map(([k, label], i) => '<span class="step ' + (i < at ? "done" : i === at ? "now" : "") + '">' + label + '</span>').join("");
-  const known = p.stage === "download" && typeof p.pct === "number";
-  const bar = '<div class="bar' + (known ? "" : " busy") + '"><i style="width:' + (known ? p.pct : 0) + '%"></i></div>';
-  const nums = [known ? p.pct.toFixed(1) + "%" : "", p.stage === "download" && p.size ? p.size : "",
-    p.stage === "download" && p.speed ? p.speed : "", p.stage === "download" && p.eta && p.eta !== "NA" ? "ETA " + p.eta : "",
-    p.part > 1 ? "part " + p.part + "/2" : "", "⏱ " + mmss(p.elapsed || 0)].filter(Boolean).join(" · ");
-  return '<div class="steps">' + steps + '</div>' + bar + '<div class="nums">' + esc(nums) + '</div>';
+  const known = typeof p.pct === "number";
+  const overall = typeof p.overall === "number" ? p.overall : 0;
+  const stageName = (STAGES[at] || ["", ""])[1].replace(/^\\S+\\s/, "");
+  // Overall bar (whole job) + a thin bar for the current stage.
+  const big = '<div class="bar"><i style="width:' + overall + '%"></i></div>';
+  const small = '<div class="bar thin' + (known ? "" : " busy") + '"><i style="width:' + (known ? p.pct : 100) + '%"></i></div>';
+  const dl = p.stage === "download";
+  const nums = [dl && p.size ? p.size : "", dl && p.speed ? p.speed : "",
+    dl && p.eta && p.eta !== "NA" ? "ETA " + p.eta : "", p.part > 1 ? "part " + p.part + "/2" : "",
+    "⏱ " + mmss(p.elapsed || 0)].filter(Boolean).join(" · ");
+  return '<div class="steps">' + steps + '</div>' +
+    '<div class="pline"><b>סה״כ ' + overall.toFixed(0) + '%</b></div>' + big +
+    '<div class="pline">' + esc(stageName) + ': ' + (known ? p.pct.toFixed(1) + '%' : 'עובד…') + '</div>' + small +
+    '<div class="nums">' + esc(nums) + '</div>';
 }
 async function pollProgress() {
   if (!S.renderUrl || !S.jobs.some((j) => j.status === "taken")) return;
@@ -645,7 +691,8 @@ document.querySelectorAll("form[data-action]").forEach((f) => f.onsubmit = async
   btn.disabled = false;
 });
 document.addEventListener("click", async (e) => {
-  const r = e.target.dataset.retry, rm = e.target.dataset.remove;
+  const r = e.target.dataset.retry, rm = e.target.dataset.remove, cx = e.target.dataset.cancel;
+  if (cx && confirm("לבטל את ההורדה?")) { const d = new FormData(); d.append("id", cx); await post("/jobs/cancel", d).catch((x) => toast(x.message)); toast("✖ בוטל"); refresh(); }
   if (r) { const d = new FormData(); d.append("id", r); await post("/jobs/retry", d).catch((x) => toast(x.message)); refresh(); }
   if (rm && confirm("להסיר את הערוץ?")) { const d = new FormData(); d.append("id", rm); await post("/channels/remove", d).catch((x) => toast(x.message)); refresh(); }
 });
@@ -659,6 +706,12 @@ $("checkBtn").onclick = async () => {
   const b = $("checkBtn"); b.disabled = true;
   try { await post("/check", new FormData()); toast("✓ נבדק"); } catch (e) { toast("✗ " + e.message); }
   b.disabled = false; refresh();
+};
+$("pcConvert").checked = !!(S.settings && S.settings.pcConvert);
+$("pcConvert").onchange = async (e) => {
+  try { await fetch(B + "/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pcConvert: e.target.checked }) });
+        toast(e.target.checked ? "✓ שירים יומרו ל-MP3 בתוכנה במחשב" : "✓ שירים יומרו ל-MP3 בשרת"); }
+  catch (x) { toast("✗ " + x); }
 };
 $("clearLogs").onclick = async () => { await fetch(B + "/logs/clear", { method: "POST" }); refresh(); };
 $("copyLogs").onclick = async () => {
