@@ -319,7 +319,7 @@ def run_ytdlp(cmd: list[str], vid: str = "") -> _Result:
         while not done.wait(4):
             try:
                 st = api("/api/check", {"videoId": vid}).get("status") if vid else "taken"
-                if st in ("cancelled", "paused", "queued"):
+                if st in ("cancelled", "paused", "queued", "missing"):   # missing = deleted
                     _current["stopped"] = st
                     os.killpg(proc.pid, signal.SIGTERM)
                     return
@@ -436,7 +436,7 @@ def _handle(job: dict) -> None:
     r = run_ytdlp(ytdlp_cmd(job, OUT), vid)
     stopped = _current.get("stopped")
     if stopped:
-        if stopped == "cancelled":
+        if stopped in ("cancelled", "missing"):
             for leftover in OUT.glob(f"*[[]{vid}[]]*"):   # partial files of this video
                 leftover.unlink(missing_ok=True)
             log(f"   ✖ בוטל: {job['title']}")

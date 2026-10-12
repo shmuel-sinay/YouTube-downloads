@@ -36,7 +36,12 @@ except Exception:
 import requests
 
 APP = "YTTracker"
-DATA = Path(os.environ.get("APPDATA") or Path.home()) / APP
+# Shared by every user of this computer: settings, download history, log.
+# (Each user's own browser data — the site login — stays per user: USERDATA.)
+PROGRAMDATA = Path(os.environ.get("PROGRAMDATA") or r"C:\ProgramData")
+DATA = PROGRAMDATA / APP
+USERDATA = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / APP
+OLD_DATA = Path(os.environ.get("APPDATA") or Path.home()) / APP   # before all-users install
 CONFIG = DATA / "config.json"
 STATE = DATA / "state.json"
 LOGFILE = DATA / "app.log"
@@ -93,7 +98,10 @@ def first_run_setup(cfg: dict) -> dict:
     if not password:
         sys.exit(0)
     messagebox.showinfo(APP, "עכשיו בחר תיקייה שאליה יירדו הקבצים.", parent=root)
-    folder = filedialog.askdirectory(title="תיקיית הורדות", initialdir=str(Path.home() / "Downloads"), parent=root)
+    # A shared folder by default, so every user of the computer sees the files.
+    shared = Path(os.environ.get("PUBLIC") or r"C:\Users\Public") / "Music" / APP
+    shared.mkdir(parents=True, exist_ok=True)
+    folder = filedialog.askdirectory(title="תיקיית הורדות", initialdir=str(shared), parent=root)
     if not folder:
         sys.exit(0)
     unzip = messagebox.askyesno(APP, "לפתוח את קבצי ה-zip אוטומטית אחרי ההורדה?\n(כן = יישאר רק השיר/הסרטון עצמו)", parent=root)
@@ -261,7 +269,12 @@ class Downloader(threading.Thread):
             self.login()
         except Exception as e:
             self.log(f"אין חיבור לאתר: {e}", remote=False)
+        lock = DownloadLock()
         while True:
+            if not lock.acquire():
+                # Another user's copy is downloading for this computer.
+                time.sleep(POLL_SECONDS)
+                continue
             try:
                 st = self.status()
                 since = self.cfg.get("since") or ""
@@ -336,9 +349,47 @@ def _parse_iso(s) -> float:
 # ---------------------------------------------------------------- window
 
 # ---------------------------------------------------------------- install
+# Installed once (needs administrator rights) for every user of the computer:
+#   C:\ProgramData\YTTracker\app\YTTracker.exe — writable by all users, so the
+#   app can update itself without asking for administrator rights again;
+#   shortcuts on the shared Desktop + Start menu; Apps & features entry.
 
-INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Programs" / APP
+INSTALL_DIR = DATA / "app"
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\YTTracker"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+LNK_NAME = "מעקב ערוצים.lnk"
+
+
+def is_admin() -> bool:
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def run_elevated(args: list[str]) -> bool:
+    """Run this exe with administrator rights (Windows asks the user) and
+    wait for it. Returns True if it ran and succeeded."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SEI(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong), ("hwnd", wintypes.HWND),
+                    ("lpVerb", wintypes.LPCWSTR), ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+                    ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int), ("hInstApp", wintypes.HINSTANCE),
+                    ("lpIDList", ctypes.c_void_p), ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+                    ("dwHotKey", wintypes.DWORD), ("hIcon", wintypes.HANDLE), ("hProcess", wintypes.HANDLE)]
+    sei = SEI(cbSize=ctypes.sizeof(SEI), fMask=0x40, lpVerb="runas", lpFile=sys.executable,
+              lpParameters=subprocess.list2cmdline(args), nShow=0)
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)):
+        return False                      # the user said "No" to the prompt
+    ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, 0xFFFFFFFF)
+    code = wintypes.DWORD()
+    ctypes.windll.kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(code))
+    ctypes.windll.kernel32.CloseHandle(sei.hProcess)
+    return code.value == 0
 
 
 def _shortcut(lnk: Path, target: Path) -> None:
@@ -347,94 +398,149 @@ def _shortcut(lnk: Path, target: Path) -> None:
           "$s.TargetPath=$env:TGT;$s.IconLocation=$env:TGT+',0';$s.WorkingDirectory=$env:DIR;$s.Save()")
     env = {**os.environ, "LNK": str(lnk), "TGT": str(target), "DIR": str(target.parent)}
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], env=env,
-                   capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                   capture_output=True, creationflags=NO_WINDOW)
 
 
 def _shortcut_paths() -> list[Path]:
+    """Shared Desktop and shared Start menu — seen by every user."""
+    public = Path(os.environ.get("PUBLIC") or r"C:\Users\Public")
+    return [public / "Desktop" / LNK_NAME,
+            PROGRAMDATA / "Microsoft" / "Windows" / "Start Menu" / "Programs" / LNK_NAME]
+
+
+def _old_per_user_cleanup() -> None:
+    """Remove the earlier per-user install (shortcuts, HKCU entries) and
+    bring its settings over to the shared place."""
+    import winreg
+    old_dir = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Programs" / APP
     appdata = Path(os.environ.get("APPDATA") or Path.home())
-    desktop = Path(os.environ.get("USERPROFILE") or Path.home()) / "Desktop"
-    return [desktop / "מעקב ערוצים.lnk",
-            appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "מעקב ערוצים.lnk"]
+    userdesk = Path(os.environ.get("USERPROFILE") or Path.home()) / "Desktop"
+    for lnk in (userdesk / LNK_NAME, appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs" / LNK_NAME):
+        lnk.unlink(missing_ok=True)
+    for key, value in ((UNINSTALL_KEY, None), (RUN_KEY, APP)):
+        try:
+            if value is None:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key)
+            else:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_SET_VALUE) as k:
+                    winreg.DeleteValue(k, value)
+        except OSError:
+            pass
+    if old_dir.exists():
+        subprocess.Popen(f'cmd /c timeout /t 3 /nobreak >nul & rmdir /s /q "{old_dir}"', shell=True,
+                         creationflags=NO_WINDOW)
+    for name in ("config.json", "state.json"):
+        src, dst = OLD_DATA / name, DATA / name
+        if src.exists() and not dst.exists():
+            shutil.copy2(src, dst)
+
+
+def do_install(src: Path) -> int:
+    """Runs elevated (--install-elevated): copy, permissions, shortcuts,
+    Apps & features, autostart for everyone."""
+    import winreg
+    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    target = INSTALL_DIR / "YTTracker.exe"
+    shutil.copy2(src, target)
+    # Every user may modify the app folder and the shared settings — needed
+    # for self-update and for each user saving settings/history.
+    subprocess.run(["icacls", str(DATA), "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/Q"],
+                   capture_output=True, creationflags=NO_WINDOW)
+    for lnk in _shortcut_paths():
+        lnk.parent.mkdir(parents=True, exist_ok=True)
+        _shortcut(lnk, target)
+    with winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY) as k:
+        for name, val in (("DisplayName", "מעקב ערוצים (YTTracker)"), ("DisplayIcon", str(target)),
+                          ("Publisher", "YTTracker"), ("InstallLocation", str(INSTALL_DIR)),
+                          ("UninstallString", f'"{target}" --uninstall'),
+                          ("DisplayVersion", bundled_version()[:7] or "1")):
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, val)
+        winreg.SetValueEx(k, "NoModify", 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(k, "NoRepair", 0, winreg.REG_DWORD, 1)
+    if "--autostart" in sys.argv:
+        _set_autostart_machine(True, target)
+    return 0
 
 
 def install_if_needed() -> bool:
-    """First run from Downloads (or anywhere): copy the app to a permanent
-    place, add Desktop + Start-menu shortcuts and an Apps & features entry,
-    then restart from there. Returns True if this copy should exit."""
+    """Not running from the shared install yet: ask for administrator rights
+    once, install for all users, then start the installed copy. Returns True
+    if this copy should exit."""
     if not getattr(sys, "frozen", False):
         return False
     exe = Path(sys.executable).resolve()
     target = INSTALL_DIR / "YTTracker.exe"
     if exe.parent == INSTALL_DIR.resolve():
-        return False                     # already the installed copy
-    try:
-        INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(exe, target)
-        for lnk in _shortcut_paths():
-            lnk.parent.mkdir(parents=True, exist_ok=True)
-            _shortcut(lnk, target)
-        import winreg
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as k:
-            for name, val in (("DisplayName", "מעקב ערוצים (YTTracker)"), ("DisplayIcon", str(target)),
-                              ("Publisher", "YTTracker"), ("InstallLocation", str(INSTALL_DIR)),
-                              ("UninstallString", f'"{target}" --uninstall'),
-                              ("DisplayVersion", bundled_version()[:7] or "1")):
-                winreg.SetValueEx(k, name, 0, winreg.REG_SZ, val)
-            winreg.SetValueEx(k, "NoModify", 0, winreg.REG_DWORD, 1)
-            winreg.SetValueEx(k, "NoRepair", 0, winreg.REG_DWORD, 1)
-        if get_autostart():
-            set_autostart(True)          # point autostart at the installed copy
-        subprocess.Popen([str(target)] + [a for a in sys.argv[1:] if a != "--background"], close_fds=True)
-        return True
-    except Exception:
-        traceback.print_exc()
-        return False                     # couldn't install — just run from here
-
-
-def uninstall() -> None:
-    """Apps & features → Uninstall. Settings in %APPDATA% are kept."""
+        try:
+            _old_per_user_cleanup()
+        except Exception:
+            pass
+        return False                      # already the installed copy
     import tkinter as tk
     from tkinter import messagebox
     r = tk.Tk(); set_tk_icon(r); r.withdraw()
-    if not messagebox.askyesno(APP, "להסיר את התוכנה מהמחשב?\n(הקבצים שהורדו לא יימחקו)", parent=r):
+    if not messagebox.askokcancel(APP, "התוכנה תותקן לכל המשתמשים במחשב.\n"
+                                  "Windows יבקש אישור מנהל — לחץ \"כן\".", parent=r):
+        r.destroy()
+        return False                      # run from here this time
+    auto = messagebox.askyesno(APP, "להפעיל את התוכנה אוטומטית עם Windows לכל המשתמשים?\n"
+                               "(היא תרוץ ברקע ותוריד גם כשהחלון סגור)", parent=r)
+    r.destroy()
+    args = ["--install-elevated", str(exe)] + (["--autostart"] if auto else [])
+    ok = do_install(exe) == 0 if is_admin() else run_elevated(args)
+    if not ok or not target.exists():
+        r = tk.Tk(); set_tk_icon(r); r.withdraw()
+        messagebox.showwarning(APP, "ההתקנה לא הושלמה (לא אושרה הרשאת מנהל). התוכנה תרוץ מהמקום הנוכחי.", parent=r)
+        r.destroy()
+        return False
+    subprocess.Popen([str(target)], close_fds=True)
+    return True
+
+
+def uninstall() -> None:
+    """Apps & features → Uninstall. Downloaded files and settings are kept."""
+    if not is_admin():
+        run_elevated(["--uninstall"])
+        return
+    import tkinter as tk
+    import winreg
+    from tkinter import messagebox
+    r = tk.Tk(); set_tk_icon(r); r.withdraw()
+    if not messagebox.askyesno(APP, "להסיר את התוכנה מהמחשב (לכל המשתמשים)?\n(הקבצים שהורדו לא יימחקו)", parent=r):
         return
     try:
-        set_autostart(False)
+        _set_autostart_machine(False)
     except Exception:
         pass
     for lnk in _shortcut_paths():
         lnk.unlink(missing_ok=True)
     try:
-        import winreg
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
-    except Exception:
+        winreg.DeleteKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY)
+    except OSError:
         pass
     # A running exe can't delete itself: let cmd remove the folder after we exit.
     subprocess.Popen(f'cmd /c timeout /t 2 /nobreak >nul & rmdir /s /q "{INSTALL_DIR}"', shell=True,
-                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                     creationflags=NO_WINDOW)
     messagebox.showinfo(APP, "התוכנה הוסרה.", parent=r)
 
 
-RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-SINGLE_PORT = 47321   # local port that marks "already running"
-
+# ---------------------------------------------------------------- autostart (all users)
 
 def get_autostart() -> bool:
     try:
         import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, RUN_KEY) as k:
             winreg.QueryValueEx(k, APP)
         return True
     except Exception:
         return False
 
 
-def set_autostart(on: bool) -> None:
-    """Start with Windows, hidden in the tray (--background)."""
+def _set_autostart_machine(on: bool, exe: Path | None = None) -> None:
     import winreg
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
         if on:
-            winreg.SetValueEx(k, APP, 0, winreg.REG_SZ, f'"{sys.executable}" --background')
+            winreg.SetValueEx(k, APP, 0, winreg.REG_SZ, f'"{exe or sys.executable}" --background')
         else:
             try:
                 winreg.DeleteValue(k, APP)
@@ -442,11 +548,34 @@ def set_autostart(on: bool) -> None:
                 pass
 
 
+def set_autostart(on: bool) -> None:
+    """Start with Windows for every user, hidden in the tray. Changing it
+    needs administrator rights, so Windows asks."""
+    if is_admin():
+        _set_autostart_machine(on)
+    else:
+        run_elevated(["--set-autostart", "1" if on else "0"])
+
+
+# ---------------------------------------------------------------- one copy per user session
+
+def _session_port() -> int:
+    """Each logged-in user gets their own 'already running' port."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        sid = wintypes.DWORD()
+        ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid))
+        return 47321 + (sid.value % 500)
+    except Exception:
+        return 47321
+
+
 def already_running() -> bool:
-    """If another copy is running, ask it to show its window and say so."""
+    """If this user already has the app open, show its window and say so."""
     import socket
     try:
-        with socket.create_connection(("127.0.0.1", SINGLE_PORT), timeout=1) as c:
+        with socket.create_connection(("127.0.0.1", _session_port()), timeout=1) as c:
             c.sendall(b"show")
         return True
     except OSError:
@@ -457,7 +586,7 @@ def listen_for_show(show) -> None:
     import socket
     srv = socket.socket()
     try:
-        srv.bind(("127.0.0.1", SINGLE_PORT))
+        srv.bind(("127.0.0.1", _session_port()))
     except OSError:
         return
     srv.listen(1)
@@ -468,6 +597,31 @@ def listen_for_show(show) -> None:
             c.close()
             show()
     threading.Thread(target=loop, daemon=True).start()
+
+
+class DownloadLock:
+    """Only one copy on the computer downloads at a time (two users logged
+    in at once would otherwise fetch the same files into the shared folder)."""
+    def __init__(self):
+        self.fh = None
+
+    def acquire(self) -> bool:
+        if self.fh:
+            return True
+        try:
+            import msvcrt
+            fh = open(DATA / "downloader.lock", "a+")
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            self.fh = fh
+            return True
+        except ImportError:
+            return True                   # not Windows (testing)
+        except OSError:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            return False
 
 
 class Api:
@@ -490,6 +644,24 @@ class Api:
             return True
         os.startfile(self.cfg["folder"])
         return False
+
+    def forget(self, vids: list, delete_files: bool = False) -> int:
+        """Deleted from the site's history: forget them here too, and
+        optionally delete the files from the computer."""
+        st, n = self.dl.state, 0
+        for vid in vids or []:
+            path = st.get("files", {}).pop(vid, None)
+            st["requeued"].pop(vid, None)
+            if vid in st["got"]:
+                st["got"].remove(vid)
+            if delete_files and path and Path(path).exists():
+                try:
+                    Path(path).unlink()
+                    n += 1
+                except OSError:
+                    pass
+        self.dl.save_state()
+        return n
 
     def downloaded(self) -> list:
         """Which videos this computer already has (the site shows a folder button)."""
@@ -571,7 +743,7 @@ def open_window(cfg: dict, dl: "Downloader", background: bool) -> None:
         tray.run_detached()
     listen_for_show(show)
     # private_mode=False + storage_path: the site's login is remembered.
-    webview.start(private_mode=False, storage_path=str(DATA / "web"))
+    webview.start(private_mode=False, storage_path=str(USERDATA / "web"))
     if tray:
         tray.stop()
 
@@ -650,6 +822,13 @@ def self_update() -> bool:
 
 def main() -> None:
     DATA.mkdir(parents=True, exist_ok=True)
+    USERDATA.mkdir(parents=True, exist_ok=True)
+    if "--install-elevated" in sys.argv:          # the administrator half of installing
+        sys.exit(do_install(Path(sys.argv[sys.argv.index("--install-elevated") + 1])))
+    if "--set-autostart" in sys.argv:
+        _set_autostart_machine(sys.argv[sys.argv.index("--set-autostart") + 1] == "1",
+                               INSTALL_DIR / "YTTracker.exe")
+        sys.exit(0)
     if "--uninstall" in sys.argv:
         return uninstall()
     if already_running():
@@ -661,18 +840,6 @@ def main() -> None:
     cfg = load_json(CONFIG, {})
     if "--setup" in sys.argv or not all(cfg.get(k) for k in ("site", "password", "folder")):
         cfg = first_run_setup(cfg)
-        if not cfg.get("asked_autostart"):
-            cfg["asked_autostart"] = True
-            save_json(CONFIG, cfg)
-            try:
-                import tkinter as tk
-                from tkinter import messagebox
-                r = tk.Tk(); set_tk_icon(r); r.withdraw()
-                if messagebox.askyesno(APP, "להפעיל את התוכנה אוטומטית עם Windows?\n(היא תרוץ ברקע ותוריד גם כשהחלון סגור)", parent=r):
-                    set_autostart(True)
-                r.destroy()
-            except Exception:
-                pass
     dl = Downloader(cfg)
     dl.start()
     open_window(cfg, dl, background="--background" in sys.argv)

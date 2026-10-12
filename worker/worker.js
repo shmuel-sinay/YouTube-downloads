@@ -65,6 +65,14 @@ async function addJobs(env, jobs) {
   for (const id of dropped) await env.DB.delete("job:" + id);
 }
 
+// Remove jobs from the history completely. A channel's "seen" list still
+// remembers them, so the tracker won't download them again by itself.
+async function deleteJobs(env, ids) {
+  const drop = new Set(ids);
+  await putJSON(env, "jobs", (await getJobIds(env)).filter((id) => !drop.has(id)));
+  for (const id of drop) await env.DB.delete("job:" + id);
+}
+
 async function listJobs(env) {
   const ids = await getJobIds(env);
   const jobs = await Promise.all(ids.map((id) => getJSON(env, "job:" + id, null)));
@@ -429,6 +437,21 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       wake();
       return redirect(BASE + "/");
     }
+    if (p === "/jobs/delete") {
+      // One or more ids (comma separated). A job being downloaded right now
+      // is stopped by the agent within seconds (its check finds it missing).
+      const ids = String(f.get("id") || "").split(",").map((x) => x.trim()).filter(Boolean);
+      await deleteJobs(env, ids);
+      await addLog(env, "worker", `נמחקו מההיסטוריה: ${ids.length}`);
+      return redirect(BASE + "/");
+    }
+    if (p === "/jobs/clear") {
+      // "Clear history": everything finished (done / failed / skipped / cancelled).
+      const done = (await listJobs(env)).filter((j) => ["done", "failed", "skipped", "cancelled"].includes(j.status));
+      await deleteJobs(env, done.map((j) => j.videoId));
+      await addLog(env, "worker", `ההיסטוריה נוקתה: ${done.length} פריטים`);
+      return json({ deleted: done.map((j) => j.videoId) });
+    }
     if (p === "/jobs/pause") {
       // Waiting job: just set aside. Downloading job: the agent sees this
       // within seconds, stops, and keeps the partial file to resume later.
@@ -720,9 +743,12 @@ async function dashboard(env) {
   <div class="content">
 
   <section data-p="queue">
-    <div class="seg" id="filter">
-      <button class="on" data-f="all">הכל</button><button data-f="active">פעילים</button>
-      <button data-f="done">הושלמו</button><button data-f="problem">בעיות</button>
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+      <div class="seg" id="filter">
+        <button class="on" data-f="all">הכל</button><button data-f="active">פעילים</button>
+        <button data-f="done">הושלמו</button><button data-f="problem">בעיות</button>
+      </div>
+      <button class="btn ghost" id="clearHistory" type="button">${icon("trash")}<span>נקה היסטוריה</span></button>
     </div>
     <div class="list" id="jobs"></div>
   </section>
@@ -867,6 +893,7 @@ function jobRow(j) {
   if (j.status === "queued" || j.status === "taken") a.push(btn("pause", j.videoId, "pause", "השהה"));
   if (["failed", "skipped", "cancelled"].includes(j.status)) a.push(btn("retry", j.videoId, "retry", "נסה שוב"));
   if (["queued", "taken", "paused"].includes(j.status)) a.push(btn("cancel", j.videoId, "x", "ביטול", "danger"));
+  a.push(btn("delete", j.videoId, "trash", "מחק מההיסטוריה", "danger"));
   return '<div class="row">' + thumb + '<div class="info"><div class="title" title="' + esc(j.title) + '">' + esc(j.title) + '</div>' +
     '<div class="meta">' + meta + '</div>' +
     (j.error ? '<div class="note' + (j.status === "failed" ? " bad" : "") + '">' + esc(j.error) + '</div>' : '') +
@@ -931,6 +958,13 @@ document.addEventListener("click", async (e) => {
   try {
     if (act === "cancel" && !confirm("לבטל את ההורדה?")) return;
     if (act === "remove" && !confirm("להסיר את הערוץ מהמעקב?")) return;
+    if (act === "delete") {
+      const job = S.jobs.find((x) => x.videoId === id) || {};
+      if (!confirm("למחוק מההיסטוריה את: " + (job.title || id) + "?")) return;
+      // In the desktop app: also forget it there, and optionally delete the file.
+      if (APP() && HAVE.has(id)) await APP().forget([id], confirm("למחוק גם את הקובץ מהמחשב?"));
+      await post("/jobs/delete", d); toast("נמחק מההיסטוריה"); await loadHave(); refresh(); return;
+    }
     if (act === "pcdl") { toast("מוריד למחשב…"); const r = await APP().download_now(id); toast(r || "ירד"); await loadHave(); render(); return; }
     if (act === "showfile") { await APP().show_file(id); return; }
     if (act === "batch") {
@@ -953,6 +987,15 @@ async function wake(btnEl) {
 $("wakeBtn").onclick = () => wake($("wakeBtn")); $("wakeBtn2").onclick = () => wake($("wakeBtn2"));
 $("checkBtn").onclick = async () => { const b = $("checkBtn"); b.disabled = true;
   try { await post("/check", new FormData()); toast("נבדק"); } catch (e) { toast("שגיאה: " + e.message); } b.disabled = false; refresh(); };
+$("clearHistory").onclick = async () => {
+  if (!confirm("למחוק מההיסטוריה את כל מה שהסתיים (הושלם / נכשל / דולג / בוטל)? הורדות פעילות לא יימחקו.")) return;
+  const files = APP() ? confirm("למחוק גם את הקבצים עצמם מהמחשב?") : false;
+  try {
+    const r = await (await fetch(B + "/jobs/clear", { method: "POST" })).json();
+    if (APP()) await APP().forget(r.deleted || [], files);
+    toast("נמחקו " + (r.deleted || []).length + " פריטים"); await loadHave(); refresh();
+  } catch (e) { toast("שגיאה: " + e); }
+};
 $("clearLogs").onclick = async () => { await fetch(B + "/logs/clear", { method: "POST" }); refresh(); };
 $("copyLogs").onclick = async () => {
   const text = S.logs.map((l) => hhmm(l.t) + " [" + l.src + "] " + l.msg).join("\\n");
@@ -989,7 +1032,7 @@ async function autoDownload() {
 }
 
 // ---------- desktop app extras ----------
-async function loadHave() { try { HAVE = new Set(await APP().downloaded()); } catch (e) {} }
+async function loadHave() { if (!APP()) return; try { HAVE = new Set(await APP().downloaded()); } catch (e) {} }
 async function initDesktop() {
   if (!APP()) return;
   await loadHave(); setInterval(async () => { await loadHave(); render(); }, 15000);
