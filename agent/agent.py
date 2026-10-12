@@ -221,7 +221,7 @@ def prog_file(vid: str) -> Path:
     return Path("/tmp") / f"ffprog-{vid}.txt"
 
 
-_LAST_GOOD = {"label": ""}     # the way that last got past YouTube
+_LAST_GOOD = {"label": None}   # the way that last got past YouTube (None = not known yet)
 
 
 def _without(cmd: list[str], flag: str) -> list[str]:
@@ -603,7 +603,8 @@ def _handle(job: dict) -> None:
     if "--proxy" in cmd:
         tries.append(("בלי WARP", _without(cmd, "--proxy")))
     # Start with whatever worked last time (no wasted attempts once a way is found).
-    tries.sort(key=lambda t: t[0] != _LAST_GOOD["label"])
+    if _LAST_GOOD["label"] is not None:
+        tries.sort(key=lambda t: t[0] != _LAST_GOOD["label"])
     seen = set()
     for n, (label, c) in enumerate(tries):
         if tuple(c) in seen:
