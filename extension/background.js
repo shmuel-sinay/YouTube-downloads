@@ -3,6 +3,30 @@
 // Nothing is sent anywhere else.
 
 const EVERY_MIN = 20;
+const VISIT_EVERY_MIN = 12 * 60;   // a quiet visit to YouTube twice a day
+
+// Keeps the login fresh even when YouTube isn't opened for a long time: load
+// the home page in the background (with this browser's cookies, like a tab
+// would), let YouTube renew its cookies, then send the renewed ones.
+async function visit() {
+  const status = { at: new Date().toISOString() };
+  try {
+    const r = await fetch("https://www.youtube.com/", { credentials: "include", cache: "no-store" });
+    status.ok = r.ok;
+    status.msg = r.ok ? "ביקור ביוטיוב: ✓" : "ביקור ביוטיוב: HTTP " + r.status;
+  } catch (e) {
+    status.ok = false;
+    status.msg = "ביקור ביוטיוב נכשל: " + e.message;
+  }
+  await chrome.storage.local.set({ lastVisit: status });
+  await new Promise((res) => setTimeout(res, 5000));     // let the renewed cookies settle
+  return push("ביקור ביוטיוב");
+}
+
+function schedule() {
+  chrome.alarms.create("push", { periodInMinutes: EVERY_MIN });
+  chrome.alarms.create("visit", { delayInMinutes: 1, periodInMinutes: VISIT_EVERY_MIN });
+}
 
 async function settings() {
   const s = await chrome.storage.local.get(["site", "key"]);
@@ -57,9 +81,12 @@ async function push(reason) {
   return status;
 }
 
-chrome.runtime.onInstalled.addListener(() => { chrome.alarms.create("push", { periodInMinutes: EVERY_MIN }); push("התקנה"); });
-chrome.runtime.onStartup.addListener(() => { chrome.alarms.create("push", { periodInMinutes: EVERY_MIN }); push("הדפדפן נפתח"); });
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === "push") push("כל " + EVERY_MIN + " דק׳"); });
+chrome.runtime.onInstalled.addListener(() => { schedule(); push("התקנה"); });
+chrome.runtime.onStartup.addListener(() => { schedule(); push("הדפדפן נפתח"); });
+chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name === "push") push("כל " + EVERY_MIN + " דק׳");
+  if (a.name === "visit") visit();
+});
 
 // YouTube rotates its login cookies while you browse — send the new ones
 // (at most once a minute).
@@ -72,4 +99,5 @@ chrome.cookies.onChanged.addListener((ch) => {
 
 chrome.runtime.onMessage.addListener((msg, _s, reply) => {
   if (msg === "push") { push("ידני").then(reply); return true; }
+  if (msg === "visit") { visit().then(reply); return true; }
 });
