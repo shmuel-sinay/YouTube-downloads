@@ -440,7 +440,10 @@ def handle_search(job: dict) -> None:
     if cookies:
         cmd += ["--cookies", cookies]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    found = None
+    # A NetFree-only profile gets several candidates: the desktop app checks
+    # them in order and keeps the first one NetFree lets through.
+    want = max(1, min(int(job.get("candidates") or 1), 8))
+    found, matches = None, []
     for line in r.stdout.splitlines():
         parts = line.split("\t", 2)
         if len(parts) < 3 or len(parts[0]) != 11:
@@ -451,18 +454,23 @@ def handle_search(job: dict) -> None:
             dur = None
         if min_s and (dur is None or dur < min_s):
             continue
-        found = {"videoId": parts[0], "title": parts[2], "duration": dur}
-        break
+        matches.append({"videoId": parts[0], "title": parts[2], "duration": dur})
+        if len(matches) >= want:
+            break
+    found = matches[0] if matches else None
     if not found:
         errs = [l for l in r.stderr.splitlines() if "ERROR" in l]
         why = errs[-1] if errs else ("לא נמצאה תוצאה" + (f" באורך {min_s // 60} דקות לפחות" if min_s else ""))
         api("/api/report", {"videoId": vid, "status": "failed", "error": why})
         log(f"   {why}")
         return
-    api("/api/enqueue", {"items": [found], "mode": job.get("mode"), "minMinutes": job.get("minMinutes"),
+    if want > 1:
+        for rank, m in enumerate(matches):
+            m.update(group=vid, rank=rank)
+    api("/api/enqueue", {"items": matches if want > 1 else [found], "mode": job.get("mode"), "minMinutes": job.get("minMinutes"),
                          "channelName": "חיפוש: " + q, "replace": vid,
                          "priority": (job.get("priority") or 0) + 1})  # download it right away
-    log(f"   נמצא: {found['title']}")
+    log(f"   נמצא: {found['title']}" + (f" (+{len(matches) - 1} חלופות לבדיקת נטפרי)" if want > 1 else ""))
 
 
 def _handle(job: dict) -> None:

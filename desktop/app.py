@@ -43,7 +43,8 @@ DATA = PROGRAMDATA / APP
 USERDATA = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / APP
 OLD_DATA = Path(os.environ.get("APPDATA") or Path.home()) / APP   # before all-users install
 CONFIG = DATA / "config.json"          # shared: site address only
-USERCFG = USERDATA / "user.json"       # this Windows user: profile login, folder, vault
+USERCFG = USERDATA / "user.json"       # before accounts: one profile per Windows user
+ACCOUNTS = USERDATA / "accounts.json"  # every profile signed in on this Windows user
 STATE = USERDATA / "state.json"        # this user's download history
 LOGFILE = USERDATA / "app.log"
 TMP = USERDATA / "tmp"                 # decrypted copies for playing — wiped on lock/exit
@@ -176,137 +177,199 @@ def msgbox(text: str, flags: int = MB_OK | MB_ICONINFO) -> bool:
         return flags & 0xF == MB_OK
 
 
-SETUP_HTML = r"""<!doctype html><html dir="rtl"><head><meta charset="utf-8"><style>
-body{font-family:Segoe UI,Arial;background:#0e1015;color:#e7e9ee;margin:0;padding:22px}
-h2{margin:0 0 14px}label{display:block;margin:12px 0 4px;color:#aab}
-input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:9px;border-radius:8px;border:1px solid #333a48;background:#171a22;color:#fff}
-.row{display:flex;gap:8px}.row input{flex:1}button{padding:9px 14px;border-radius:8px;border:0;background:#2b6cff;color:#fff;cursor:pointer}
-button.s{background:#2a2f3b}.chk{display:flex;gap:8px;align-items:center;margin-top:14px}#err{color:#ff6b6b;margin-top:10px;min-height:1em}
-.box{border:1px solid #2a2f3b;border-radius:10px;padding:10px 12px;margin-top:10px}</style></head><body>
-<h2>הגדרת התוכנה</h2>
-<label>כתובת האתר</label><input type="text" id="site">
-<label>הסיסמה שלך לאתר (הפרופיל שלך)</label><input type="password" id="pw">
-<div class="chk"><input type="checkbox" id="usev" onchange="upd()"><span>לשמור את הקבצים בכספת מוצפנת (בסייר יראו רק קבצים מקודדים)</span></div>
-<div class="box" id="vbox" style="display:none">
-<label>תיקיית הכספת</label><div class="row"><input type="text" id="vdir"><button class="s" onclick="pick('vdir')">בחר…</button></div>
-<label>סיסמה לכספת (לפחות 6 תווים; אם הכספת כבר קיימת — אין צורך)</label><input type="password" id="vp1">
-<label>שוב סיסמת הכספת</label><input type="password" id="vp2">
-</div>
-<div id="fbox"><label>תיקיית הורדות</label><div class="row"><input type="text" id="folder"><button class="s" onclick="pick('folder')">בחר…</button></div></div>
-<div class="chk"><input type="checkbox" id="old"><span>להוריד גם קבצים שכבר מוכנים עכשיו בתור</span></div>
-<div id="err"></div>
-<div style="margin-top:14px;display:flex;gap:8px"><button onclick="save()">שמירה והמשך</button><button class="s" onclick="pywebview.api.cancel()">ביטול</button></div>
-<script>
-function upd(){var v=document.getElementById('usev').checked;document.getElementById('vbox').style.display=v?'':'none';document.getElementById('fbox').style.display=v?'none':''}
-async function pick(id){var r=await pywebview.api.pick();if(r)document.getElementById(id).value=r}
-async function save(){var g=function(i){return document.getElementById(i)};
- var r=await pywebview.api.save({site:g('site').value,password:g('pw').value,vault:g('usev').checked,vault_dir:g('vdir').value,
-  vp1:g('vp1').value,vp2:g('vp2').value,folder:g('folder').value,old:g('old').checked});
- if(r!=='ok')g('err').textContent=r}
-var BOOTED=false;async function boot(){if(BOOTED||!(window.pywebview&&pywebview.api&&pywebview.api.defaults))return;BOOTED=true;var d=await pywebview.api.defaults();
- document.getElementById('site').value=d.site;document.getElementById('folder').value=d.folder;
- document.getElementById('vdir').value=d.vault_dir||'';if(d.vault_dir){document.getElementById('usev').checked=true;upd()}}
-window.addEventListener('pywebviewready',boot);setInterval(boot,300);
-</script></body></html>"""
+# ---------------------------------------------------------------- accounts
+# Several people can share one Windows user. Each signs in on the site's
+# own "who's signing in?" page inside the app; the app remembers the
+# profile (code encrypted with DPAPI, for this Windows user only) and keeps
+# downloading for every remembered profile in the background — each into
+# its own folder or vault.
 
+class Accounts:
+    def __init__(self, site: str):
+        self.site = site.rstrip("/")
+        self.data: dict = load_json(ACCOUNTS, {})       # pid -> stored account
+        self.dls: dict = {}                            # pid -> Downloader
+        self.notify = lambda title, msg: None          # set by the tray icon
+        self.lock = threading.Lock()
 
-class SetupApi:
-    def __init__(self, cfg: dict):
-        self._cfg = cfg
-        self._win = None
-        self._done = False
+    def save(self) -> None:
+        with self.lock:
+            out = {}
+            for pid, a in self.data.items():
+                a = {k: v for k, v in a.items() if k != "password"}
+                if self.data[pid].get("password"):
+                    a["password_enc"] = protect(self.data[pid]["password"])
+                out[pid] = a
+            save_json(ACCOUNTS, out)
 
-    def defaults(self):
-        return {"site": self._cfg.get("site") or DEFAULT_SITE, "vault_dir": self._cfg.get("vault_dir") or "",
-                "folder": self._cfg.get("folder") or str(Path.home() / "Music" / APP)}
-
-    def pick(self):
-        import webview
-        r = self._win.create_file_dialog(webview.FOLDER_DIALOG)
-        return r[0] if r else ""
-
-    def cancel(self):
-        self._win.destroy()
-
-    def save(self, d: dict):
-        site = (d.get("site") or "").strip().rstrip("/")
-        if not site.startswith("http"):
-            return "כתובת אתר לא תקינה"
-        if not d.get("password"):
-            return "חסרה סיסמה לאתר"
-        vault_dir, folder = "", ""
-        if d.get("vault"):
-            vault_dir = (d.get("vault_dir") or "").strip()
-            if not vault_dir:
-                return "בחר תיקייה לכספת"
-            from vault import Vault
-            v = Vault(vault_dir)
-            if not v.exists:
-                if d.get("vp1") != d.get("vp2") or len(d.get("vp1") or "") < 6:
-                    return "סיסמאות הכספת לא זהות או קצרות מדי"
-                try:
-                    v.create(d["vp1"])
-                except Exception as e:
-                    return f"יצירת הכספת נכשלה: {e}"
-        else:
-            folder = (d.get("folder") or "").strip() or str(Path.home() / "Music" / APP)
+    def _decrypt(self, a: dict) -> dict:
+        if "password" not in a:
             try:
-                Path(folder).mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                return f"אי אפשר ליצור את התיקייה: {e}"
-        old = bool(d.get("old"))
-        self._cfg.update(site=site, password=d["password"], folder=folder or str(USERDATA / "files"),
-                        vault_dir=vault_dir, unzip=True, include_existing=old,
-                        since="" if old else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        save_user_cfg(self._cfg)
-        self._done = True
-        self._win.destroy()
-        return "ok"
+                a["password"] = unprotect(a.get("password_enc", "")) if a.get("password_enc") else ""
+            except Exception:
+                a["password"] = ""
+        a.pop("password_enc", None)
+        a.setdefault("site", self.site)
+        a.setdefault("unzip", True)
+        return a
+
+    def start_all(self) -> None:
+        for pid in list(self.data):
+            self._start(pid)
+
+    def _start(self, pid: str) -> "Downloader":
+        acct = self._decrypt(self.data[pid])
+        acct["pid"] = pid
+        dl = self.dls.get(pid)
+        if dl is None:
+            dl = Downloader(acct, self)
+            self.dls[pid] = dl
+            dl.start()
+        return dl
+
+    def default_folder(self, name: str) -> str:
+        safe = "".join(c for c in name if c not in '<>:"/\\|?*').strip() or "profile"
+        return str(Path.home() / "Music" / APP / safe)
+
+    def remember(self, pid: str, password: str) -> dict:
+        """Called by the sign-in page inside the app. Checks the code with the
+        site, then keeps this profile downloading in the background."""
+        s = requests.Session()
+        s.headers["User-Agent"] = "yt-tracker-desktop/1.0"
+        r = s.post(self.site + "/yt/login", data={"pid": pid, "password": password}, allow_redirects=False, timeout=30)
+        if r.status_code not in (302, 303) or "auth" not in s.cookies:
+            return {"ok": False}
+        prof = (s.get(self.site + "/yt/status", timeout=30).json().get("profile") or {})
+        pid = prof.get("id") or pid
+        old = self.data.get(pid)
+        if old:
+            old = self._decrypt(old)
+            if old.get("password") != password:
+                # The admin gave this profile a new code: the vault (whose
+                # password is the code) follows it.
+                if old.get("vault_dir") and old.get("vault_auto"):
+                    try:
+                        from vault import Vault
+                        Vault(old["vault_dir"]).change_password(old["password"], password)
+                    except Exception:
+                        pass
+                old["password"] = password
+                if pid in self.dls:
+                    self.dls[pid].cfg["password"] = password
+        else:
+            self.data[pid] = {"password": password, "name": prof.get("name") or pid,
+                              "folder": self.default_folder(prof.get("name") or pid), "vault_dir": "",
+                              "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "notify": "each"}
+        self.data[pid].update(name=prof.get("name") or pid, vault=bool(prof.get("vault")), netfree=bool(prof.get("netfree")))
+        self.save()
+        dl = self._start(pid)
+        dl.apply_profile(prof)
+        return {"ok": True, "pid": pid}
+
+    def add_legacy(self, cfg: dict) -> None:
+        """One profile from before accounts (user.json): its id is learned on
+        the first contact with the site."""
+        if not cfg.get("password"):
+            return
+        self.data["?"] = {"password": cfg["password"], "name": "", "folder": cfg.get("folder") or "",
+                          "vault_dir": cfg.get("vault_dir") or "", "since": cfg.get("since") or "",
+                          "unzip": cfg.get("unzip", True), "notify": get_pref("notify", "each"), "legacy": True}
+        self.save()
+
+    def rekey(self, old: str, new: str) -> None:
+        """The legacy account's real profile id is now known."""
+        with self.lock:
+            if old in self.data:
+                if new in self.data:              # already signed in again meanwhile
+                    self.data.pop(old)
+                else:
+                    self.data[new] = self.data.pop(old)
+                    self.data[new].pop("legacy", None)
+            if old in self.dls:
+                self.dls[new] = self.dls.pop(old)
+        self.save()
+        if STATE.exists() and not state_file(new).exists():
+            shutil.copy2(STATE, state_file(new))
 
 
-def setup_ui() -> int:
-    """Runs in its own process (--setup-ui): pywebview can start only once
-    per process, and the main window starts after this."""
-    import webview
-    api = SetupApi(load_cfg())
-    api._win = webview.create_window("הגדרת מעקב ערוצים", html=SETUP_HTML, js_api=api, width=560, height=640,
-                                    background_color="#0e1015")
-    webview.start(private_mode=True)
-    return 0 if api._done else 1
-
-
-def first_run_setup(cfg: dict) -> dict:
-    """Per Windows user: which profile (by its password), where files go,
-    and whether to keep them in an encrypted vault."""
-    cmd = [sys.executable, "--setup-ui"] if getattr(sys, "frozen", False) else [sys.executable, __file__, "--setup-ui"]
-    if subprocess.run(cmd).returncode != 0:
-        sys.exit(0)
-    return load_cfg()
+def state_file(pid: str) -> Path:
+    return USERDATA / f"state-{pid}.json"
 
 
 # ---------------------------------------------------------------- downloader
 
 class Downloader(threading.Thread):
-    def __init__(self, cfg: dict):
+    """Downloads for one profile (one remembered account)."""
+    def __init__(self, cfg: dict, accounts: "Accounts | None" = None):
         super().__init__(daemon=True)
         self.cfg = cfg
+        self.accounts = accounts
         self.base = cfg["site"].rstrip("/") + "/yt"
         self.s = requests.Session()
         self.s.headers["User-Agent"] = "yt-tracker-desktop/1.0"
-        self.state = load_json(STATE, {"got": [], "requeued": {}})
+        self.state = load_json(self.state_path(), {"got": [], "requeued": {}})
         self.state.setdefault("files", {})       # videoId -> where the file was saved
         self.pending_got: list[str] = []         # reported to the site (browser then skips them)
         self.pending_logs: list[str] = []
         self.last_wake = 0.0
         self.last_update_check = time.time()
         self.lock = threading.Lock()          # one download at a time
-        self.notify = lambda title, msg: None  # set by the tray icon
+        self.nf_seen: dict = {}               # videoId -> time of the last "unknown" NetFree check
         self._seen: set | None = None           # files already announced
         self._batch = 0                         # files in the current "download task"
 
     # -- helpers
+    @property
+    def pid(self) -> str:
+        return self.cfg.get("pid") or "?"
+
+    def notify(self, title: str, msg: str) -> None:
+        if self.accounts:
+            self.accounts.notify(title, msg)
+
+    def state_path(self) -> Path:
+        return STATE if self.pid == "?" else state_file(self.pid)
+
+    def folder(self) -> Path:
+        return Path(self.cfg.get("folder") or (self.accounts.default_folder(self.cfg.get("name") or self.pid)
+                                                if self.accounts else USERDATA / "files"))
+
+    def save_cfg(self) -> None:
+        if self.accounts:
+            self.accounts.save()
+        else:
+            save_user_cfg(self.cfg)
+
+    def apply_profile(self, prof: dict) -> None:
+        """What the admin set for this profile (name, vault) — the user can't
+        change these. A profile with a vault gets one here, locked with its
+        code (only the admin sets codes)."""
+        if not prof:
+            return
+        pid = prof.get("id") or self.pid
+        if self.pid == "?" and self.accounts and pid:
+            self.accounts.rekey("?", pid)
+            self.cfg["pid"] = pid
+            self.save_state()
+        changed = False
+        for k in ("name", "vault", "netfree"):
+            v = prof.get(k) if k == "name" else bool(prof.get(k))
+            if v is not None and self.cfg.get(k) != v:
+                self.cfg[k], changed = v, True
+        if prof.get("vault") and not self.cfg.get("vault_dir") and self.cfg.get("password"):
+            from vault import Vault
+            vdir = USERDATA / f"vault-{self.pid}"
+            v = Vault(vdir)
+            if not v.exists:
+                v.create(self.cfg["password"])
+            self.cfg.update(vault_dir=str(vdir), vault_auto=True)
+            self.log("נוצרה כספת מוצפנת לפרופיל (הסיסמה שלה = הקוד של הפרופיל)")
+            changed = True
+        if changed:
+            self.save_cfg()
+
     def log(self, msg: str, remote: bool = True) -> None:
-        line = time.strftime("%H:%M:%S ") + msg
+        line = time.strftime("%H:%M:%S ") + (f"[{self.cfg.get('name') or self.pid}] " if self.accounts else "") + msg
         try:
             with LOGFILE.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -326,8 +389,10 @@ class Downloader(threading.Thread):
             self.pending_got = got + self.pending_got
 
     def login(self) -> bool:
-        r = self.s.post(self.base + "/login", data={"password": self.cfg["password"]},
-                        allow_redirects=False, timeout=30)
+        data = {"password": self.cfg["password"]}
+        if self.pid != "?":
+            data["pid"] = self.pid
+        r = self.s.post(self.base + "/login", data=data, allow_redirects=False, timeout=30)
         ok = r.status_code in (302, 303) and "auth" in self.s.cookies
         self.log("התחברתי לאתר" if ok else f"התחברות נכשלה (HTTP {r.status_code}) — בדוק את הסיסמה", remote=ok)
         return ok
@@ -341,11 +406,13 @@ class Downloader(threading.Thread):
             if not self.login():
                 raise RuntimeError("לא מחובר")
             r = self.s.get(self.base + "/status?client=pc", timeout=30)
-        return r.json()
+        st = r.json()
+        self.apply_profile(st.get("profile") or {})
+        return st
 
     def save_state(self) -> None:
         self.state["got"] = self.state["got"][-2000:]
-        save_json(STATE, self.state)
+        save_json(self.state_path(), self.state)
 
     # -- work
     def download_now(self, vid: str) -> str:
@@ -367,7 +434,7 @@ class Downloader(threading.Thread):
     def _download(self, job: dict) -> None:
         # With a vault, files land in a private staging folder and are
         # encrypted straight away; otherwise in the chosen folder.
-        folder = (USERDATA / "incoming") if self.cfg.get("vault_dir") else Path(self.cfg["folder"])
+        folder = (USERDATA / "incoming" / self.pid) if self.cfg.get("vault_dir") else self.folder()
         folder.mkdir(parents=True, exist_ok=True)
         url = job["fileUrl"]
         name = job.get("fileName") or urllib.parse.unquote(urllib.parse.urlparse(url).path.split("/")[-1])
@@ -444,7 +511,7 @@ class Downloader(threading.Thread):
         self.log(f"הקובץ נמחק בשרת — החזרתי לתור: {job.get('title')}")
 
     def run(self) -> None:
-        self.log(f"התוכנה עלתה · תיקייה: {self.cfg['folder']}", remote=False)
+        self.log("התוכנה עלתה · " + ("כספת מוצפנת" if self.cfg.get("vault_dir") else f"תיקייה: {self.folder()}"), remote=False)
         try:
             self.login()
         except Exception as e:
@@ -457,6 +524,11 @@ class Downloader(threading.Thread):
                 except Exception:
                     time.sleep(POLL_SECONDS)
                     continue
+            if self.pid == "main":
+                try:
+                    self.netfree_checks()
+                except Exception as e:
+                    self.log(f"בדיקת נטפרי: {e}", remote=False)
             if not lock.acquire():
                 # Another user's copy is downloading for this computer; this
                 # copy still shows notifications to its own user.
@@ -501,20 +573,45 @@ class Downloader(threading.Thread):
             return
         new = [landed[v] for v in landed if v not in self._seen]
         self._seen |= set(landed)
-        mode = get_pref("notify", "each")
+        mode = self.cfg.get("notify") or get_pref("notify", "each")
+        who = self.cfg.get("name") or ""
         if mode == "each":
             for j in new[:5]:
-                self.notify("ירד קובץ חדש", j.get("title") or j["videoId"])
+                # A profile with a vault: no titles on screen.
+                self.notify("ירד קובץ חדש" + (f" · {who}" if who else ""),
+                            "קובץ חדש נשמר בכספת" if self.cfg.get("vault_dir") else (j.get("title") or j["videoId"]))
             if len(new) > 5:
                 self.notify("ירדו קבצים חדשים", f"ועוד {len(new) - 5} קבצים")
         elif mode == "batch":
             self._batch += len(new)
             busy = any(j.get("status") in ("queued", "taken") for j in jobs)
             if self._batch and not busy:
-                self.notify("ההורדות הסתיימו", f"ירדו {self._batch} קבצים לתיקייה")
+                self.notify("ההורדות הסתיימו" + (f" · {who}" if who else ""),
+                            f"ירדו {self._batch} קבצים" + (" לכספת" if self.cfg.get("vault_dir") else " לתיקייה"))
                 self._batch = 0
         else:
             self._batch = 0
+
+    def netfree_checks(self) -> None:
+        """Admin's copy only: videos waiting for "is it open on NetFree?"
+        (profiles the admin restricted). This computer is behind NetFree,
+        so what gets through here is what NetFree allows."""
+        r = self.s.get(self.base + "/nf/pending", timeout=30)
+        if r.status_code != 200 or not r.headers.get("content-type", "").startswith("application/json"):
+            return
+        from netfree import probe
+        for it in r.json().get("items", [])[:10]:
+            vid = it["videoId"]
+            if time.time() - self.nf_seen.get(vid, 0) < 600:
+                continue                              # undecided a moment ago — later
+            verdict, detail = probe(vid)
+            if verdict == "unknown":
+                self.nf_seen[vid] = time.time()
+                self.log(f"נטפרי: לא הצלחתי להכריע על {it.get('title') or vid} — אנסה שוב ({detail})")
+                continue
+            self.s.post(self.base + "/nf/result", timeout=30,
+                        json={"pid": it["pid"], "videoId": vid, "ok": verdict == "open", "detail": "חסום בנטפרי"})
+            self.log(f"נטפרי: {'פתוח' if verdict == 'open' else 'חסום'} — {it.get('title') or vid} ({detail})", remote=False)
 
     def check_for_update(self) -> None:
         """While running, just announce a new version; it installs itself
@@ -864,43 +961,87 @@ class DownloadLock:
 
 class Api:
     """Functions the site can call when it runs inside the app
-    (window.pywebview.api.…)."""
-    def __init__(self, cfg: dict, dl: "Downloader"):
-        self.cfg, self.dl = cfg, dl
+    (window.pywebview.api.…). They act only for the profile that signed in
+    through this window (its code was checked by remember()), so one person
+    can't reach another's files from the page."""
+    def __init__(self, accounts: Accounts):
+        self._accounts = accounts
+        self._active: str | None = None
 
-    def download_now(self, vid: str) -> str:
-        return self.dl.download_now(vid)
+    def _dl(self) -> "Downloader":
+        dl = self._accounts.dls.get(self._active or "")
+        if dl is None:
+            raise PermissionError("לא מחובר בתוכנה")
+        return dl
 
-    def open_folder(self) -> None:
-        if self.cfg.get("vault_dir"):
-            open_vault_window(self.cfg)
-        else:
-            os.startfile(self.cfg["folder"])
+    def _sign_out(self) -> None:
+        self._active = None
 
-    def open_vault(self) -> bool:
-        open_vault_window(self.cfg)
+    def sign_out(self) -> bool:
+        """The site's sign-out button: lock this profile's vault too."""
+        self._active = None
+        lock_all_vaults()
         return True
 
-    def has_vault(self) -> bool:
-        return bool(self.cfg.get("vault_dir"))
+    # -- sign in (the site's sign-in page calls this before submitting)
+    def remember(self, pid: str, password: str) -> bool:
+        try:
+            r = self._accounts.remember(str(pid), str(password))
+        except Exception as e:
+            traceback.print_exc()
+            return False
+        if r.get("ok"):
+            self._active = r["pid"]
+            return True
+        return False
+
+    def download_now(self, vid: str) -> str:
+        return self._dl().download_now(vid)
+
+    def open_folder(self) -> None:
+        dl = self._dl()
+        if dl.cfg.get("vault_dir"):
+            open_vault_window(dl.cfg)
+        else:
+            dl.folder().mkdir(parents=True, exist_ok=True)
+            os.startfile(str(dl.folder()))
+
+    def open_vault(self) -> bool:
+        open_vault_window(self._dl().cfg)
+        return True
+
+    def pick_folder(self) -> str:
+        """The user chooses where their own files go (not for a vault profile)."""
+        dl = self._dl()
+        if dl.cfg.get("vault_dir"):
+            return ""
+        import webview
+        r = webview.windows[0].create_file_dialog(webview.FOLDER_DIALOG, directory=str(dl.folder()))
+        if r:
+            dl.cfg["folder"] = r[0] if isinstance(r, (list, tuple)) else str(r)
+            dl.save_cfg()
+            dl.log(f"תיקיית ההורדות שונתה: {dl.cfg['folder']}", remote=False)
+        return str(dl.folder())
 
     def show_file(self, vid: str) -> bool:
         """Open the downloads folder with this video's file selected (or the
         vault, for files kept there)."""
-        path = self.dl.state.get("files", {}).get(vid)
+        dl = self._dl()
+        path = dl.state.get("files", {}).get(vid)
         if path and path.endswith(".ytv"):
-            open_vault_window(self.cfg)
+            open_vault_window(dl.cfg)
             return True
         if path and Path(path).exists():
             subprocess.Popen(["explorer", "/select,", path])
             return True
-        os.startfile(self.cfg["folder"])
+        self.open_folder()
         return False
 
     def forget(self, vids: list, delete_files: bool = False) -> int:
         """Deleted from the site's history: forget them here too, and
         optionally delete the files from the computer."""
-        st, n = self.dl.state, 0
+        dl = self._dl()
+        st, n = dl.state, 0
         for vid in vids or []:
             path = st.get("files", {}).pop(vid, None)
             st["requeued"].pop(vid, None)
@@ -912,39 +1053,79 @@ class Api:
                     n += 1
                 except OSError:
                     pass
-        self.dl.save_state()
+        dl.save_state()
         return n
 
     def downloaded(self) -> list:
         """Which videos this computer already has (the site shows a folder button)."""
-        return [v for v, p in self.dl.state.get("files", {}).items() if Path(p).exists()]
+        try:
+            dl = self._dl()
+        except PermissionError:
+            return []
+        return [v for v, p in dl.state.get("files", {}).items() if Path(p).exists()]
 
-    def app_info(self) -> dict:
-        return {"folder": "כספת מוצפנת" if self.cfg.get("vault_dir") else self.cfg["folder"],
-                "vault": bool(self.cfg.get("vault_dir")), "version": bundled_version()[:7], "autostart": get_autostart(),
-                "notify": get_pref("notify", "each")}
+    def app_info(self, pid: str = "") -> dict:
+        dl = self._dl()
+        if pid and pid != self._active:
+            raise PermissionError("פרופיל אחר")
+        return {"folder": "כספת מוצפנת" if dl.cfg.get("vault_dir") else str(dl.folder()),
+                "vault": bool(dl.cfg.get("vault_dir")), "version": bundled_version()[:7], "autostart": get_autostart(),
+                "notify": dl.cfg.get("notify") or "each", "admin": dl.pid == "main"}
 
     def get_notify(self) -> str:
-        return get_pref("notify", "each")
+        return self._dl().cfg.get("notify") or "each"
 
     def set_notify(self, mode: str) -> str:
+        dl = self._dl()
         if mode in NOTIFY_MODES:
-            set_pref("notify", mode)
-        return get_pref("notify", "each")
+            dl.cfg["notify"] = mode
+            dl.save_cfg()
+        return dl.cfg.get("notify") or "each"
 
     def set_autostart(self, on: bool) -> bool:
         set_autostart(bool(on))
         return get_autostart()
 
+    def nf_test(self, link: str) -> str:
+        """Admin: check one video against NetFree right now (to calibrate)."""
+        dl = self._dl()
+        if dl.pid != "main":
+            raise PermissionError("רק למנהל")
+        import re
+        m = re.search(r"(?:v=|youtu\.be/|shorts/|live/)([\w-]{11})", link or "") or re.fullmatch(r"([\w-]{11})", (link or "").strip())
+        if not m:
+            return "לא זיהיתי קישור לסרטון"
+        from netfree import probe
+        verdict, detail = probe(m.group(1))
+        res = {"open": "פתוח בנטפרי", "blocked": "חסום בנטפרי", "unknown": "לא ברור"}[verdict]
+        dl.log(f"בדיקת נטפרי ידנית: {m.group(1)} → {res} ({detail})")
+        dl.flush_logs()
+        return f"{res}\n{detail}"
 
-_VAULT = {}
+
+_VAULT: dict = {}          # pid -> {"win", "api"}
+
+
+def lock_all_vaults() -> None:
+    for v in list(_VAULT.values()):
+        try:
+            v["api"].lock()
+            if v.get("win"):
+                v["win"].destroy()
+        except Exception:
+            pass
+    _VAULT.clear()
 
 
 def open_vault_window(cfg: dict) -> None:
-    """One vault window per app; showing it again just brings it forward."""
+    """One vault window per profile; showing it again brings it forward.
+    A vault locked with the profile's code opens straight away (the code was
+    just entered to sign in)."""
     import webview
     from vault_ui import VAULT_HTML, VaultApi
-    w = _VAULT.get("win")
+    pid = cfg.get("pid") or "?"
+    ent = _VAULT.get(pid) or {}
+    w = ent.get("win")
     if w is not None:
         try:
             w.show()
@@ -952,37 +1133,32 @@ def open_vault_window(cfg: dict) -> None:
             return
         except Exception:
             pass
-    api = _VAULT.get("api") or VaultApi(cfg, TMP)
-    _VAULT["api"] = api
-    w = webview.create_window("הכספת — מעקב ערוצים", html=VAULT_HTML, js_api=api, width=900, height=640,
-                              min_size=(420, 420), background_color="#0e1015")
+    api = ent.get("api") or VaultApi(cfg, TMP / pid)
+    if cfg.get("vault_auto") and cfg.get("password") and api._v and not api._v.unlocked:
+        try:
+            api.unlock(cfg["password"])
+        except Exception:
+            pass
+    w = webview.create_window("הכספת — " + (cfg.get("name") or "מעקב ערוצים"), html=VAULT_HTML, js_api=api,
+                              width=900, height=640, min_size=(420, 420), background_color="#0e1015")
     api._window = w
+    _VAULT[pid] = {"win": w, "api": api}
 
     def closed():
         api.lock()                       # closing the vault window locks it
-        _VAULT.pop("win", None)
+        _VAULT.get(pid, {}).pop("win", None)
     w.events.closed += closed
-    _VAULT["win"] = w
 
 
-def make_tray(on_open, on_quit, cfg: dict):
-    """Icon next to the clock: keeps the app running with the window closed."""
+def make_tray(on_open, on_quit):
+    """Icon next to the clock: keeps the app running with the window closed.
+    Nothing personal in its menu — anyone at the computer can click it."""
     try:
         import pystray
         from PIL import Image
         img = Image.open(icon_path())
-        def pick(mode):
-            return lambda icon, item: set_pref("notify", mode)
-
-        def is_on(mode):
-            return lambda item: get_pref("notify", "each") == mode
-        notify_menu = pystray.Menu(*[pystray.MenuItem(label, pick(m), checked=is_on(m), radio=True)
-                                     for m, label in NOTIFY_MODES.items()])
         menu = pystray.Menu(
             pystray.MenuItem("פתח", lambda: on_open(), default=True),
-            pystray.MenuItem("התראות", notify_menu),
-            pystray.MenuItem("פתח כספת" if cfg.get("vault_dir") else "פתח את תיקיית ההורדות",
-                             lambda: open_vault_window(cfg) if cfg.get("vault_dir") else os.startfile(cfg["folder"])),
             pystray.MenuItem("יציאה", lambda: on_quit()))
         return pystray.Icon(APP, img, "מעקב ערוצים — מוריד ברקע", menu)
     except Exception:
@@ -990,8 +1166,8 @@ def make_tray(on_open, on_quit, cfg: dict):
         return None
 
 
-def open_window(cfg: dict, dl: "Downloader", background: bool) -> None:
-    url = cfg["site"].rstrip("/") + "/yt/"
+def open_window(accounts: Accounts, background: bool) -> None:
+    url = accounts.site + "/yt/"
     state = {"quit": False}
     try:
         import webview  # pywebview — uses Edge WebView2, built into Windows 10/11
@@ -1000,19 +1176,20 @@ def open_window(cfg: dict, dl: "Downloader", background: bool) -> None:
 
     if webview is None:
         # No WebView2: tray only; "open" uses the normal browser.
-        tray = make_tray(lambda: webbrowser.open(url), lambda: tray.stop(), cfg)
+        tray = make_tray(lambda: webbrowser.open(url), lambda: tray.stop())
         if not background:
             webbrowser.open(url)
         if tray:
-            dl.notify = lambda t, m: tray.notify(m, t)
+            accounts.notify = lambda t, m: tray.notify(m, t)
             tray.run()
         else:
             while True:
                 time.sleep(3600)
         return
 
+    api = Api(accounts)
     win = webview.create_window("מעקב ערוצים", url, width=1200, height=820, min_size=(420, 520),
-                                hidden=background, js_api=Api(cfg, dl), background_color="#0e1015")
+                                hidden=background, js_api=api, background_color="#0e1015")
 
     def show():
         win.show()
@@ -1020,31 +1197,37 @@ def open_window(cfg: dict, dl: "Downloader", background: bool) -> None:
 
     def quit_app():
         state["quit"] = True
-        if _VAULT.get("api"):
-            _VAULT["api"].lock()
+        lock_all_vaults()
         if tray:
             tray.stop()
         win.destroy()
 
-    tray = make_tray(show, quit_app, cfg)
+    tray = make_tray(show, quit_app)
 
     def on_closing():
-        # Closing the window hides it — downloads keep running in the tray.
+        # Closing the window signs out (next time: "who's signing in?") and
+        # locks the vaults; every profile keeps downloading in the tray.
         if state["quit"] or tray is None:
             return True
         win.hide()
+        api._sign_out()
+        lock_all_vaults()
+        try:
+            win.load_url(url + "logout")
+        except Exception:
+            pass
         if not state.get("told"):
             state["told"] = True
-            tray.notify("התוכנה ממשיכה להוריד ברקע. ליציאה: לחיצה ימנית על האייקון ליד השעון ← יציאה.", APP)
+            tray.notify("התנתקת. התוכנה ממשיכה להוריד ברקע לכל הפרופילים. ליציאה: לחיצה ימנית על האייקון ליד השעון ← יציאה.", APP)
         return False
 
     win.events.closing += on_closing
     if tray:
-        dl.notify = lambda t, m: tray.notify(m, t)
+        accounts.notify = lambda t, m: tray.notify(m, t)
         tray.run_detached()
     listen_for_show(show)
-    # private_mode=False + storage_path: the site's login is remembered.
-    webview.start(private_mode=False, storage_path=str(USERDATA / "web"))
+    # private_mode: nothing of the sign-in is kept between openings.
+    webview.start(private_mode=True)
     if tray:
         tray.stop()
 
@@ -1136,8 +1319,6 @@ def main() -> None:
         sys.exit(0)
     if "--uninstall" in sys.argv:
         return uninstall()
-    if "--setup-ui" in sys.argv:                  # first-run settings window (own process)
-        sys.exit(setup_ui())
     if getattr(sys, "frozen", False) and not is_installed_copy():
         close_other_copies()             # old versions would block installing
     if already_running():
@@ -1157,13 +1338,11 @@ def main() -> None:
     if not STATE.exists() and (DATA / "state.json").exists():
         shutil.copy2(DATA / "state.json", STATE)
     shutil.rmtree(TMP, ignore_errors=True)      # decrypted leftovers from last time
-    cfg = load_cfg()
-    if "--setup" in sys.argv or not cfg.get("password") or not (cfg.get("folder") or cfg.get("vault_dir")):
-        cfg = first_run_setup(cfg)
-    dl = Downloader(cfg)
-    dl.start()
-    open_window(cfg, dl, background="--background" in sys.argv)
-
+    accounts = Accounts(load_json(CONFIG, {}).get("site") or DEFAULT_SITE)
+    if not accounts.data and USERCFG.exists():
+        accounts.add_legacy(load_cfg())          # the profile set up before accounts
+    accounts.start_all()
+    open_window(accounts, background="--background" in sys.argv)
 
 if __name__ == "__main__":
     main()

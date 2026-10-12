@@ -58,6 +58,11 @@ const getJobIds = (env) => getJSON(env, "jobs", []);
 
 async function addJobs(env, jobs) {
   if (!jobs.length) return;
+  // A NetFree-only profile: videos wait until the desktop app (behind
+  // NetFree) confirms they're open. Lists/searches expand first.
+  if ((await profileInfo(env, env.PROFILE)).netfree) {
+    for (const j of jobs) if (!j.kind && j.status === "queued" && j.nf !== "ok") j.status = "nfcheck";
+  }
   const ids = await getJobIds(env);
   for (const j of [...jobs].reverse()) {   // keep the newest on top
     await putJSON(env, "job:" + j.videoId, j);
@@ -202,7 +207,7 @@ async function wakeAgent(env) {
 // keys. Every other profile has its own copy of everything under
 // "p:<id>:" — channels, queue, history, log, settings. "agent" and the
 // profile list itself stay global.
-const GLOBAL_KEYS = new Set(["agent", "profiles"]);
+const GLOBAL_KEYS = new Set(["agent", "profiles", "mainprof"]);
 
 function profileEnv(env, pid) {
   if (!pid || pid === "main") return { ...env, PROFILE: "main" };
@@ -213,6 +218,17 @@ function profileEnv(env, pid) {
     put: (key, v) => env.DB.put(k(key), v),
     delete: (key) => env.DB.delete(k(key)),
   } };
+}
+
+// What the admin set for a profile: shown name, "only what NetFree allows",
+// and whether the desktop app keeps its files in an encrypted vault.
+async function profileInfo(env, pid) {
+  if (!pid || pid === "main") {
+    const m = await getJSON(env, "mainprof", {});
+    return { id: "main", name: m.name || "מנהל", netfree: false, vault: !!m.vault, admin: true };
+  }
+  const pr = (await getJSON(env, "profiles", {}))[pid] || {};
+  return { id: pid, name: pr.name || pid, netfree: !!pr.netfree, vault: !!pr.vault, admin: false, created: pr.created };
 }
 
 async function profileIds(env) {
@@ -241,6 +257,12 @@ async function whoIs(req, env) {
   const legacy = c.match(/(?:^|;\s*)auth=([a-f0-9]{64})(?:;|$)/);   // cookie from before profiles
   if (legacy && legacy[1] === await sha256("yt-tracker:" + env.ADMIN_PASSWORD)) return "main";
   return null;
+}
+
+async function checkCode(env, pid, password) {
+  if (pid === "main") return !!env.ADMIN_PASSWORD && password === env.ADMIN_PASSWORD;
+  const pr = (await getJSON(env, "profiles", {}))[pid];
+  return !!pr && pr.hash === await sha256("pw:" + password);
 }
 
 async function loginProfile(env, password) {
@@ -323,17 +345,25 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const all = [];
       for (const pid of await profileIds(env)) {
         const penv = profileEnv(env, pid);
-        const settings = await getJSON(penv, "settings", {});
-        for (const j of (await listJobs(penv)).reverse()) all.push({ j, pid, penv, settings });
+        const nf = (await profileInfo(env, pid)).netfree;
+        for (const j of (await listJobs(penv)).reverse()) all.push({ j, pid, penv, nf });
       }
       all.sort((a, b) => (b.j.priority || 0) - (a.j.priority || 0));
-      for (const { j, pid, penv, settings } of all) {
+      for (const { j, pid, penv, nf } of all) {
+        if (j.status === "nfcheck" && !(nf && !j.kind)) j.status = "queued";     // restriction lifted
+        if (nf && !j.kind && j.status === "queued" && j.nf !== "ok") {
+          // Never download for a NetFree-only profile before the check.
+          j.status = "nfcheck"; j.updated = new Date().toISOString();
+          await putJSON(penv, "job:" + j.videoId, j);
+          continue;
+        }
         const stale = j.status === "taken" && now - Date.parse(j.updated) > CLAIM_TIMEOUT_MS;
         if (j.status !== "queued" && !stale) continue;
         j.status = "taken"; j.updated = new Date().toISOString(); j.profile = pid;
         // "Convert on the PC": the server skips the slow MP3 encode and the
         // desktop app converts after downloading.
         j.pcConvert = j.mode === "audio";   // the server never encodes MP3 — the app does
+        if (nf && j.kind === "search") j.candidates = 5;   // the app keeps the first one NetFree allows
         await putJSON(penv, "job:" + j.videoId, j);
         out.push(j);
         if (out.length >= limit) break;
@@ -349,7 +379,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const fresh = (b.items || []).filter((it) => it.videoId && !known.has(it.videoId)).map((it) => ({
         videoId: it.videoId, channelId: b.channelId || "", channelName: b.channelName || "",
         title: it.title || it.videoId, published: "", url: "https://www.youtube.com/watch?v=" + it.videoId,
-        mode: modeOf(b.mode), minMinutes: b.minMinutes || 0, status: "queued", updated: new Date().toISOString() }));
+        mode: modeOf(b.mode), minMinutes: b.minMinutes || 0, status: "queued", updated: new Date().toISOString(),
+        ...(it.group ? { group: String(it.group), rank: +it.rank || 0 } : {}) }));
       if (b.priority) fresh.forEach((j) => { j.priority = b.priority; });
       await addJobs(env, fresh);
       // A search job is replaced by the video it found (keeps the list tidy).
@@ -384,12 +415,13 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   // --- login ---
   if (p === "/login" && req.method === "POST") {
     const f = await req.formData();
-    const pid = await loginProfile(env, String(f.get("password") || ""));
+    const want = String(f.get("pid") || ""), pw = String(f.get("password") || "");
+    const pid = want ? ((await checkCode(env, want, pw)) ? want : null) : await loginProfile(env, pw);
     if (pid) {
       const tok = await profileToken(env, pid);
       return redirect(BASE + "/", { "Set-Cookie": `auth=${pid}.${tok}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000` });
     }
-    return page("כניסה", loginForm("סיסמה שגויה"));
+    return page("כניסה", await loginForm(env, "קוד שגוי", want));
   }
   if (p === "/logout") {
     return redirect(BASE + "/", { "Set-Cookie": "auth=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0" });
@@ -397,7 +429,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   const pid = await whoIs(req, env);
   if (!pid) {
     if (!env.ADMIN_PASSWORD) return page("הגדרה חסרה", "<p>חסר Secret בשם <b>ADMIN_PASSWORD</b> ב-Worker. ראה README.</p>");
-    return page("כניסה", loginForm(""));
+    return page("כניסה", await loginForm(env, ""));
   }
   const rootEnv = env;
   env = profileEnv(env, pid);   // from here on everything is this profile's own data
@@ -408,10 +440,80 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (pw === env.ADMIN_PASSWORD || await loginProfile(rootEnv, pw)) return new Response("הסיסמה כבר בשימוש", { status: 400 });
     const profs = await getJSON(rootEnv, "profiles", {});
     const id = "u" + Date.now().toString(36);
-    profs[id] = { name, hash: await sha256("pw:" + pw), created: new Date().toISOString() };
+    profs[id] = { name, hash: await sha256("pw:" + pw), created: new Date().toISOString(),
+                  netfree: f.get("netfree") === "on", vault: f.get("vault") === "on" };
     await putJSON(rootEnv, "profiles", profs);
     await addLog(env, "worker", `נוצר פרופיל: ${name}`);
     return json({ ok: true, id });
+  }
+  if (p === "/profiles/update" && req.method === "POST" && pid === "main") {
+    // Admin only: rename, new code, "only NetFree", vault. Users can't
+    // change these themselves.
+    const f = await req.formData(), id = String(f.get("id") || "");
+    const name = String(f.get("name") || "").trim().slice(0, 40), on = (k) => f.get(k) === "1";
+    if (id === "main") {
+      const m = await getJSON(rootEnv, "mainprof", {});
+      if (f.has("vault")) m.vault = on("vault");
+      if (name) m.name = name;
+      await putJSON(rootEnv, "mainprof", m);
+      return json({ ok: true });
+    }
+    const profs = await getJSON(rootEnv, "profiles", {}), pr = profs[id];
+    if (!pr) return new Response("אין פרופיל כזה", { status: 404 });
+    if (f.has("netfree")) pr.netfree = on("netfree");
+    if (f.has("vault")) pr.vault = on("vault");
+    if (name) pr.name = name;
+    const pw = String(f.get("password") || "");
+    if (pw) {
+      if (pw.length < 4) return new Response("קוד של 4 תווים לפחות", { status: 400 });
+      if (pw === env.ADMIN_PASSWORD || await loginProfile(rootEnv, pw)) return new Response("הקוד כבר בשימוש", { status: 400 });
+      pr.hash = await sha256("pw:" + pw);            // also signs that profile out everywhere
+    }
+    await putJSON(rootEnv, "profiles", profs);
+    await addLog(env, "worker", `עודכן פרופיל: ${pr.name}` + (f.has("netfree") ? (pr.netfree ? " · רק פתוח בנטפרי" : " · בלי הגבלת נטפרי") : "") +
+      (f.has("vault") ? (pr.vault ? " · כספת" : " · בלי כספת") : "") + (pw ? " · קוד חדש" : ""));
+    return json({ ok: true });
+  }
+  // --- NetFree check, done by the desktop app (it sits behind NetFree; the
+  // download server doesn't). Only the admin's app session reports results.
+  if (p === "/nf/pending" && pid === "main") {
+    const items = [];
+    for (const q of await profileIds(rootEnv)) {
+      if (!(await profileInfo(rootEnv, q)).netfree) continue;
+      const groups = new Set();
+      const jobs = (await listJobs(profileEnv(rootEnv, q))).filter((j) => j.status === "nfcheck")
+        .sort((a, b) => (a.rank || 0) - (b.rank || 0));
+      for (const j of jobs) {
+        if (j.group) { if (groups.has(j.group)) continue; groups.add(j.group); }   // best search result first
+        items.push({ pid: q, videoId: j.videoId, title: j.title });
+        if (items.length >= 20) break;
+      }
+    }
+    return json({ items });
+  }
+  if (p === "/nf/result" && req.method === "POST" && pid === "main") {
+    const b = await req.json();
+    const penv = profileEnv(rootEnv, String(b.pid || ""));
+    const j = await getJSON(penv, "job:" + b.videoId, null);
+    if (!j || j.status !== "nfcheck") return json({ ok: true, ignored: true });
+    const now = new Date().toISOString();
+    const mates = j.group ? (await listJobs(penv)).filter((x) => x.group === j.group && x.videoId !== j.videoId) : [];
+    if (b.ok) {
+      Object.assign(j, { status: "queued", nf: "ok", error: "", updated: now });
+      await putJSON(penv, "job:" + j.videoId, j);
+      const drop = mates.filter((x) => ["nfcheck", "blocked"].includes(x.status)).map((x) => x.videoId);
+      if (drop.length) await deleteJobs(penv, drop);
+      await addLog(penv, "worker", `✓ פתוח בנטפרי: ${j.title}`);
+      wake();
+    } else if (mates.some((x) => x.status === "nfcheck")) {
+      await deleteJobs(penv, [j.videoId]);              // try the next search result
+      await addLog(penv, "worker", `חסום בנטפרי, בודק תוצאה אחרת: ${j.title}`);
+    } else {
+      Object.assign(j, { status: "blocked", error: String(b.detail || "הסרטון לא פתוח בנטפרי").slice(0, 200), updated: now });
+      await putJSON(penv, "job:" + j.videoId, j);
+      await addLog(penv, "worker", `⛔ חסום בנטפרי: ${j.title}`);
+    }
+    return json({ ok: true });
   }
   if (p === "/profiles/remove" && req.method === "POST" && pid === "main") {
     // Removes the profile and all of its data.
@@ -472,7 +574,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   }
   if (p === "/jobs/clear" && req.method === "POST") {
     // "Clear history": everything finished (done / failed / skipped / cancelled).
-    const done = (await listJobs(env)).filter((j) => ["done", "failed", "skipped", "cancelled"].includes(j.status));
+    const done = (await listJobs(env)).filter((j) => ["done", "failed", "skipped", "cancelled", "blocked"].includes(j.status));
     await deleteJobs(env, done.map((j) => j.videoId));
     await addLog(env, "worker", `ההיסטוריה נוקתה: ${done.length} פריטים`);
     return json({ deleted: done.map((j) => j.videoId) });
@@ -614,7 +716,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     }
     if (p === "/jobs/cancel") {
       const j = await getJSON(env, "job:" + f.get("id"), null);
-      if (j && ["queued", "taken", "paused"].includes(j.status)) {
+      if (j && ["queued", "taken", "paused", "nfcheck"].includes(j.status)) {
         const was = j.status;
         j.status = "cancelled"; j.error = ""; j.updated = new Date().toISOString();
         await putJSON(env, "job:" + j.videoId, j);
@@ -657,7 +759,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
 const MODES = { video: "סרטון · MP4", m4a: "שיר מהיר · M4A", audio: "שיר · MP3 (המרה בתוכנה)" };
 const modeOf = (v) => (v in MODES ? v : "video");
 
-const STATUS = { queued: "ממתין", taken: "בהורדה", done: "הושלם", failed: "נכשל", skipped: "דולג", cancelled: "בוטל", paused: "מושהה" };
+const STATUS = { queued: "ממתין", taken: "בהורדה", done: "הושלם", failed: "נכשל", skipped: "דולג", cancelled: "בוטל", paused: "מושהה",
+                 nfcheck: "ממתין לבדיקת נטפרי", blocked: "חסום בנטפרי" };
 
 // Everything the page shows — also polled by the page every few seconds.
 async function state(env) {
@@ -666,8 +769,9 @@ async function state(env) {
     getJSON(env, "agent", {}), getJSON(env, "lastCheck", null), getJSON(env, "settings", {}), getJSON(env, "pc", {})]);
   const profs = await getJSON(env, "profiles", {});
   const pid = env.PROFILE || "main";
-  const profile = { id: pid, name: pid === "main" ? "מנהל" : (profs[pid] || {}).name || pid, admin: pid === "main" };
-  const profiles = profile.admin ? Object.entries(profs).map(([id, v]) => ({ id, name: v.name, created: v.created })) : [];
+  const profile = await profileInfo(env, pid);
+  const profiles = profile.admin ? [profile, ...Object.entries(profs).map(([id, v]) => ({ id, name: v.name, created: v.created,
+    netfree: !!v.netfree, vault: !!v.vault }))] : [];
   return { channels, jobs: jobs.slice(0, 200), logs: logs.slice(-LOG_CAP), agent, lastCheck, settings, pc, profile, profiles,
            renderUrl: env.RENDER_URL || "", now: new Date().toISOString() };
 }
@@ -706,6 +810,8 @@ const IC = {
   monitor: '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>',
   user: '<circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/>',
   users: '<circle cx="9" cy="8" r="4"/><path d="M1 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1M16 4a4 4 0 0 1 0 8M23 21v-1a6 6 0 0 0-4-5.6"/>',
+  key: '<circle cx="7.5" cy="15.5" r="5.5"/><path d="M21 2l-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/>',
+  edit: '<path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
   logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
   lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
 };
@@ -780,6 +886,8 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
 .b-done{color:var(--ok);background:#2fbf871a}.b-failed{color:var(--bad);background:#f064641a}.b-taken{color:var(--primary);background:#4f8cff1f}
 .b-queued{color:var(--warn);background:#f0b43c1a}.b-paused{color:#a78bfa;background:#a78bfa1f}
+.b-nfcheck{color:#38bdf8;background:#38bdf81a}.b-blocked{color:var(--bad);background:#f064641a}
+.pflags{display:flex;gap:14px;align-items:center;flex-wrap:wrap;font-size:.8rem;color:var(--muted)}.pflags label{display:flex;align-items:center;gap:6px}
 .side-col{display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex:none}
 .acts{display:flex;gap:6px}
 .empty{padding:48px 16px;text-align:center;color:var(--muted)}
@@ -842,14 +950,44 @@ function page(title, body) {
     { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
-function loginForm(msg) {
-  return `<form class="card login" method="post" action="${BASE}/login">
+// "Who's signing in?" — a tile per profile, then that profile's code.
+async function loginForm(env, msg, pick) {
+  const tiles = [];
+  for (const id of await profileIds(env)) tiles.push(await profileInfo(env, id));
+  const tile = (t) => `<button type="button" class="tile" data-pid="${esc(t.id)}" data-name="${esc(t.name)}">
+<span class="avatar">${esc(t.name.charAt(0))}</span><span>${esc(t.name)}</span></button>`;
+  return `<style>.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px;margin:14px 0}
+.tile{display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px 8px;border-radius:12px;border:1px solid var(--line);background:var(--panel2);color:var(--text);font:inherit;cursor:pointer}
+.tile:hover{border-color:var(--primary)}.tile .avatar{width:44px;height:44px;font-size:1.2rem}</style>
+<div class="card login">
 <img src="${ICON}" alt=""><h2 style="justify-content:center">מעקב ערוצים</h2>
-<p class="sub">הכנס סיסמה כדי להמשיך</p>
-${msg ? `<p style="color:var(--bad);margin:0">${esc(msg)}</p>` : ""}
-<input type="password" name="password" placeholder="סיסמה" autofocus>
-<button class="btn">כניסה</button>
-<p style="margin:16px 0 0"><a href="/">${icon("chat")} מעבר ל-Gemini</a></p></form>`;
+<div id="pickBox"${pick ? ' class="hidden"' : ""}><p class="sub">מי נכנס?</p><div class="tiles">${tiles.map(tile).join("")}</div></div>
+<form method="post" action="${BASE}/login" id="lf"${pick ? "" : ' class="hidden"'}>
+<input type="hidden" name="pid" value="${esc(pick || "")}">
+<p class="sub" id="who">${pick ? esc((tiles.find((t) => t.id === pick) || {}).name || "") : ""}</p>
+${msg ? `<p style="color:var(--bad);margin:0 0 8px">${esc(msg)}</p>` : ""}
+<input type="password" name="password" placeholder="קוד" autocomplete="off">
+<button class="btn" style="margin-top:10px">כניסה</button>
+<p style="margin:12px 0 0"><a href="#" id="back">החלף פרופיל</a></p></form>
+<p style="margin:16px 0 0"><a href="/">${icon("chat")} מעבר ל-Gemini</a></p></div>
+<script>
+const lf = document.getElementById("lf");
+document.querySelectorAll(".tile").forEach((t) => t.onclick = () => {
+  lf.pid.value = t.dataset.pid; document.getElementById("who").textContent = t.dataset.name;
+  document.getElementById("pickBox").classList.add("hidden"); lf.classList.remove("hidden"); lf.password.value = ""; lf.password.focus();
+});
+document.getElementById("back").onclick = (e) => { e.preventDefault(); lf.classList.add("hidden"); document.getElementById("pickBox").classList.remove("hidden"); };
+if (lf.pid.value) lf.password.focus();
+lf.onsubmit = async (e) => {
+  // Inside the desktop app: it remembers this profile (encrypted, for this
+  // Windows user) so its downloads keep running after the window closes.
+  const api = window.pywebview && window.pywebview.api;
+  if (!api || !api.remember || lf.dataset.ok) return;
+  e.preventDefault();
+  try { await api.remember(lf.pid.value, lf.password.value); } catch (x) {}
+  lf.dataset.ok = "1"; lf.submit();
+};
+</script>`;
 }
 
 async function dashboard(env) {
@@ -957,11 +1095,13 @@ async function dashboard(env) {
     </div>
     <div class="card hidden" id="profilesCard">
       <h2>${icon("users")}פרופילים</h2>
-      <p class="sub">לכל פרופיל סיסמה משלו, ותור, ערוצים והיסטוריה נפרדים לגמרי. מי שנכנס עם סיסמת פרופיל רואה רק את שלו.</p>
+      <p class="sub">לכל פרופיל קוד משלו (רק המנהל קובע ומשנה אותו), ותור, ערוצים והיסטוריה נפרדים לגמרי. <b>רק פתוח בנטפרי</b> — יורד רק מה שהתוכנה במחשב בדקה שנטפרי מאשר. <b>כספת</b> — בתוכנה למחשב הקבצים נשמרים מוצפנים.</p>
       <div id="profilesList"></div>
       <form class="grid" data-action="/profiles/add" style="margin-top:12px">
         <label class="field">שם<input name="name" placeholder="למשל: אחי" required></label>
-        <label class="field">סיסמה לפרופיל<input name="password" type="password" minlength="4" required></label>
+        <label class="field">קוד לפרופיל<input name="password" type="password" minlength="4" required></label>
+        <label class="field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" name="netfree" style="width:auto" checked>רק פתוח בנטפרי</label>
+        <label class="field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" name="vault" style="width:auto">כספת מוצפנת</label>
         <div class="actions-row" style="align-self:end;margin:0"><button class="btn">${icon("add")}<span>צור פרופיל</span></button></div>
       </form>
     </div>
@@ -972,7 +1112,10 @@ async function dashboard(env) {
       <div class="setting"><div class="txt"><b>התראות</b><span>לכל משתמש במחשב הבחירה שלו.</span></div>
         <select id="notifyMode" style="width:auto"><option value="each">על כל קובץ</option><option value="batch">רק בסיום משימת הורדה</option><option value="off">ללא התראות</option></select></div>
       <div class="setting"><div class="txt"><b>תיקיית הורדות</b><span id="folderPath"></span></div>
-        <button class="btn ghost" id="openFolder" type="button">${icon("folder")}<span>פתח</span></button></div>
+        <span style="display:flex;gap:8px"><button class="btn ghost hidden" id="pickFolder" type="button">${icon("edit")}<span>שנה</span></button>
+        <button class="btn ghost" id="openFolder" type="button">${icon("folder")}<span>פתח</span></button></span></div>
+      <div class="setting hidden" id="nfTestRow"><div class="txt"><b>בדיקת נטפרי</b><span>הדבק קישור לסרטון — התוכנה בודקת דרך החיבור בבית אם הוא פתוח בנטפרי. <span id="nfTestOut" style="white-space:pre-wrap"></span></span></div>
+        <span style="display:flex;gap:8px"><input id="nfTestUrl" placeholder="https://youtu.be/…" style="width:200px"><button class="btn ghost" id="nfTestBtn" type="button">בדוק</button></span></div>
       <div class="setting"><div class="txt"><b>גרסה</b><span id="appVersion"></span></div></div>
     </div>
     <div class="card">
@@ -1045,18 +1188,19 @@ function jobRow(j) {
   if (j.status === "queued") a.push(btn("priority", j.videoId, "now", "הורד עכשיו — לפני כל השאר", "primary"));
   if (j.status === "paused") a.push(btn("resume", j.videoId, "play", "המשך", "primary"), btn("priority", j.videoId, "now", "הורד עכשיו"));
   if (j.status === "queued" || j.status === "taken") a.push(btn("pause", j.videoId, "pause", "השהה"));
-  if (["failed", "skipped", "cancelled"].includes(j.status)) a.push(btn("retry", j.videoId, "retry", "נסה שוב"));
-  if (["queued", "taken", "paused"].includes(j.status)) a.push(btn("cancel", j.videoId, "x", "ביטול", "danger"));
+  if (["failed", "skipped", "cancelled", "blocked"].includes(j.status)) a.push(btn("retry", j.videoId, "retry", j.status === "blocked" ? "בדוק שוב בנטפרי" : "נסה שוב"));
+  if (["queued", "taken", "paused", "nfcheck"].includes(j.status)) a.push(btn("cancel", j.videoId, "x", "ביטול", "danger"));
   a.push(btn("delete", j.videoId, "trash", "מחק מההיסטוריה", "danger"));
   return '<div class="row">' + thumb + '<div class="info"><div class="title" title="' + esc(j.title) + '">' + esc(j.title) + '</div>' +
     '<div class="meta">' + meta + '</div>' +
-    (j.error ? '<div class="note' + (j.status === "failed" ? " bad" : "") + '">' + esc(j.error) + '</div>' : '') +
+    (j.error ? '<div class="note' + (["failed", "blocked"].includes(j.status) ? " bad" : "") + '">' + esc(j.error) + '</div>' : '') +
+    (j.status === "nfcheck" ? '<div class="note">התוכנה במחשב בודקת שהסרטון פתוח בנטפרי, ורק אז הוא יורד (אם התוכנה סגורה — ממתין לה).</div>' : '') +
     (j.status === "taken" ? '<div class="prog" data-prog="' + esc(j.videoId) + '">' + progHtml(j.videoId) + '</div>' : '') + '</div>' +
     '<div class="side-col"><span class="badge b-' + esc(j.status) + '">' + (STATUS[j.status] || esc(j.status)) + '</span>' +
     '<div class="acts">' + a.join("") + '</div></div></div>';
 }
-const IN = { all: () => true, active: (j) => ["queued", "taken", "paused"].includes(j.status), done: (j) => j.status === "done",
-             problem: (j) => ["failed", "skipped", "cancelled"].includes(j.status) };
+const IN = { all: () => true, active: (j) => ["queued", "taken", "paused", "nfcheck"].includes(j.status), done: (j) => j.status === "done",
+             problem: (j) => ["failed", "skipped", "cancelled", "blocked"].includes(j.status) };
 function render() {
   const seen = S.agent && S.agent.seen, mins = seen ? (Date.now() - Date.parse(seen)) / 60000 : Infinity;
   const busy = S.jobs.some((j) => j.status === "taken"), info = S.agent && S.agent.info;
@@ -1088,12 +1232,21 @@ function render() {
   });
   $("profileName").textContent = (S.profile && S.profile.name) || "";
   $("profilesCard").classList.toggle("hidden", !(S.profile && S.profile.admin));
-  $("profilesList").innerHTML = (S.profiles || []).length ? S.profiles.map((pr) =>
-    '<div class="setting"><div class="avatar">' + esc(pr.name.charAt(0)) + '</div><div class="txt"><b>' + esc(pr.name) + '</b><span>נוצר ' + ago(pr.created) + '</span></div>' +
-    btn("profdel", pr.id, "trash", "מחק פרופיל וכל הנתונים שלו", "danger") + '</div>').join("")
-    : '<div class="sub" style="margin:0">אין עדיין פרופילים נוספים.</div>';
+  const sw = (pr, flag, label) => '<label>' + label + '<span class="switch"><input type="checkbox" data-prof="' + esc(pr.id) + '" data-flag="' + flag + '"' + (pr[flag] ? " checked" : "") + '><i></i></span></label>';
+  if (!document.activeElement || !document.activeElement.dataset || !document.activeElement.dataset.prof)
+  $("profilesList").innerHTML = (S.profiles || []).map((pr) =>
+    '<div class="setting"><div class="avatar">' + esc(pr.name.charAt(0)) + '</div><div class="txt"><b>' + esc(pr.name) + '</b><span>' +
+    (pr.admin ? "מנהל · הקוד הוא ADMIN_PASSWORD" : "נוצר " + ago(pr.created)) + '</span></div>' +
+    '<div class="pflags">' + (pr.admin ? "" : sw(pr, "netfree", "רק פתוח בנטפרי")) + sw(pr, "vault", "כספת") + '</div>' +
+    btn("profname", pr.id, "edit", "שינוי שם") + (pr.admin ? "" : btn("profcode", pr.id, "key", "קוד חדש") + btn("profdel", pr.id, "trash", "מחק פרופיל וכל הנתונים שלו", "danger")) + '</div>').join("");
   $("pcState").textContent = pcActive() ? "התוכנה פועלת עכשיו — היא מורידה." : "";
 }
+
+document.addEventListener("change", async (e) => {
+  const t = e.target; if (!t.dataset || !t.dataset.prof) return;
+  const d = new FormData(); d.append("id", t.dataset.prof); d.append(t.dataset.flag, t.checked ? "1" : "0");
+  try { await post("/profiles/update", d); toast("נשמר"); t.blur(); refresh(); } catch (x) { toast("שגיאה: " + x.message, 6000); t.checked = !t.checked; }
+});
 
 // ---------- data ----------
 async function refresh() { try { S = await (await fetch(B + "/status")).json(); render(); autoDownload(); } catch (e) {} }
@@ -1124,6 +1277,12 @@ document.addEventListener("click", async (e) => {
   try {
     if (act === "cancel" && !confirm("לבטל את ההורדה?")) return;
     if (act === "remove" && !confirm("להסיר את הערוץ מהמעקב?")) return;
+    if (act === "profcode" || act === "profname") {
+      const v = prompt(act === "profcode" ? "קוד חדש לפרופיל (לפחות 4 תווים). המשתמש לא יוכל לשנות אותו:" : "שם חדש:");
+      if (!v) return;
+      d.append(act === "profcode" ? "password" : "name", v);
+      await post("/profiles/update", d); toast(act === "profcode" ? "הקוד הוחלף" : "השם עודכן"); refresh(); return;
+    }
     if (act === "profdel") {
       if (!confirm("למחוק את הפרופיל וכל התור, הערוצים וההיסטוריה שלו?")) return;
       await post("/profiles/remove", d); toast("הפרופיל נמחק"); refresh(); return;
@@ -1201,13 +1360,18 @@ async function initDesktop() {
   if (!APP()) return;
   await loadHave(); setInterval(async () => { await loadHave(); render(); }, 15000);
   try {
-    const info = await APP().app_info();
+    const info = await APP().app_info((S.profile && S.profile.id) || "");
     $("desktopCard").classList.remove("hidden");
     if (info.vault) { $("vaultNav").classList.remove("hidden"); $("vaultNav").onclick = () => APP().open_vault(); }
     $("folderPath").textContent = info.folder; $("appVersion").textContent = info.version || "פיתוח";
     $("autostart").checked = !!info.autostart;
     $("autostart").onchange = async (e) => { await APP().set_autostart(e.target.checked); toast(e.target.checked ? "תעלה עם Windows" : "לא תעלה עם Windows"); };
     $("openFolder").onclick = () => APP().open_folder();
+    $("pickFolder").classList.toggle("hidden", !!info.vault);
+    $("pickFolder").onclick = async () => { const f = await APP().pick_folder(); if (f) { $("folderPath").textContent = f; toast("התיקייה נשמרה"); } };
+    $("nfTestRow").classList.toggle("hidden", !info.admin);
+    $("nfTestBtn").onclick = async () => { $("nfTestOut").textContent = "בודק…"; try { $("nfTestOut").textContent = await APP().nf_test($("nfTestUrl").value); } catch (x) { $("nfTestOut").textContent = "שגיאה: " + x; } };
+    document.querySelectorAll('a[href$="/logout"]').forEach((a) => a.addEventListener("click", () => { try { APP().sign_out(); } catch (x) {} }));
     $("notifyMode").value = info.notify || "each";
     $("notifyMode").onchange = async (e) => { await APP().set_notify(e.target.value); toast("ההתראות עודכנו"); };
     render();
