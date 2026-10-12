@@ -458,7 +458,9 @@ class Downloader(threading.Thread):
         final = dest
         if job.get("pcConvert") and dest.suffix.lower() == ".zip":
             final = self.convert_to_mp3(dest, folder)
-        elif self.cfg.get("unzip") and dest.suffix.lower() == ".zip":
+        elif (self.cfg.get("unzip") or self.cfg.get("vault_dir")) and dest.suffix.lower() == ".zip":
+            # The zip is only the wrapper that gets through NetFree; the vault
+            # keeps the video/song itself, so it shows and plays there.
             try:
                 with zipfile.ZipFile(dest) as z:
                     names = z.namelist()
@@ -477,7 +479,7 @@ class Downloader(threading.Thread):
         self.state["files"][job["videoId"]] = str(final)
         self.save_state()
         self.pending_got.append(job["videoId"])
-        self.log("ירד למחשב" + ("" if self.cfg.get("vault_dir") else f": {final.name}"))
+        self.log("ירד למחשב" + (" (נשמר בכספת)" if self.cfg.get("vault_dir") else f": {final.name}"))
 
     def convert_to_mp3(self, zpath: Path, folder: Path) -> Path:
         """The server sent the original audio (no MP3 encode, to save its
@@ -652,7 +654,7 @@ class Downloader(threading.Thread):
             self.state["files"][vid] = str(final)
             self.save_state()
             self.pending_got.append(vid)
-            self.log("ירד למחשב" + ("" if self.cfg.get("vault_dir") else f": {final.name}"))
+            self.log("ירד למחשב" + (" (נשמר בכספת)" if self.cfg.get("vault_dir") else f": {final.name}"))
         finally:
             shutil.rmtree(work, ignore_errors=True)
 

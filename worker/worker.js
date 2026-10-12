@@ -1657,7 +1657,13 @@ document.addEventListener("change", async (e) => {
 });
 
 // ---------- data ----------
-async function refresh() { try { S = await (await fetch(B + "/status")).json(); render(); autoDownload(); } catch (e) {} }
+// Signed out meanwhile (the answer is the sign-in page, not data): show it,
+// instead of a stale page whose buttons fail with "<!doctype … not valid JSON".
+async function jsonOrLogin(r) {
+  if (!(r.headers.get("content-type") || "").includes("json")) { location.reload(); throw new Error("צריך להתחבר מחדש"); }
+  return r.json();
+}
+async function refresh() { try { S = await jsonOrLogin(await fetch(B + "/status")); render(); autoDownload(); } catch (e) {} }
 async function post(path, data) {
   const r = await fetch(B + path, { method: "POST", body: data });
   if (!r.ok) throw new Error((await r.text()).replace(/^Error: /, ""));
@@ -1717,7 +1723,7 @@ document.addEventListener("click", async (e) => {
 });
 async function wake(btnEl) {
   btnEl.disabled = true; toast("מעיר את שרת ההורדות… (עד דקה)", 60000);
-  try { const r = await (await fetch(B + "/wake", { method: "POST" })).json(); toast(r.result === "ok" ? "השרת ער ובודק את התור" : "שגיאה: " + r.result, 8000); }
+  try { const r = await jsonOrLogin(await fetch(B + "/wake", { method: "POST" })); toast(r.result === "ok" ? "השרת ער ובודק את התור" : "שגיאה: " + r.result, 8000); }
   catch (e) { toast("שגיאה: " + e); }
   btnEl.disabled = false; refresh();
 }
