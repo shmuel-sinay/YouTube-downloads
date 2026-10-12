@@ -62,13 +62,14 @@ KEEP_FILES_HOURS = float(os.environ.get("KEEP_FILES_HOURS", "6"))
 
 def cookies_path() -> str | None:
     """yt-dlp rewrites the cookie file when it exits; Render's secret files
-    are read-only, so work on a private copy."""
+    are read-only, so yt-dlp always gets a fresh private copy."""
     src = os.environ.get("YTDLP_COOKIES")
     if not src or not Path(src).exists():
         return None
+    # Copy on every use: a cookie file updated in Render must take effect
+    # without restarting the server (an old copy kept "not a bot" errors alive).
     dst = Path("/tmp/yt-cookies.txt")
-    if not dst.exists():
-        shutil.copy(src, dst)
+    shutil.copy(src, dst)
     return str(dst)
 
 
