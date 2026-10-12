@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8ab4f8"/>
+      <stop offset="1" stop-color="#3367d6"/>
+    </linearGradient>
+    <linearGradient id="badge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff6b5e"/>
+      <stop offset="1" stop-color="#e2382b"/>
+    </linearGradient>
+  </defs>
+  <!-- tile -->
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <!-- download arrow -->
+  <path d="M128 52 v92" stroke="#fff" stroke-width="26" stroke-linecap="round"/>
+  <path d="M84 104 L128 148 L172 104" fill="none" stroke="#fff" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- tray -->
+  <path d="M58 156 v26 a14 14 0 0 0 14 14 h112 a14 14 0 0 0 14 -14 v-26" fill="none" stroke="#fff" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- play badge -->
+  <circle cx="196" cy="62" r="40" fill="url(#badge)" stroke="#fff" stroke-width="8"/>
+  <path d="M184 44 L216 62 L184 80 Z" fill="#fff" stroke="#fff" stroke-width="6" stroke-linejoin="round"/>
+</svg>

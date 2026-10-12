@@ -31,6 +31,7 @@ jobs:
       - name: Build YTTracker.exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name YTTracker
+          --icon desktop/icon.ico --add-data "desktop/icon.ico;."
           --collect-all imageio_ffmpeg --collect-all webview
           desktop/app.py
 

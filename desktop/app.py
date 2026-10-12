@@ -62,12 +62,26 @@ def save_json(path: Path, data) -> None:
 
 # ---------------------------------------------------------------- setup
 
+def icon_path() -> str:
+    """icon.ico next to the script, or inside the PyInstaller bundle."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return str(base / "icon.ico")
+
+
+def set_tk_icon(root) -> None:
+    try:
+        root.iconbitmap(icon_path())
+    except Exception:
+        pass
+
+
 def first_run_setup(cfg: dict) -> dict:
     """Ask for the site, password and folder (small Tk dialogs)."""
     import tkinter as tk
     from tkinter import filedialog, messagebox, simpledialog
 
     root = tk.Tk()
+    set_tk_icon(root)
     root.withdraw()
     site = simpledialog.askstring(APP, "כתובת האתר:", initialvalue=cfg.get("site") or DEFAULT_SITE, parent=root)
     if not site:
@@ -291,6 +305,7 @@ def open_window(cfg: dict) -> None:
         webbrowser.open(url)
         import tkinter as tk
         root = tk.Tk()
+        set_tk_icon(root)
         root.title(APP)
         tk.Label(root, text="התוכנה מורידה ברקע לתיקייה:\n" + cfg["folder"] +
                  "\n\nסגירת החלון עוצרת את ההורדות.", padx=20, pady=20).pack()

@@ -439,6 +439,9 @@ async function state(env) {
            renderUrl: env.RENDER_URL || "", now: new Date().toISOString() };
 }
 
+// The app icon (same as desktop/icon.svg), used as the browser-tab icon.
+const ICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E %3Cdefs%3E %3ClinearGradient id='bg' x1='0' y1='0' x2='1' y2='1'%3E %3Cstop offset='0' stop-color='%238ab4f8'/%3E %3Cstop offset='1' stop-color='%233367d6'/%3E %3C/linearGradient%3E %3ClinearGradient id='badge' x1='0' y1='0' x2='0' y2='1'%3E %3Cstop offset='0' stop-color='%23ff6b5e'/%3E %3Cstop offset='1' stop-color='%23e2382b'/%3E %3C/linearGradient%3E %3C/defs%3E %3Crect x='8' y='8' width='240' height='240' rx='56' fill='url%28%23bg%29'/%3E %3Cpath d='M128 52 v92' stroke='%23fff' stroke-width='26' stroke-linecap='round'/%3E %3Cpath d='M84 104 L128 148 L172 104' fill='none' stroke='%23fff' stroke-width='26' stroke-linecap='round' stroke-linejoin='round'/%3E %3Cpath d='M58 156 v26 a14 14 0 0 0 14 14 h112 a14 14 0 0 0 14 -14 v-26' fill='none' stroke='%23fff' stroke-width='22' stroke-linecap='round' stroke-linejoin='round'/%3E %3Ccircle cx='196' cy='62' r='40' fill='url%28%23badge%29' stroke='%23fff' stroke-width='8'/%3E %3Cpath d='M184 44 L216 62 L184 80 Z' fill='%23fff' stroke='%23fff' stroke-width='6' stroke-linejoin='round'/%3E %3C/svg%3E";
+
 const CSS = `
 :root{--bg:#131314;--panel:#1e1f20;--panel2:#26272a;--line:#3a3b3d;--text:#e3e3e3;--muted:#9aa0a6;
 --primary:#8ab4f8;--ok:#81c995;--warn:#fdd663;--bad:#f28b82;--radius:14px}
@@ -502,6 +505,7 @@ input:focus,select:focus{outline:none;border-color:var(--primary)}
 function page(title, body) {
   return new Response(`<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>
+<link rel="icon" href="${ICON}">
 <link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;700&display=swap" rel="stylesheet">
 <style>${CSS}</style></head><body><div class="wrap">${body}</div></body></html>`,
     { headers: { "Content-Type": "text/html; charset=utf-8" } });
