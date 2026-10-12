@@ -77,8 +77,45 @@ async function addJobs(env, jobs) {
 // remembers them, so the tracker won't download them again by itself.
 async function deleteJobs(env, ids) {
   const drop = new Set(ids);
+  if ((env.PROFILE || "main") === "main") {     // the admin's own history: also from the general dashboard
+    const acts = await getJSON(env, "activity", []);
+    const keep = acts.filter((a) => !(a.pid === "main" && drop.has(a.videoId)));
+    if (keep.length !== acts.length) await putJSON(env, "activity", keep);
+  }
   await putJSON(env, "jobs", (await getJobIds(env)).filter((id) => !drop.has(id)));
   for (const id of drop) await env.DB.delete("job:" + id);
+}
+
+// ---------- general dashboard (admin) ----------
+// Every download of every profile, kept apart from the profiles' own
+// histories: a profile deleting its history doesn't remove anything here.
+// Only the admin's own deletions apply (to the admin's own entries).
+const ACTIVITY_CAP = 600;
+async function recordActivity(env, j, patch) {
+  const pid = env.PROFILE || "main";
+  const acts = await getJSON(env, "activity", []);
+  const i = acts.findIndex((a) => a.pid === pid && a.videoId === j.videoId);
+  if (patch) {                      // e.g. "reached the computer": update in place
+    if (i < 0) return;
+    Object.assign(acts[i], patch);
+  } else {
+    const prev = i >= 0 ? acts.splice(i, 1)[0] : {};
+    acts.unshift({ ...prev, t: new Date().toISOString(), pid, name: (await profileInfo(env, pid)).name,
+      videoId: j.videoId, title: j.title, channelName: j.channelName || "", mode: j.mode || "",
+      status: j.status, error: j.error || "", kind: j.kind || "" });
+  }
+  await putJSON(env, "activity", acts.slice(0, ACTIVITY_CAP));
+}
+
+function countJobs(jobs) {
+  const c = { done: 0, pc: 0, taken: 0, waiting: 0, problem: 0 };
+  for (const j of jobs) {
+    if (j.status === "done") { c.done++; if (j.pcGot) c.pc++; }
+    else if (j.status === "taken") c.taken++;
+    else if (["queued", "nfcheck", "paused"].includes(j.status)) c.waiting++;
+    else if (["failed", "blocked", "skipped"].includes(j.status)) c.problem++;
+  }
+  return c;
 }
 
 async function listJobs(env) {
@@ -207,7 +244,7 @@ async function wakeAgent(env) {
 // keys. Every other profile has its own copy of everything under
 // "p:<id>:" — channels, queue, history, log, settings. "agent" and the
 // profile list itself stay global.
-const GLOBAL_KEYS = new Set(["agent", "profiles", "mainprof"]);
+const GLOBAL_KEYS = new Set(["agent", "profiles", "mainprof", "activity"]);
 
 function profileEnv(env, pid) {
   if (!pid || pid === "main") return { ...env, PROFILE: "main" };
@@ -406,6 +443,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         updated: new Date().toISOString(),
       });
       await putJSON(env, "job:" + j.videoId, j);
+      if (!j.kind) await recordActivity(env, j);
       await addLog(env, "worker", `${STATUS[j.status] || j.status}: ${j.title}` + (j.error ? ` — ${j.error}` : ""));
       return json({ ok: true });
     }
@@ -511,9 +549,18 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     } else {
       Object.assign(j, { status: "blocked", error: String(b.detail || "הסרטון לא פתוח בנטפרי").slice(0, 200), updated: now });
       await putJSON(penv, "job:" + j.videoId, j);
+      await recordActivity(penv, j);
       await addLog(penv, "worker", `⛔ חסום בנטפרי: ${j.title}`);
     }
     return json({ ok: true });
+  }
+  if (p === "/activity" && pid === "main") {
+    const profiles = [];
+    for (const q of await profileIds(rootEnv)) {
+      const info = await profileInfo(rootEnv, q);
+      profiles.push({ id: q, name: info.name, netfree: info.netfree, vault: info.vault, ...countJobs(await listJobs(profileEnv(rootEnv, q))) });
+    }
+    return json({ items: await getJSON(rootEnv, "activity", []), profiles });
   }
   if (p === "/profiles/remove" && req.method === "POST" && pid === "main") {
     // Removes the profile and all of its data.
@@ -568,7 +615,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     await addLogs(env, "pc", (b.lines || []).slice(-50).map(String));
     for (const id of (b.got || []).slice(0, 100)) {      // files now on the PC
       const j = await getJSON(env, "job:" + id, null);
-      if (j && !j.pcGot) { j.pcGot = true; await putJSON(env, "job:" + id, j); }
+      if (j && !j.pcGot) { j.pcGot = true; await putJSON(env, "job:" + id, j); await recordActivity(env, j, { pcGot: true }); }
     }
     return json({ ok: true });
   }
@@ -810,6 +857,9 @@ const IC = {
   monitor: '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>',
   user: '<circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/>',
   users: '<circle cx="9" cy="8" r="4"/><path d="M1 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1M16 4a4 4 0 0 1 0 8M23 21v-1a6 6 0 0 0-4-5.6"/>',
+  dash: '<rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>',
+  check: '<path d="M20 6L9 17l-5-5"/>',
+  alert: '<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>',
   key: '<circle cx="7.5" cy="15.5" r="5.5"/><path d="M21 2l-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/>',
   edit: '<path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
   logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
@@ -889,6 +939,25 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .b-nfcheck{color:#38bdf8;background:#38bdf81a}.b-blocked{color:var(--bad);background:#f064641a}
 .pflags{display:flex;gap:14px;align-items:center;flex-wrap:wrap;font-size:.8rem;color:var(--muted)}.pflags label{display:flex;align-items:center;gap:6px}
 .side-col{display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex:none}
+/* dashboards */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);cursor:pointer;text-align:start;font:inherit;color:var(--text)}
+.stat:hover{border-color:var(--primary)}
+.stat .k{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:.85rem}.stat .k .i{width:16px;height:16px}
+.stat .v{font-size:2rem;font-weight:600;margin-top:6px;font-variant-numeric:tabular-nums}
+.stat .s{color:var(--muted);font-size:.78rem;margin-top:2px}
+.dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}.dgrid .card{margin:0}
+.mini{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)}.mini:last-child{border-bottom:0}
+.mini .pos{flex:none;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--panel2);color:var(--muted);font-size:.8rem;font-variant-numeric:tabular-nums}
+.mini .t{flex:1;min-width:0}.mini .t b{display:block;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mini .t span{color:var(--muted);font-size:.78rem}
+.mini .t .bad{color:var(--bad)}
+.ghead{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:16px 18px;border-bottom:1px solid var(--line)}
+.prow{display:flex;align-items:center;gap:14px;padding:14px 18px;border-bottom:1px solid var(--line);flex-wrap:wrap}.prow:last-child{border-bottom:0}
+.prow .who{display:flex;align-items:center;gap:10px;min-width:150px;flex:1}
+.prow .nums{display:flex;gap:18px;flex-wrap:wrap}.prow .nums div{text-align:center;min-width:56px}
+.prow .nums b{display:block;font-size:1.15rem;font-variant-numeric:tabular-nums}.prow .nums span{color:var(--muted);font-size:.74rem}
+.tag{font-size:.7rem;padding:2px 8px;border-radius:999px;background:var(--panel2);color:var(--muted);margin-inline-start:6px}
 .acts{display:flex;gap:6px}
 .empty{padding:48px 16px;text-align:center;color:var(--muted)}
 .empty .i{width:36px;height:36px;margin-bottom:8px;opacity:.6}
@@ -996,7 +1065,9 @@ async function dashboard(env) {
   return `<div class="app">
 <aside class="side">
   <div class="brand"><img src="${ICON}" alt="">מעקב ערוצים</div>
-  <button class="nav on" data-page="queue">${icon("queue")}<span>תור הורדות</span><span class="count" id="qCount"></span></button>
+  <button class="nav on" data-page="dash">${icon("dash")}<span>לוח בקרה</span></button>
+  <button class="nav hidden" data-page="global" id="globalNav">${icon("users")}<span>לוח בקרה כללי</span></button>
+  <button class="nav" data-page="queue">${icon("queue")}<span>תור הורדות</span><span class="count" id="qCount"></span></button>
   <button class="nav" data-page="channels">${icon("channels")}<span>ערוצים</span><span class="count" id="cCount"></span></button>
   <button class="nav" data-page="add">${icon("add")}<span>הוספה</span></button>
   <button class="nav" data-page="logs">${icon("logs")}<span>לוגים</span></button>
@@ -1007,7 +1078,7 @@ async function dashboard(env) {
 </aside>
 <main class="main">
   <div class="topbar">
-    <h1 id="pageTitle">תור הורדות</h1>
+    <h1 id="pageTitle">לוח בקרה</h1>
     <span class="status"><span class="dot" id="agentDot"></span><span id="agentText">…</span></span>
     <button class="btn ghost" id="wakeBtn" type="button">${icon("zap")}<span>הער שרת</span></button>
     <span class="status" title="מחובר כ">${icon("user")}<span id="profileName"></span></span>
@@ -1015,7 +1086,28 @@ async function dashboard(env) {
   </div>
   <div class="content">
 
-  <section data-p="queue">
+  <section data-p="dash">
+    <div class="stats" id="dashStats"></div>
+    <div class="dgrid">
+      <div class="card"><h2>${icon("download")}בהורדה עכשיו</h2><div id="dashNow"></div></div>
+      <div class="card"><h2>${icon("queue")}ממתינות בתור</h2><div id="dashWait"></div></div>
+      <div class="card"><h2>${icon("check")}ירדו לאחרונה</h2><div id="dashDone"></div></div>
+      <div class="card"><h2>${icon("alert")}לא ירדו</h2><div id="dashBad"></div></div>
+    </div>
+  </section>
+
+  <section data-p="global" class="hidden">
+    <p class="sub" style="margin-top:0">כל מה שירד בכל הפרופילים. מחיקת היסטוריה של פרופיל לא מוחקת מכאן — רק מחיקה של ההיסטוריה שלך (המנהל) חלה גם כאן.</p>
+    <div class="card" style="padding:0"><div id="gProfiles"></div></div>
+    <div class="card" style="padding:0">
+      <div class="ghead"><h2 style="margin:0">${icon("clock")}פעילות אחרונה</h2>
+        <span style="display:flex;gap:8px;flex-wrap:wrap"><select id="gWho" style="width:auto"><option value="">כל הפרופילים</option></select>
+        <select id="gWhat" style="width:auto"><option value="">כל הסטטוסים</option><option value="done">ירדו</option><option value="problem">לא ירדו</option></select></span></div>
+      <div id="gList"></div>
+    </div>
+  </section>
+
+  <section data-p="queue" class="hidden">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
       <div class="seg" id="filter">
         <button class="on" data-f="all">הכל</button><button data-f="active">פעילים</button>
@@ -1143,13 +1235,15 @@ function toast(msg, ms) { const t = $("toast"); t.textContent = msg; t.style.dis
 const APP = () => window.pywebview && window.pywebview.api;   // running inside the desktop app?
 
 // ---------- pages ----------
-const TITLES = { queue: "תור הורדות", channels: "ערוצים", add: "הוספה", logs: "לוגים", settings: "הגדרות" };
+const TITLES = { dash: "לוח בקרה", global: "לוח בקרה כללי", queue: "תור הורדות", channels: "ערוצים", add: "הוספה", logs: "לוגים", settings: "הגדרות" };
 function showPage(name) {
+  if (name === "global" && !(S.profile && S.profile.admin)) name = "dash";
   document.querySelectorAll(".nav[data-page]").forEach((n) => n.classList.toggle("on", n.dataset.page === name));
   document.querySelectorAll("section[data-p]").forEach((s) => s.classList.toggle("hidden", s.dataset.p !== name));
   $("pageTitle").textContent = TITLES[name];
   try { localStorage.setItem("page", name); } catch (e) {}
   if (name === "logs") { const b = $("logs"); b.scrollTop = b.scrollHeight; }
+  if (name === "global") setTimeout(loadGlobal, 0);
 }
 document.querySelectorAll(".nav[data-page]").forEach((n) => n.onclick = () => showPage(n.dataset.page));
 try { const p = localStorage.getItem("page"); if (p && TITLES[p]) showPage(p); } catch (e) {}
@@ -1201,6 +1295,69 @@ function jobRow(j) {
 }
 const IN = { all: () => true, active: (j) => ["queued", "taken", "paused", "nfcheck"].includes(j.status), done: (j) => j.status === "done",
              problem: (j) => ["failed", "skipped", "cancelled", "blocked"].includes(j.status) };
+// ---------- dashboard (this profile) ----------
+const WAITING = ["queued", "nfcheck", "paused"], PROBLEM = ["failed", "blocked", "skipped"];
+function stat(ic, label, value, sub, go) {
+  return '<button class="stat" type="button" data-go="' + go + '"><div class="k">' + icon(ic) + label + '</div><div class="v">' + value + '</div><div class="s">' + (sub || "&nbsp;") + '</div></button>';
+}
+function mini(lead, title, sub, badge) {
+  return '<div class="mini">' + lead + '<div class="t"><b title="' + esc(title) + '">' + esc(title) + '</b><span>' + sub + '</span></div>' + (badge || "") + '</div>';
+}
+const badgeOf = (st) => '<span class="badge b-' + esc(st) + '">' + (STATUS[st] || esc(st)) + '</span>';
+// The order the download server will take them (top priority, then oldest).
+const waitOrder = (jobs) => jobs.filter((j) => WAITING.includes(j.status)).reverse().sort((a, b) => (b.priority || 0) - (a.priority || 0));
+function renderDash() {
+  const J = S.jobs.filter((j) => !j.kind), lists = S.jobs.filter((j) => j.kind && WAITING.concat("taken").includes(j.status));
+  const done = J.filter((j) => j.status === "done"), now = S.jobs.filter((j) => j.status === "taken");
+  const wait = waitOrder(S.jobs), bad = J.filter((j) => PROBLEM.includes(j.status));
+  const pc = done.filter((j) => j.pcGot).length, today = done.filter((j) => Date.now() - Date.parse(j.updated) < 86400000).length;
+  const nf = wait.filter((j) => j.status === "nfcheck").length, paused = wait.filter((j) => j.status === "paused").length;
+  $("dashStats").innerHTML =
+    stat("check", "ירדו", done.length, today + " ב-24 השעות האחרונות" + (pc ? " · " + pc + " במחשב" : ""), "done") +
+    stat("download", "בהורדה עכשיו", now.length, now.length ? "השרת עובד" : "אין כרגע", "active") +
+    stat("queue", "ממתינות", wait.length, [nf ? nf + " בבדיקת נטפרי" : "", paused ? paused + " מושהות" : "", lists.length ? lists.length + " רשימות/חיפושים" : ""].filter(Boolean).join(" · "), "active") +
+    stat("alert", "לא ירדו", bad.length, bad.filter((j) => j.status === "blocked").length ? bad.filter((j) => j.status === "blocked").length + " חסומים בנטפרי" : "", "problem");
+  $("dashNow").innerHTML = now.length ? now.map((j) => '<div class="mini" style="display:block"><b>' + esc(j.title) + '</b><div class="prog" data-prog="' + esc(j.videoId) + '">' + progHtml(j.videoId) + '</div></div>').join("")
+    : '<div class="sub" style="margin:0">שום דבר לא יורד כרגע.</div>';
+  $("dashWait").innerHTML = wait.length ? wait.slice(0, 12).map((j, i) => mini('<span class="pos">' + (i + 1) + '</span>', j.title,
+      esc(j.channelName || "") + (j.status === "nfcheck" ? " · ממתין לבדיקת נטפרי" : j.status === "paused" ? " · מושהה" : " · נוסף " + ago(j.updated)), badgeOf(j.status))).join("") +
+      (wait.length > 12 ? '<div class="sub" style="margin:8px 0 0">ועוד ' + (wait.length - 12) + '…</div>' : "")
+    : '<div class="sub" style="margin:0">התור ריק.</div>';
+  $("dashDone").innerHTML = done.length ? done.slice(0, 10).map((j) => mini("", j.title, ago(j.updated) + " · " + esc(MODES[j.mode] || "") + (j.pcGot ? " · במחשב" : ""), badgeOf("done"))).join("")
+    : '<div class="sub" style="margin:0">עוד לא ירד כלום.</div>';
+  $("dashBad").innerHTML = bad.length ? bad.slice(0, 10).map((j) => mini("", j.title, '<span class="bad">' + esc(j.error || STATUS[j.status]) + '</span> · ' + ago(j.updated), badgeOf(j.status))).join("")
+    : '<div class="sub" style="margin:0">הכל ירד בהצלחה.</div>';
+}
+document.addEventListener("click", (e) => {
+  const st = e.target.closest(".stat[data-go]"); if (!st) return;
+  FILTER = st.dataset.go === "done" ? "done" : st.dataset.go;
+  document.querySelectorAll("#filter button").forEach((x) => x.classList.toggle("on", x.dataset.f === FILTER));
+  showPage("queue"); render();
+});
+
+// ---------- general dashboard (admin): every profile ----------
+let G = null;
+async function loadGlobal() {
+  if (!(S.profile && S.profile.admin)) return;
+  try { G = await (await fetch(B + "/activity", { cache: "no-store" })).json(); } catch (e) { return; }
+  const sel = $("gWho"), cur = sel.value;
+  sel.innerHTML = '<option value="">כל הפרופילים</option>' + G.profiles.map((p) => '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>').join("");
+  sel.value = cur; renderGlobal();
+}
+function renderGlobal() {
+  if (!G) return;
+  $("gProfiles").innerHTML = G.profiles.map((p) => '<div class="prow"><div class="who"><div class="avatar">' + esc(p.name.charAt(0)) + '</div><div><b>' + esc(p.name) + '</b>' +
+    (p.netfree ? '<span class="tag">רק נטפרי</span>' : "") + (p.vault ? '<span class="tag">כספת</span>' : "") + '</div></div><div class="nums">' +
+    [["done", "ירדו"], ["pc", "במחשב"], ["taken", "בהורדה"], ["waiting", "ממתינות"], ["problem", "לא ירדו"]].map(([k, l]) => '<div><b>' + p[k] + '</b><span>' + l + '</span></div>').join("") + '</div></div>').join("");
+  const who = $("gWho").value, what = $("gWhat").value;
+  const items = G.items.filter((a) => (!who || a.pid === who) && (!what || (what === "done" ? a.status === "done" : a.status !== "done"))).slice(0, 150);
+  $("gList").innerHTML = items.length ? '<div style="padding:4px 18px">' + items.map((a) => mini('<div class="avatar" title="' + esc(a.name) + '">' + esc((a.name || "?").charAt(0)) + '</div>', a.title,
+      esc(a.name) + " · " + ago(a.t) + (a.channelName ? " · " + esc(a.channelName) : "") + (a.pcGot ? " · במחשב" : "") + (a.error && a.status !== "done" ? ' · <span class="bad">' + esc(a.error) + '</span>' : ""),
+      badgeOf(a.status))).join("") + '</div>' : '<div class="empty">אין עדיין פעילות</div>';
+}
+$("gWho").onchange = renderGlobal; $("gWhat").onchange = renderGlobal;
+setInterval(() => { if (!$("globalNav").classList.contains("hidden") && !document.querySelector('section[data-p="global"]').classList.contains("hidden")) loadGlobal(); }, 15000);
+
 function render() {
   const seen = S.agent && S.agent.seen, mins = seen ? (Date.now() - Date.parse(seen)) / 60000 : Infinity;
   const busy = S.jobs.some((j) => j.status === "taken"), info = S.agent && S.agent.info;
@@ -1231,6 +1388,8 @@ function render() {
     if (!mp3ok && o.selected) o.parentNode.value = "video";
   });
   $("profileName").textContent = (S.profile && S.profile.name) || "";
+  $("globalNav").classList.toggle("hidden", !(S.profile && S.profile.admin));
+  renderDash();
   $("profilesCard").classList.toggle("hidden", !(S.profile && S.profile.admin));
   const sw = (pr, flag, label) => '<label>' + label + '<span class="switch"><input type="checkbox" data-prof="' + esc(pr.id) + '" data-flag="' + flag + '"' + (pr[flag] ? " checked" : "") + '><i></i></span></label>';
   if (!document.activeElement || !document.activeElement.dataset || !document.activeElement.dataset.prof)
