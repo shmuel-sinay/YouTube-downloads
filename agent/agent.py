@@ -112,13 +112,38 @@ def hello() -> None:
             return "חסר"
     info = {"ytdlp": ver(["yt-dlp", "--version"]), "node": ver(["node", "--version"]),
             "ffmpeg": ver(["ffmpeg", "-version"])[:40], "cookies": bool(cookies_path()),
-            "pot": pot_server(), "mode": "render" if PORT else "loop", "public": PUBLIC_URL}
+            "pot": pot_server(), "warp": warp_up(wait=30), "mode": "render" if PORT else "loop", "public": PUBLIC_URL}
     try:
         api("/api/hello", info)
     except Exception as e:
         print(f"[!] hello failed (TRACKER_URL / AGENT_TOKEN?): {e}", flush=True)
     log(f"סוכן עלה: yt-dlp {info['ytdlp']}, node {info['node']}, "
-        f"עוגיות {'יש' if info['cookies'] else 'אין!'}, שרת טוקנים {info['pot'] or 'לא פעיל!'}")
+        f"עוגיות {'יש' if info['cookies'] else 'אין!'}, שרת טוקנים {info['pot'] or 'לא פעיל!'}, "
+        f"WARP {'פעיל' if info['warp'] else 'לא פעיל'}")
+
+
+WARP_PROXY = "socks5://127.0.0.1:40000"
+
+
+def warp_up(wait: int = 0) -> bool:
+    """Is the WARP proxy (start.sh → wireproxy) listening? Optionally wait for
+    it — registering with Cloudflare takes a few seconds after startup."""
+    import socket
+    for i in range(max(1, wait // 2)):
+        try:
+            socket.create_connection(("127.0.0.1", 40000), timeout=1).close()
+            return True
+        except OSError:
+            if wait:
+                time.sleep(2)
+    return False
+
+
+def net_args() -> list[str]:
+    """Route yt-dlp through Cloudflare WARP when it's running (YouTube sees a
+    Cloudflare address, not Render's). The PO-token plugin passes the same
+    proxy on to the token server."""
+    return ["--proxy", WARP_PROXY] if warp_up() else []
 
 
 def pot_server() -> str:
@@ -169,6 +194,17 @@ def prog_file(vid: str) -> Path:
     return Path("/tmp") / f"ffprog-{vid}.txt"
 
 
+def _without(cmd: list[str], flag: str) -> list[str]:
+    """cmd without `flag` and its value."""
+    i = cmd.index(flag)
+    return cmd[:i] + cmd[i + 2:]
+
+
+def _bot_check(r) -> bool:
+    out = r.stdout + r.stderr
+    return "confirm you" in out and "not a bot" in out
+
+
 def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
     """yt-dlp with the free anti-bot stack learned in the zmani project:
     cookies, Node for the JS challenge (yt-dlp[default] ships the solver),
@@ -187,7 +223,7 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
            # ios/android ignore cookies (→ "not a bot"); yt-dlp's defaults plus
            # mweb use the cookies and the PO tokens from the bgutil server.
            "--extractor-args", "youtube:player_client=default,mweb",
-           "--embed-thumbnail", "--embed-metadata"]
+           "--embed-thumbnail", "--embed-metadata"] + net_args()
     if job.get("mode") == "video":
         cmd += ["-f", f"bv*[height<={RES}]+ba/b[height<={RES}]/bv*+ba/b",
                 "--merge-output-format", "mp4", "--remux-video", "mp4"]
@@ -412,7 +448,7 @@ def handle_list(job: dict) -> None:
     cmd = ["yt-dlp", job["url"], "--flat-playlist", "--no-warnings",
            "--playlist-end", str(min(count * (3 if min_s else 1) + 5, 600)),
            "--print", "%(id)s\t%(duration)s\t%(title)s",
-           "--js-runtimes", "node", "--impersonate", "chrome"]
+           "--js-runtimes", "node", "--impersonate", "chrome"] + net_args()
     cookies = cookies_path()
     if cookies:
         cmd += ["--cookies", cookies]
@@ -451,7 +487,7 @@ def handle_search(job: dict) -> None:
     log(f"-> מחפש: {q}")
     set_progress(vid, stage="start", pct=None, started=time.time(), mode="m4a")
     cmd = ["yt-dlp", f"ytsearch{20 if min_s else 5}:{q}", "--flat-playlist", "--no-warnings",
-           "--print", "%(id)s\t%(duration)s\t%(title)s", "--js-runtimes", "node", "--impersonate", "chrome"]
+           "--print", "%(id)s\t%(duration)s\t%(title)s", "--js-runtimes", "node", "--impersonate", "chrome"] + net_args()
     cookies = cookies_path()
     if cookies:
         cmd += ["--cookies", cookies]
@@ -502,17 +538,22 @@ def _handle(job: dict) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     _current.clear()
     cmd = ytdlp_cmd(job, OUT)
-    r = run_ytdlp(cmd, vid)
-    if (not _current.get("stopped") and "--cookies" in cmd
-            and "confirm you" in (r.stdout + r.stderr) and "not a bot" in (r.stdout + r.stderr)):
-        # A bad/rotated cookie file makes YouTube ask "not a bot" even where
-        # the server would pass without it (PO tokens do the job). Try again
-        # without cookies before giving up.
-        i = cmd.index("--cookies")
-        log("   יוטיוב דחה את העוגיות — מנסה שוב בלי עוגיות")
-        r = run_ytdlp(cmd[:i] + cmd[i + 2:], vid)
-        if not _current.get("stopped") and "not a bot" not in (r.stdout + r.stderr):
-            log("   ✓ עבד בלי עוגיות — כדאי להחליף את קובץ העוגיות ב-Render (או למחוק אותו)")
+    # YouTube's "not a bot" depends on the address and on the cookies; when
+    # it refuses, try the other routes before giving up: the same without
+    # cookies (a rejected cookie file), then without WARP (the direct route).
+    tries = [("", cmd)]
+    if "--cookies" in cmd:
+        tries.append(("בלי עוגיות", _without(cmd, "--cookies")))
+    if "--proxy" in cmd:
+        tries.append(("בלי WARP", _without(cmd, "--proxy")))
+    for n, (label, c) in enumerate(tries):
+        if n:
+            log(f"   יוטיוב ביקש 'not a bot' — מנסה שוב {label}")
+        r = run_ytdlp(c, vid)
+        if _current.get("stopped") or not _bot_check(r):
+            if n:
+                log(f"   ✓ עבר {label}")
+            break
     stopped = _current.get("stopped")
     if stopped:
         if stopped in ("cancelled", "missing"):

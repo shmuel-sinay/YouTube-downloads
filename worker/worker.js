@@ -1562,7 +1562,8 @@ function render() {
   $("agentDot").className = "dot " + (busy || mins < 5 ? "ok" : mins < 30 ? "warn" : "bad");
   $("agentText").textContent = !S.renderUrl ? "RENDER_URL לא מוגדר" : busy ? "מוריד" : mins < 5 ? "שרת ער" : "שרת ישן";
   $("agentInfo").textContent = "נראה " + ago(seen) + (info ? " · yt-dlp " + (info.ytdlp || "?") + " · עוגיות: " + (info.cookies ? "יש" : "אין!") +
-    (info.pot !== undefined ? " · שרת טוקנים: " + (info.pot || "לא פעיל!") : "") : "");
+    (info.pot !== undefined ? " · שרת טוקנים: " + (info.pot || "לא פעיל!") : "") +
+    (info.warp !== undefined ? " · WARP: " + (info.warp ? "פעיל" : "לא פעיל") : "") : "");
   const active = S.jobs.filter(IN.active).length;
   $("qCount").textContent = active || ""; $("cCount").textContent = S.channels.length || "";
   $("checkText").textContent = "בדיקה אחרונה: " + ago(S.lastCheck && S.lastCheck.at) + " · אוטומטית כל 3 שעות";

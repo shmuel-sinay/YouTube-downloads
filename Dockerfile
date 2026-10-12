@@ -14,6 +14,18 @@ RUN git clone -q https://github.com/Brainicism/bgutil-ytdlp-pot-provider /src \
 WORKDIR /src/server
 RUN npm ci --no-audit --no-fund && npx tsc && npm prune --omit=dev --no-audit --no-fund
 
+# --- Cloudflare WARP tools, built from pinned releases (wgcf v2.3.1 registers
+# a free WARP account; wireproxy v1.1.3 turns it into a local SOCKS proxy —
+# Render can't create network interfaces, so it runs in userspace).
+FROM golang:1.26-bookworm AS warp
+ENV CGO_ENABLED=0
+RUN git clone -q --depth 1 --branch v2.3.1 https://github.com/ViRb3/wgcf /wgcf \
+ && test "$(git -C /wgcf rev-parse HEAD)" = de6bba7147dc965a1b8e4de113a709750697ccea \
+ && cd /wgcf && go build -trimpath -o /out/wgcf .
+RUN git clone -q --depth 1 --branch v1.1.3 https://github.com/whyvl/wireproxy /wireproxy \
+ && test "$(git -C /wireproxy rev-parse HEAD)" = 31a9a34498267d7fb8aeff05aba79d929b15eb39 \
+ && cd /wireproxy && go build -trimpath -o /out/wireproxy ./cmd/wireproxy
+
 FROM python:3.12-slim-bookworm
 RUN apt-get update -qq && apt-get install -y -qq ffmpeg ca-certificates >/dev/null \
  && rm -rf /var/lib/apt/lists/*
@@ -27,7 +39,8 @@ COPY agent/agent.py .
 COPY --from=pot /src/server/package.json /pot/package.json
 COPY --from=pot /src/server/build /pot/build
 COPY --from=pot /src/server/node_modules /pot/node_modules
+COPY --from=warp /out/wgcf /out/wireproxy /usr/local/bin/
+COPY agent/start.sh /app/start.sh
 ENV OUT_DIR=/tmp/downloads PYTHONUNBUFFERED=1
-# The token server runs in the background; if it ever fails, the agent still
-# works (yt-dlp just goes without tokens).
-CMD ["sh", "-c", "node /pot/build/main.js --host 127.0.0.1 --port 4416 > /tmp/pot.log 2>&1 & exec python /app/agent.py"]
+# start.sh runs the token server and WARP in the background, then the agent.
+CMD ["sh", "/app/start.sh"]
