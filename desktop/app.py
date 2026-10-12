@@ -25,6 +25,12 @@ import webbrowser
 import zipfile
 from pathlib import Path
 
+# A new copy of this app started from here (after an update, after install)
+# must unpack itself fresh. Without this it inherits this process's temp
+# folder (_MEI…), which is deleted as this one exits → "Failed to create a
+# .NET runtime" and "Failed to remove temporary directory" in the new copy.
+os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+
 try:
     # Use Windows' own certificate store, so HTTPS works behind filters such
     # as NetFree that install their own root certificate.

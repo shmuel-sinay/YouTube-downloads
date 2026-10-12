@@ -51,6 +51,8 @@ TOKEN = os.environ.get("AGENT_TOKEN", "")
 OUT = Path(os.environ.get("OUT_DIR", "./downloads"))
 POLL = int(os.environ.get("POLL_SECONDS", "300"))
 RES = os.environ.get("VIDEO_RES", "1080")
+# yt-dlp plugins next to this file (adds the visionos_old client).
+PLUGINS = Path(__file__).resolve().parent / "plugins"
 AGE_LIMIT = os.environ.get("AGE_LIMIT", "17")
 PORT = os.environ.get("PORT")  # set by Render -> web-server mode
 # Secret part of file links. Derived from AGENT_TOKEN (never the token
@@ -279,6 +281,8 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
            # mweb use the cookies and the PO tokens from the bgutil server.
            "--extractor-args", "youtube:player_client=default,mweb",
            "--embed-thumbnail", "--embed-metadata"] + net_args()
+    if PLUGINS.is_dir():
+        cmd += ["--plugin-dirs", str(PLUGINS)]
     if job.get("mode") == "video":
         cmd += ["-f", f"bv*[height<={RES}]+ba/b[height<={RES}]/bv*+ba/b",
                 "--merge-output-format", "mp4", "--remux-video", "mp4"]
@@ -604,7 +608,11 @@ def _handle(job: dict) -> None:
     # Order: visionos first — it gets direct stream links (no signature, no
     # n-challenge, no PO token → no Node run, nothing to 403 on); then
     # tv_simply, which got through on Render via WARP.
-    tries = [("לקוח visionos (בלי עוגיות)", _with_clients(light, "visionos")),
+    # visionos_old (0.1, the original Vision Pro — our plugin) downloads the
+    # whole file where yt-dlp's visionos 1.02 is sometimes cut off with 403.
+    old_ok = "--plugin-dirs" in light
+    tries = ([("לקוח visionos ישן (בלי עוגיות)", _with_clients(light, "visionos_old"))] if old_ok else []) + [
+             ("לקוח visionos (בלי עוגיות)", _with_clients(light, "visionos")),
              ("לקוח tv_simply (בלי עוגיות)", _with_clients(light, "tv_simply")),
              ("לקוח android_vr (בלי עוגיות)", _with_clients(light, "android_vr")),
              ("", cmd),

@@ -36,6 +36,8 @@ WORKDIR /app
 COPY agent/requirements.txt .
 RUN pip install --no-cache-dir -U -r requirements.txt
 COPY agent/agent.py .
+# yt-dlp plugin: the original visionOS client (visionos_old)
+COPY agent/plugins /app/plugins
 COPY --from=pot /src/server/package.json /pot/package.json
 COPY --from=pot /src/server/build /pot/build
 COPY --from=pot /src/server/node_modules /pot/node_modules
