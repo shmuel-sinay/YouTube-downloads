@@ -23,6 +23,7 @@
 //   Optional R2 binding:   FILES
 
 const BASE = "/yt";     // where the tracker lives; "/" stays the Gemini chat
+let ORIGIN = "";        // this Worker's address, remembered for hints in the log
 
 const SEEN_CAP = 500;   // video ids remembered per channel
 const JOBS_CAP = 400;   // jobs kept in the list (oldest dropped)
@@ -169,9 +170,13 @@ async function wakeAgent(env) {
   try {
     const r = await fetch(env.RENDER_URL.replace(/\/$/, "") + "/wake", { method: "POST" });
     const body = (await r.text()).trim();
-    // Our agent answers exactly "ok". Anything else is some other app (old
-    // code still deployed, a failed build, Render's own error page…).
-    res = r.ok && body === "ok" ? "ok"
+    // Our agent answers "ok", or "ok|<its last error reaching this Worker>".
+    // Anything else is some other app (old code, failed build, error page).
+    if (r.ok && body.startsWith("ok|")) {
+      await addLog(env, "worker", "⚠ שרת ההורדות לא מצליח לדבר עם האתר: " + body.slice(3) +
+        " — בדוק ב-Render את TRACKER_URL (צריך להיות " + (ORIGIN || "https://my-gemini.<שם>.workers.dev") + BASE + ") ואת AGENT_TOKEN");
+    }
+    res = r.ok && body.startsWith("ok") ? "ok"
       : r.ok ? "השרת ענה, אבל לא כמו סוכן ההורדות — כנראה ב-Render עדיין רץ קוד ישן או שהבנייה נכשלה"
       : `HTTP ${r.status} מ-Render`;
   } catch (e) {
@@ -208,11 +213,15 @@ const redirect = (to, headers = {}) => new Response(null, { status: 303, headers
 
 async function route(req, env, ctx) {
   const url = new URL(req.url);
+  ORIGIN = url.origin;
   if (url.pathname === "/") return gemini(req, env);   // the existing project
-  if (url.pathname !== BASE && !url.pathname.startsWith(BASE + "/")) {
+  // The agent API also answers without the /yt prefix, in case TRACKER_URL
+  // was set to the bare Worker address.
+  const bareApi = url.pathname.startsWith("/api/");
+  if (!bareApi && url.pathname !== BASE && !url.pathname.startsWith(BASE + "/")) {
     return new Response("Not found", { status: 404 });
   }
-  const p = url.pathname.slice(BASE.length) || "/";
+  const p = bareApi ? url.pathname : url.pathname.slice(BASE.length) || "/";
   const wake = () => ctx.waitUntil(wakeAgent(env));
   if (!env.DB) {
     return page("הגדרה חסרה", `<p>חסר חיבור למסד נתונים (KV) בשם <b>DB</b>.</p>

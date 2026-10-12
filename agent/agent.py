@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -113,13 +114,32 @@ def hello() -> None:
         f"עוגיות {'יש' if info['cookies'] else 'אין!'}")
 
 
+LAST_ERR = ""  # last failure talking to the Worker — returned on /wake
+
+
 def api(path: str, body: dict | None = None) -> dict:
+    """POST to the Worker. Failures are remembered in LAST_ERR, which the
+    agent sends back on /wake — so the site can show why even when the agent
+    can't reach the Worker at all (wrong TRACKER_URL, blocked, bad token)."""
+    global LAST_ERR
     req = urllib.request.Request(
         TRACKER + path, method="POST",
         data=json.dumps(body or {}).encode(),
-        headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.load(r)
+        headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json",
+                 # Cloudflare may refuse the default "Python-urllib" agent.
+                 "User-Agent": "yt-tracker-agent/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.load(r)
+        LAST_ERR = ""
+        return data
+    except urllib.error.HTTPError as e:
+        detail = e.read(200).decode("utf-8", "replace").strip()
+        LAST_ERR = f"{TRACKER + path} → HTTP {e.code} {detail}"
+        raise
+    except Exception as e:
+        LAST_ERR = f"{TRACKER + path} → {e}"
+        raise
 
 
 def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
@@ -240,6 +260,8 @@ def worker_loop() -> None:
     while True:
         _wake.wait(timeout=POLL if POLL > 0 else 300)
         _wake.clear()
+        if not TRACKER or not TOKEN:
+            continue  # nothing to do until Render's Environment is fixed
         _busy.set()
         try:
             cleanup_old_files()
@@ -279,7 +301,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not _busy.is_set():
                 log("קיבלתי קריאת השכמה — בודק את התור")
             _wake.set()
-            return self._send(200, "ok")
+            # "ok", plus the last error reaching the Worker, if any.
+            return self._send(200, "ok" + (f"|{LAST_ERR}" if LAST_ERR else ""))
         self._send(404, "not found")
 
     def do_GET(self):
@@ -331,8 +354,13 @@ def serve() -> int:
 
 
 def main() -> int:
+    global LAST_ERR
     if not TRACKER or not TOKEN:
-        sys.exit("Set TRACKER_URL and AGENT_TOKEN (see agent.env.example).")
+        if not PORT:
+            sys.exit("Set TRACKER_URL and AGENT_TOKEN (see agent.env.example).")
+        # On Render keep serving, so the site can show what's missing.
+        LAST_ERR = "חסר TRACKER_URL או AGENT_TOKEN ב-Environment של Render"
+        print(LAST_ERR, flush=True)
     if PORT:
         return serve()
     hello()
