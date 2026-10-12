@@ -732,10 +732,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print("http:", line, flush=True)
 
 
+def youtube_selftest() -> None:
+    """On startup: which route gets past YouTube right now? Writes one line
+    to the site's log, e.g. "בדיקת יוטיוב: WARP ✓ · ישיר ✗" — so a block is
+    visible before any download fails."""
+    probe = "https://www.youtube.com/watch?v=jNQXAC9IVRw"     # "Me at the zoo" — always online
+    base = ["yt-dlp", probe, "--simulate", "--no-playlist", "--no-warnings", "-q",
+            "--js-runtimes", "node", "--impersonate", "chrome",
+            "--extractor-args", "youtube:player_client=default,mweb"]
+    cookies = cookies_path()
+    routes = []
+    if warp_up():
+        routes.append(("WARP", ["--proxy", WARP_PROXY]))
+    routes.append(("ישיר", []))
+    parts = []
+    for name, extra in routes:
+        for label, ck in ((" + עוגיות", ["--cookies", cookies] if cookies else None), ("", [])):
+            if ck is None:
+                continue
+            try:
+                r = subprocess.run(base + extra + ck, capture_output=True, text=True, timeout=120)
+                ok = r.returncode == 0
+                why = "" if ok else (" (not a bot)" if "not a bot" in r.stderr else "")
+            except Exception:
+                ok, why = False, " (timeout)"
+            parts.append(f"{name}{label} {'✓' if ok else '✗' + why}")
+    log("בדיקת יוטיוב: " + " · ".join(parts))
+
+
 def serve() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=log_flusher, daemon=True).start()
     hello()
+    threading.Thread(target=youtube_selftest, daemon=True).start()
     threading.Thread(target=worker_loop, daemon=True).start()
     threading.Thread(target=keep_awake_loop, daemon=True).start()
     _wake.set()  # woke up — check the queue right away
