@@ -64,69 +64,69 @@ class VaultApi:
 
     def __init__(self, cfg: dict, tmp_dir: Path):
         from vault import Vault
-        self.cfg, self.tmp = cfg, tmp_dir
-        self.v = Vault(cfg["vault_dir"]) if cfg.get("vault_dir") else None
-        self.last = time.time()
-        self.window = None
+        self._cfg, self._tmp = cfg, tmp_dir
+        self._v = Vault(cfg["vault_dir"]) if cfg.get("vault_dir") else None
+        self._last = time.time()
+        self._window = None
         threading.Thread(target=self._auto_lock, daemon=True).start()
 
     # -- housekeeping
     def _touch(self):
-        self.last = time.time()
+        self._last = time.time()
 
     def _auto_lock(self):
         while True:
             time.sleep(30)
-            if self.v and self.v.unlocked and time.time() - self.last > AUTO_LOCK_MINUTES * 60:
+            if self._v and self._v.unlocked and time.time() - self._last > AUTO_LOCK_MINUTES * 60:
                 self.lock()
                 try:
-                    self.window.evaluate_js("locked()")
+                    self._window.evaluate_js("locked()")
                 except Exception:
                     pass
 
     def wipe_tmp(self):
         """Remove decrypted copies (a file still open in a player is skipped
         and removed next time)."""
-        if self.tmp.exists():
-            for p in sorted(self.tmp.rglob("*"), reverse=True):
+        if self._tmp.exists():
+            for p in sorted(self._tmp.rglob("*"), reverse=True):
                 try:
                     p.unlink() if p.is_file() else p.rmdir()
                 except OSError:
                     pass
 
     def _require(self):
-        if not self.v or not self.v.unlocked:
+        if not self._v or not self._v.unlocked:
             raise PermissionError("הכספת נעולה")
         self._touch()
 
     # -- API
     def info(self) -> dict:
-        return {"configured": bool(self.v), "exists": bool(self.v and self.v.exists),
-                "unlocked": bool(self.v and self.v.unlocked), "autolock": AUTO_LOCK_MINUTES}
+        return {"configured": bool(self._v), "exists": bool(self._v and self._v.exists),
+                "unlocked": bool(self._v and self._v.unlocked), "autolock": AUTO_LOCK_MINUTES}
 
     def unlock(self, password: str) -> bool:
-        ok = bool(self.v and self.v.unlock(password))
+        ok = bool(self._v and self._v.unlock(password))
         self._touch()
         return ok
 
     def lock(self) -> bool:
-        if self.v:
-            self.v.lock()
+        if self._v:
+            self._v.lock()
         self.wipe_tmp()
         return True
 
     def change_password(self, old: str, new: str) -> bool:
-        return bool(self.v and len(new) >= 6 and self.v.change_password(old, new))
+        return bool(self._v and len(new) >= 6 and self._v.change_password(old, new))
 
     def list(self) -> list:
         self._require()
-        return self.v.list()
+        return self._v.list()
 
     def play(self, eid: str) -> str:
         """Decrypt to this user's private temp folder and open in the default player."""
         self._require()
-        d = self.tmp / eid
-        path = self.v.extract(eid, d)
+        d = self._tmp / eid
+        path = self._v.extract(eid, d)
         os.startfile(str(path))
         return path.name
 
@@ -134,18 +134,18 @@ class VaultApi:
         """Decrypt the chosen files into a folder the user picks (USB stick, …)."""
         self._require()
         import webview
-        res = self.window.create_file_dialog(webview.FOLDER_DIALOG)
+        res = self._window.create_file_dialog(webview.FOLDER_DIALOG)
         if not res:
             return ""
         dest = Path(res[0] if isinstance(res, (list, tuple)) else res)
         for eid in eids:
-            self.v.extract(eid, dest)
+            self._v.extract(eid, dest)
         return str(dest)
 
     def delete(self, eids: list) -> int:
         self._require()
         for eid in eids:
-            self.v.delete(eid)
+            self._v.delete(eid)
         return len(eids)
 
     def devices(self) -> list:
@@ -164,8 +164,8 @@ class VaultApi:
         self._require()
         ok, failed = 0, []
         for eid in eids:
-            d = self.tmp / ("send-" + eid)
-            path = self.v.extract(eid, d)
+            d = self._tmp / ("send-" + eid)
+            path = self._v.extract(eid, d)
             try:
                 code, out = _ps(PS_SEND, {"YT_DEV": device, "YT_STOR": storage, "YT_SUB": sub or "Download",
                                           "YT_FILE": str(path)}, timeout=1900)
@@ -209,7 +209,7 @@ input,select{font:inherit;color:var(--text);background:var(--bg);border:1px soli
 .empty{padding:40px;text-align:center;color:var(--muted)}
 </style></head><body>
 <div class="top"><h1><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>הכספת</h1>
-<button class="btn ghost hidden" id="lockBtn" onclick="doLock()">נעל</button></div>
+<button class="btn ghost" style="display:none" id="lockBtn" onclick="doLock()">נעל</button></div>
 <div id="view"></div>
 <div class="modal" id="phone"><div class="box">
   <h3 style="margin-top:0">העברה לטלפון</h3>
@@ -285,5 +285,12 @@ async function send() {
   catch (e) { toast("שגיאה: " + e, 8000); }
   $("sendBtn").disabled = false;
 }
-window.addEventListener("pywebviewready", start);
+let STARTED = false;
+async function boot() {
+  if (STARTED || !(window.pywebview && window.pywebview.api && window.pywebview.api.info)) return;
+  STARTED = true;
+  try { await start(); } catch (e) { STARTED = false; $("view").innerHTML = '<div class="center"><p>שגיאה בפתיחת הכספת</p><p class="muted">' + esc(e) + '</p></div>'; }
+}
+window.addEventListener("pywebviewready", boot);
+const BOOT = setInterval(() => { boot(); if (STARTED) clearInterval(BOOT); }, 300);
 </script></body></html>"""

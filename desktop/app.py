@@ -203,29 +203,30 @@ async function save(){var g=function(i){return document.getElementById(i)};
  var r=await pywebview.api.save({site:g('site').value,password:g('pw').value,vault:g('usev').checked,vault_dir:g('vdir').value,
   vp1:g('vp1').value,vp2:g('vp2').value,folder:g('folder').value,old:g('old').checked});
  if(r!=='ok')g('err').textContent=r}
-window.addEventListener('pywebviewready',async function(){var d=await pywebview.api.defaults();
+var BOOTED=false;async function boot(){if(BOOTED||!(window.pywebview&&pywebview.api&&pywebview.api.defaults))return;BOOTED=true;var d=await pywebview.api.defaults();
  document.getElementById('site').value=d.site;document.getElementById('folder').value=d.folder;
- document.getElementById('vdir').value=d.vault_dir||'';if(d.vault_dir){document.getElementById('usev').checked=true;upd()}});
+ document.getElementById('vdir').value=d.vault_dir||'';if(d.vault_dir){document.getElementById('usev').checked=true;upd()}}
+window.addEventListener('pywebviewready',boot);setInterval(boot,300);
 </script></body></html>"""
 
 
 class SetupApi:
     def __init__(self, cfg: dict):
-        self.cfg = cfg
-        self.win = None
-        self.done = False
+        self._cfg = cfg
+        self._win = None
+        self._done = False
 
     def defaults(self):
-        return {"site": self.cfg.get("site") or DEFAULT_SITE, "vault_dir": self.cfg.get("vault_dir") or "",
-                "folder": self.cfg.get("folder") or str(Path.home() / "Music" / APP)}
+        return {"site": self._cfg.get("site") or DEFAULT_SITE, "vault_dir": self._cfg.get("vault_dir") or "",
+                "folder": self._cfg.get("folder") or str(Path.home() / "Music" / APP)}
 
     def pick(self):
         import webview
-        r = self.win.create_file_dialog(webview.FOLDER_DIALOG)
+        r = self._win.create_file_dialog(webview.FOLDER_DIALOG)
         return r[0] if r else ""
 
     def cancel(self):
-        self.win.destroy()
+        self._win.destroy()
 
     def save(self, d: dict):
         site = (d.get("site") or "").strip().rstrip("/")
@@ -254,12 +255,12 @@ class SetupApi:
             except Exception as e:
                 return f"אי אפשר ליצור את התיקייה: {e}"
         old = bool(d.get("old"))
-        self.cfg.update(site=site, password=d["password"], folder=folder or str(USERDATA / "files"),
+        self._cfg.update(site=site, password=d["password"], folder=folder or str(USERDATA / "files"),
                         vault_dir=vault_dir, unzip=True, include_existing=old,
                         since="" if old else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        save_user_cfg(self.cfg)
-        self.done = True
-        self.win.destroy()
+        save_user_cfg(self._cfg)
+        self._done = True
+        self._win.destroy()
         return "ok"
 
 
@@ -268,10 +269,10 @@ def setup_ui() -> int:
     per process, and the main window starts after this."""
     import webview
     api = SetupApi(load_cfg())
-    api.win = webview.create_window("הגדרת מעקב ערוצים", html=SETUP_HTML, js_api=api, width=560, height=640,
+    api._win = webview.create_window("הגדרת מעקב ערוצים", html=SETUP_HTML, js_api=api, width=560, height=640,
                                     background_color="#0e1015")
     webview.start(private_mode=True)
-    return 0 if api.done else 1
+    return 0 if api._done else 1
 
 
 def first_run_setup(cfg: dict) -> dict:
@@ -955,7 +956,7 @@ def open_vault_window(cfg: dict) -> None:
     _VAULT["api"] = api
     w = webview.create_window("הכספת — מעקב ערוצים", html=VAULT_HTML, js_api=api, width=900, height=640,
                               min_size=(420, 420), background_color="#0e1015")
-    api.window = w
+    api._window = w
 
     def closed():
         api.lock()                       # closing the vault window locks it
