@@ -150,7 +150,9 @@ def net_args() -> list[str]:
     """Route yt-dlp through Cloudflare WARP when it's running (YouTube sees a
     Cloudflare address, not Render's). The PO-token plugin passes the same
     proxy on to the token server."""
-    return ["--proxy", WARP_PROXY] if warp_up() else []
+    # --force-ipv4: WARP has IPv4 and IPv6; YouTube binds the video URL to the
+    # address that asked for it, and a v6 request + v4 download = 403.
+    return ["--proxy", WARP_PROXY, "--force-ipv4"] if warp_up() else ["--force-ipv4"]
 
 
 def pot_server() -> str:
@@ -587,10 +589,16 @@ def _handle(job: dict) -> None:
             log(f"   יוטיוב סירב ({why}) — מנסה שוב: {label}")
         r = run_ytdlp(c, vid)
         why = _refusal(r)
-        if _current.get("stopped") or not why:
+        out = r.stdout + r.stderr
+        if _current.get("stopped") or r.returncode == 0:
             if n:
                 log(f"   ✓ עבד: {label}")
             break
+        if "does not pass filter" in out or "age restricted" in out or "age-restricted" in out:
+            break                               # not YouTube refusing — no point retrying
+        if not why:                              # some other error: show it and try the next way
+            errs = [l for l in out.splitlines() if "ERROR" in l]
+            why = (errs[-1].split("ERROR:")[-1].strip()[:80] if errs else f"exit {r.returncode}")
     stopped = _current.get("stopped")
     if stopped:
         if stopped in ("cancelled", "missing"):
@@ -780,7 +788,7 @@ def youtube_selftest() -> None:
     cookies = cookies_path()
     routes = []
     if warp_up():
-        routes.append(("WARP", ["--proxy", WARP_PROXY]))
+        routes.append(("WARP", ["--proxy", WARP_PROXY, "--force-ipv4"]))
     routes.append(("ישיר", []))
     parts = []
     for name, extra in routes:
