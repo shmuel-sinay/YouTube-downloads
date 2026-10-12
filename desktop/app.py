@@ -842,7 +842,13 @@ def self_update() -> bool:
     if not getattr(sys, "frozen", False):
         return False                     # running from source — nothing to do
     exe = Path(sys.executable)
-    exe.with_suffix(".old.exe").unlink(missing_ok=True)   # leftover from last update
+    # Leftovers from earlier updates. Another user may still be running one
+    # of them (shared install) — then it's locked; just try again next time.
+    for old in exe.parent.glob("YTTracker.old*.exe"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
     mine = bundled_version()
     try:
         sha, url = latest_release()
@@ -857,7 +863,7 @@ def self_update() -> bool:
     tk.Label(root, text="מוריד גרסה חדשה של התוכנה…", padx=30, pady=24).pack()
     root.update()
     try:
-        tmp = exe.with_name(exe.stem + ".new" + (".zip" if url.endswith(".zip") else ".exe"))
+        tmp = exe.with_name(exe.stem + f".new{os.getpid()}" + (".zip" if url.endswith(".zip") else ".exe"))
         with requests.get(url, stream=True, timeout=(30, 300), headers={"User-Agent": "yt-tracker-desktop"}) as r:
             r.raise_for_status()
             with tmp.open("wb") as f:
@@ -867,11 +873,12 @@ def self_update() -> bool:
             with zipfile.ZipFile(tmp) as z:
                 data = z.read("YTTracker.exe")
             tmp.unlink()
-            tmp = exe.with_name(exe.stem + ".new.exe")
+            tmp = exe.with_name(exe.stem + f".new{os.getpid()}.exe")
             tmp.write_bytes(data)
         if tmp.stat().st_size < 5_000_000:
             raise RuntimeError("קובץ העדכון קטן מדי — כנראה נחסם")
-        exe.replace(exe.with_suffix(".old.exe"))
+        # Unique name: an older .old.exe may still be running for another user.
+        exe.replace(exe.with_name(f"YTTracker.old-{int(time.time())}.exe"))
         tmp.replace(exe)
         root.destroy()
         subprocess.Popen([str(exe)] + sys.argv[1:], close_fds=True)
@@ -880,8 +887,13 @@ def self_update() -> bool:
         root.destroy()
         with LOGFILE.open("a", encoding="utf-8") as f:
             f.write(time.strftime("%H:%M:%S ") + f"עדכון נכשל: {e}\n")
-        if not exe.exists() and exe.with_suffix(".old.exe").exists():
-            exe.with_suffix(".old.exe").replace(exe)   # put the working one back
+        if not exe.exists():                           # put the working one back
+            olds = sorted(exe.parent.glob("YTTracker.old-*.exe"))
+            if olds:
+                try:
+                    olds[-1].replace(exe)
+                except OSError:
+                    pass
         return False
 
 
@@ -900,8 +912,11 @@ def main() -> None:
         return                           # the running copy shows its window
     if install_if_needed():
         return                           # the installed copy is starting
-    if self_update():
-        return                           # the new version is starting
+    try:
+        if self_update():
+            return                       # the new version is starting
+    except Exception:
+        traceback.print_exc()            # an update problem must never stop the app
     cfg = load_json(CONFIG, {})
     if "--setup" in sys.argv or not all(cfg.get(k) for k in ("site", "password", "folder")):
         cfg = first_run_setup(cfg)
