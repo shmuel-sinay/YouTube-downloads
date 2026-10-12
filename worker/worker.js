@@ -244,6 +244,15 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       agent.info = await req.json();
       agent.started = new Date().toISOString();
       await putJSON(env, "agent", agent);
+      // A (re)started agent has lost whatever it was working on — Render's
+      // disk is wiped on every restart/deploy. Put those jobs back in line
+      // instead of leaving them "בהורדה" for hours.
+      const stuck = (await listJobs(env)).filter((j) => j.status === "taken");
+      for (const j of stuck) {
+        j.status = "queued"; j.updated = new Date().toISOString();
+        await putJSON(env, "job:" + j.videoId, j);
+      }
+      if (stuck.length) await addLog(env, "worker", `השרת עלה מחדש — ${stuck.length} משימות שהיו בהורדה חזרו לתור`);
       return json({ ok: true });
     }
     if (p === "/api/log" && req.method === "POST") {
@@ -508,7 +517,8 @@ async function dashboard(env) {
   <div class="card">
     <div class="row" style="margin:0 0 10px;justify-content:space-between">
       <span class="muted"><span style="color:var(--ok)">worker</span> = Cloudflare · <span style="color:var(--primary)">render</span> = שרת ההורדות</span>
-      <button class="btn small ghost" id="clearLogs" type="button">ניקוי</button>
+      <span><button class="btn small" id="copyLogs" type="button">📋 העתק הכל</button>
+      <button class="btn small ghost" id="clearLogs" type="button">ניקוי</button></span>
     </div>
     <div class="logs" id="logs"></div>
   </div>
@@ -609,6 +619,11 @@ $("checkBtn").onclick = async () => {
   b.disabled = false; refresh();
 };
 $("clearLogs").onclick = async () => { await fetch(B + "/logs/clear", { method: "POST" }); refresh(); };
+$("copyLogs").onclick = async () => {
+  const text = S.logs.map((l) => hhmm(l.t) + " [" + l.src + "] " + l.msg).join("\\n");
+  try { await navigator.clipboard.writeText(text); toast("✓ הועתק — אפשר להדביק"); }
+  catch (e) { const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); toast("✓ הועתק"); }
+};
 
 // Auto-download: each newly finished file is downloaded once (remembered in
 // this browser) — only files finished after the box was ticked.
