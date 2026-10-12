@@ -161,63 +161,126 @@ def icon_path() -> str:
     return str(base / "icon.ico")
 
 
-def set_tk_icon(root) -> None:
+MB_OK, MB_OKCANCEL, MB_YESNO = 0, 1, 4
+MB_ICONINFO, MB_ICONWARN, MB_ICONQUESTION = 0x40, 0x30, 0x20
+
+
+def msgbox(text: str, flags: int = MB_OK | MB_ICONINFO) -> bool:
+    """Native Windows message box (no tkinter). True for OK/Yes."""
     try:
-        root.iconbitmap(icon_path())
+        import ctypes
+        r = ctypes.windll.user32.MessageBoxW(None, text, APP, flags | 0x2000 | 0x10000 | 0x80000 | 0x100000)
+        return r in (1, 6)
     except Exception:
-        pass
+        print(text)
+        return flags & 0xF == MB_OK
+
+
+SETUP_HTML = r"""<!doctype html><html dir="rtl"><head><meta charset="utf-8"><style>
+body{font-family:Segoe UI,Arial;background:#0e1015;color:#e7e9ee;margin:0;padding:22px}
+h2{margin:0 0 14px}label{display:block;margin:12px 0 4px;color:#aab}
+input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:9px;border-radius:8px;border:1px solid #333a48;background:#171a22;color:#fff}
+.row{display:flex;gap:8px}.row input{flex:1}button{padding:9px 14px;border-radius:8px;border:0;background:#2b6cff;color:#fff;cursor:pointer}
+button.s{background:#2a2f3b}.chk{display:flex;gap:8px;align-items:center;margin-top:14px}#err{color:#ff6b6b;margin-top:10px;min-height:1em}
+.box{border:1px solid #2a2f3b;border-radius:10px;padding:10px 12px;margin-top:10px}</style></head><body>
+<h2>הגדרת התוכנה</h2>
+<label>כתובת האתר</label><input type="text" id="site">
+<label>הסיסמה שלך לאתר (הפרופיל שלך)</label><input type="password" id="pw">
+<div class="chk"><input type="checkbox" id="usev" onchange="upd()"><span>לשמור את הקבצים בכספת מוצפנת (בסייר יראו רק קבצים מקודדים)</span></div>
+<div class="box" id="vbox" style="display:none">
+<label>תיקיית הכספת</label><div class="row"><input type="text" id="vdir"><button class="s" onclick="pick('vdir')">בחר…</button></div>
+<label>סיסמה לכספת (לפחות 6 תווים; אם הכספת כבר קיימת — אין צורך)</label><input type="password" id="vp1">
+<label>שוב סיסמת הכספת</label><input type="password" id="vp2">
+</div>
+<div id="fbox"><label>תיקיית הורדות</label><div class="row"><input type="text" id="folder"><button class="s" onclick="pick('folder')">בחר…</button></div></div>
+<div class="chk"><input type="checkbox" id="old"><span>להוריד גם קבצים שכבר מוכנים עכשיו בתור</span></div>
+<div id="err"></div>
+<div style="margin-top:14px;display:flex;gap:8px"><button onclick="save()">שמירה והמשך</button><button class="s" onclick="pywebview.api.cancel()">ביטול</button></div>
+<script>
+function upd(){var v=document.getElementById('usev').checked;document.getElementById('vbox').style.display=v?'':'none';document.getElementById('fbox').style.display=v?'none':''}
+async function pick(id){var r=await pywebview.api.pick();if(r)document.getElementById(id).value=r}
+async function save(){var g=function(i){return document.getElementById(i)};
+ var r=await pywebview.api.save({site:g('site').value,password:g('pw').value,vault:g('usev').checked,vault_dir:g('vdir').value,
+  vp1:g('vp1').value,vp2:g('vp2').value,folder:g('folder').value,old:g('old').checked});
+ if(r!=='ok')g('err').textContent=r}
+window.addEventListener('pywebviewready',async function(){var d=await pywebview.api.defaults();
+ document.getElementById('site').value=d.site;document.getElementById('folder').value=d.folder;
+ document.getElementById('vdir').value=d.vault_dir||'';if(d.vault_dir){document.getElementById('usev').checked=true;upd()}});
+</script></body></html>"""
+
+
+class SetupApi:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.win = None
+        self.done = False
+
+    def defaults(self):
+        return {"site": self.cfg.get("site") or DEFAULT_SITE, "vault_dir": self.cfg.get("vault_dir") or "",
+                "folder": self.cfg.get("folder") or str(Path.home() / "Music" / APP)}
+
+    def pick(self):
+        import webview
+        r = self.win.create_file_dialog(webview.FOLDER_DIALOG)
+        return r[0] if r else ""
+
+    def cancel(self):
+        self.win.destroy()
+
+    def save(self, d: dict):
+        site = (d.get("site") or "").strip().rstrip("/")
+        if not site.startswith("http"):
+            return "כתובת אתר לא תקינה"
+        if not d.get("password"):
+            return "חסרה סיסמה לאתר"
+        vault_dir, folder = "", ""
+        if d.get("vault"):
+            vault_dir = (d.get("vault_dir") or "").strip()
+            if not vault_dir:
+                return "בחר תיקייה לכספת"
+            from vault import Vault
+            v = Vault(vault_dir)
+            if not v.exists:
+                if d.get("vp1") != d.get("vp2") or len(d.get("vp1") or "") < 6:
+                    return "סיסמאות הכספת לא זהות או קצרות מדי"
+                try:
+                    v.create(d["vp1"])
+                except Exception as e:
+                    return f"יצירת הכספת נכשלה: {e}"
+        else:
+            folder = (d.get("folder") or "").strip() or str(Path.home() / "Music" / APP)
+            try:
+                Path(folder).mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                return f"אי אפשר ליצור את התיקייה: {e}"
+        old = bool(d.get("old"))
+        self.cfg.update(site=site, password=d["password"], folder=folder or str(USERDATA / "files"),
+                        vault_dir=vault_dir, unzip=True, include_existing=old,
+                        since="" if old else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        save_user_cfg(self.cfg)
+        self.done = True
+        self.win.destroy()
+        return "ok"
+
+
+def setup_ui() -> int:
+    """Runs in its own process (--setup-ui): pywebview can start only once
+    per process, and the main window starts after this."""
+    import webview
+    api = SetupApi(load_cfg())
+    api.win = webview.create_window("הגדרת מעקב ערוצים", html=SETUP_HTML, js_api=api, width=560, height=640,
+                                    background_color="#0e1015")
+    webview.start(private_mode=True)
+    return 0 if api.done else 1
 
 
 def first_run_setup(cfg: dict) -> dict:
     """Per Windows user: which profile (by its password), where files go,
     and whether to keep them in an encrypted vault."""
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, simpledialog
-
-    root = tk.Tk()
-    set_tk_icon(root)
-    root.withdraw()
-    site = simpledialog.askstring(APP, "כתובת האתר:", initialvalue=cfg.get("site") or DEFAULT_SITE, parent=root)
-    if not site:
+    cmd = [sys.executable, "--setup-ui"] if getattr(sys, "frozen", False) else [sys.executable, __file__, "--setup-ui"]
+    if subprocess.run(cmd).returncode != 0:
         sys.exit(0)
-    password = simpledialog.askstring(APP, "הסיסמה שלך לאתר (הפרופיל שלך):\n"
-                                      "התוכנה תוריד רק את מה שבפרופיל הזה.", show="*", parent=root)
-    if not password:
-        sys.exit(0)
-    vault_dir = ""
-    if messagebox.askyesno(APP, "לשמור את הקבצים שלך בכספת מוצפנת?\n\n"
-                           "בסייר של Windows יראו רק קבצים מקודדים בלי שמות, "
-                           "ופותחים אותם רק בתוכנה עם סיסמה.", parent=root):
-        messagebox.showinfo(APP, "בחר תיקייה ריקה לכספת.", parent=root)
-        vault_dir = filedialog.askdirectory(title="תיקיית הכספת", initialdir=str(Path.home()), parent=root)
-        if vault_dir:
-            from vault import Vault
-            v = Vault(vault_dir)
-            if not v.exists:
-                while True:
-                    p1 = simpledialog.askstring(APP, "בחר סיסמה לכספת (לפחות 6 תווים):", show="*", parent=root)
-                    if not p1:
-                        vault_dir = ""
-                        break
-                    p2 = simpledialog.askstring(APP, "הקלד שוב את סיסמת הכספת:", show="*", parent=root)
-                    if p1 == p2 and len(p1) >= 6:
-                        v.create(p1)
-                        messagebox.showinfo(APP, "הכספת נוצרה. אין דרך לשחזר את הסיסמה אם תישכח — שמור אותה.", parent=root)
-                        break
-                    messagebox.showwarning(APP, "הסיסמאות לא זהות או קצרות מדי.", parent=root)
-    folder = cfg.get("folder") or ""
-    if not vault_dir:
-        messagebox.showinfo(APP, "בחר תיקייה שאליה יירדו הקבצים.", parent=root)
-        default = Path.home() / "Music" / APP
-        default.mkdir(parents=True, exist_ok=True)
-        folder = filedialog.askdirectory(title="תיקיית הורדות", initialdir=str(default), parent=root) or str(default)
-    old = messagebox.askyesno(APP, "להוריד גם קבצים שכבר מוכנים עכשיו בתור?\n(לא = רק מה שיסתיים מעכשיו)", parent=root)
-    root.destroy()
-    cfg.update(site=site.rstrip("/"), password=password, folder=folder or str(USERDATA / "files"),
-               vault_dir=vault_dir, unzip=True, include_existing=old,
-               since="" if old else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    save_user_cfg(cfg)
-    return cfg
+    return load_cfg()
 
 
 # ---------------------------------------------------------------- downloader
@@ -590,9 +653,18 @@ def _old_per_user_cleanup() -> None:
 
 
 def do_install(src: Path) -> int:
+    try:
+        return _do_install(src)
+    except Exception:
+        (DATA / "install-error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        return 1
+
+
+def _do_install(src: Path) -> int:
     """Runs elevated (--install-elevated): copy, permissions, shortcuts,
     Apps & features, autostart for everyone."""
     import winreg
+    (DATA / "install-error.txt").unlink(missing_ok=True)
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     target = INSTALL_DIR / "YTTracker.exe"
     shutil.copy2(src, target)
@@ -616,6 +688,23 @@ def do_install(src: Path) -> int:
     return 0
 
 
+def close_other_copies() -> None:
+    """A freshly downloaded copy is about to install: close older copies of
+    the app running for this user (e.g. an old version in the tray), or they
+    would 'answer' instead and the new version would never install. The
+    PyInstaller launcher is our parent process — keep it."""
+    script = ("Get-Process -Name YTTracker -ErrorAction SilentlyContinue | "
+              f"Where-Object {{ $_.Id -ne {os.getpid()} -and $_.Id -ne {os.getppid()} -and $_.SessionId -eq (Get-Process -Id {os.getpid()}).SessionId }} | "
+              "Stop-Process -Force -ErrorAction SilentlyContinue")
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                   capture_output=True, creationflags=NO_WINDOW, timeout=30)
+    time.sleep(1)
+
+
+def is_installed_copy() -> bool:
+    return getattr(sys, "frozen", False) and Path(sys.executable).resolve().parent == INSTALL_DIR.resolve()
+
+
 def install_if_needed() -> bool:
     """Not running from the shared install yet: ask for administrator rights
     once, install for all users, then start the installed copy. Returns True
@@ -630,23 +719,19 @@ def install_if_needed() -> bool:
         except Exception:
             pass
         return False                      # already the installed copy
-    import tkinter as tk
-    from tkinter import messagebox
-    r = tk.Tk(); set_tk_icon(r); r.withdraw()
-    if not messagebox.askokcancel(APP, "התוכנה תותקן לכל המשתמשים במחשב.\n"
-                                  "Windows יבקש אישור מנהל — לחץ \"כן\".", parent=r):
-        r.destroy()
+    if not msgbox("התוכנה תותקן לכל המשתמשים במחשב.\n"
+                  "Windows יבקש אישור מנהל — לחץ \"כן\".", MB_OKCANCEL | MB_ICONINFO):
         return False                      # run from here this time
-    auto = messagebox.askyesno(APP, "להפעיל את התוכנה אוטומטית עם Windows לכל המשתמשים?\n"
-                               "(היא תרוץ ברקע ותוריד גם כשהחלון סגור)", parent=r)
-    r.destroy()
+    auto = msgbox("להפעיל את התוכנה אוטומטית עם Windows לכל המשתמשים?\n"
+                  "(היא תרוץ ברקע ותוריד גם כשהחלון סגור)", MB_YESNO | MB_ICONQUESTION)
     args = ["--install-elevated", str(exe)] + (["--autostart"] if auto else [])
     ok = do_install(exe) == 0 if is_admin() else run_elevated(args)
     if not ok or not target.exists():
-        r = tk.Tk(); set_tk_icon(r); r.withdraw()
-        messagebox.showwarning(APP, "ההתקנה לא הושלמה (לא אושרה הרשאת מנהל). התוכנה תרוץ מהמקום הנוכחי.", parent=r)
-        r.destroy()
+        err = DATA / "install-error.txt"
+        why = err.read_text(encoding="utf-8").strip().splitlines()[-1] if err.exists() else "לא אושרה הרשאת מנהל"
+        msgbox(f"ההתקנה לא הושלמה:\n{why}\n\nהתוכנה תרוץ מהמקום הנוכחי.", MB_OK | MB_ICONWARN)
         return False
+    msgbox("התוכנה הותקנה לכל המשתמשים.\nיש קיצור \"מעקב ערוצים\" בשולחן העבודה ובתפריט התחל.")
     subprocess.Popen([str(target)], close_fds=True)
     return True
 
@@ -656,11 +741,8 @@ def uninstall() -> None:
     if not is_admin():
         run_elevated(["--uninstall"])
         return
-    import tkinter as tk
     import winreg
-    from tkinter import messagebox
-    r = tk.Tk(); set_tk_icon(r); r.withdraw()
-    if not messagebox.askyesno(APP, "להסיר את התוכנה מהמחשב (לכל המשתמשים)?\n(הקבצים שהורדו לא יימחקו)", parent=r):
+    if not msgbox("להסיר את התוכנה מהמחשב (לכל המשתמשים)?\n(הקבצים שהורדו לא יימחקו)", MB_YESNO | MB_ICONQUESTION):
         return
     try:
         _set_autostart_machine(False)
@@ -675,7 +757,7 @@ def uninstall() -> None:
     # A running exe can't delete itself: let cmd remove the folder after we exit.
     subprocess.Popen(f'cmd /c timeout /t 2 /nobreak >nul & rmdir /s /q "{INSTALL_DIR}"', shell=True,
                      creationflags=NO_WINDOW)
-    messagebox.showinfo(APP, "התוכנה הוסרה.", parent=r)
+    msgbox("התוכנה הוסרה.")
 
 
 # ---------------------------------------------------------------- autostart (all users)
@@ -1009,12 +1091,6 @@ def self_update() -> bool:
         return False                     # offline / blocked — try next time
     if not sha or not url or not mine or sha.startswith(mine) or mine.startswith(sha):
         return False
-    import tkinter as tk
-    root = tk.Tk()
-    set_tk_icon(root)
-    root.title(APP)
-    tk.Label(root, text="מוריד גרסה חדשה של התוכנה…", padx=30, pady=24).pack()
-    root.update()
     try:
         tmp = exe.with_name(exe.stem + f".new{os.getpid()}" + (".zip" if url.endswith(".zip") else ".exe"))
         with requests.get(url, stream=True, timeout=(30, 300), headers={"User-Agent": "yt-tracker-desktop"}) as r:
@@ -1033,11 +1109,9 @@ def self_update() -> bool:
         # Unique name: an older .old.exe may still be running for another user.
         exe.replace(exe.with_name(f"YTTracker.old-{int(time.time())}.exe"))
         tmp.replace(exe)
-        root.destroy()
         subprocess.Popen([str(exe)] + sys.argv[1:], close_fds=True)
         return True
     except Exception as e:
-        root.destroy()
         with LOGFILE.open("a", encoding="utf-8") as f:
             f.write(time.strftime("%H:%M:%S ") + f"עדכון נכשל: {e}\n")
         if not exe.exists():                           # put the working one back
@@ -1061,6 +1135,10 @@ def main() -> None:
         sys.exit(0)
     if "--uninstall" in sys.argv:
         return uninstall()
+    if "--setup-ui" in sys.argv:                  # first-run settings window (own process)
+        sys.exit(setup_ui())
+    if getattr(sys, "frozen", False) and not is_installed_copy():
+        close_other_copies()             # old versions would block installing
     if already_running():
         return                           # the running copy shows its window
     if install_if_needed():

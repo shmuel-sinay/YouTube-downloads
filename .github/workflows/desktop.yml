@@ -37,7 +37,7 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --name YTTracker
           --icon desktop/icon.ico --add-data "desktop/icon.ico;."
           --add-data "desktop/version.txt;."
-          --collect-all imageio_ffmpeg --collect-all webview --hidden-import pystray._win32 --hidden-import vault --hidden-import vault_ui --paths desktop
+          --collect-all imageio_ffmpeg --collect-all webview --hidden-import pystray._win32 --hidden-import vault --hidden-import vault_ui --exclude-module tkinter --paths desktop
           desktop/app.py
 
       - name: Zip it too (some filters block .exe downloads)
