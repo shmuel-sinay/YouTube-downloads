@@ -192,6 +192,11 @@ async function route(req, env, ctx) {
   }
   const p = url.pathname.slice(BASE.length) || "/";
   const wake = () => ctx.waitUntil(wakeAgent(env));
+  if (!env.DB) {
+    return page("הגדרה חסרה", `<p>חסר חיבור למסד נתונים (KV) בשם <b>DB</b>.</p>
+<p>ב-Cloudflare: <b>Workers & Pages ← my-gemini ← Settings ← Bindings ← Add ← KV namespace</b>,
+Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Storage & databases ← Workers KV ← Create). אחר כך מרעננים.</p>`);
+  }
 
   // --- agent API ---
   if (p.startsWith("/api/")) {
