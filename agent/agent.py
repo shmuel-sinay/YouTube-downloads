@@ -65,6 +65,54 @@ def cookies_path() -> str | None:
     return str(dst)
 
 
+_log_buf: list[str] = []
+_log_lock = threading.Lock()
+
+
+def log(msg: str) -> None:
+    """Print, and queue the line for the Worker's log page."""
+    print(msg, flush=True)
+    with _log_lock:
+        _log_buf.append(time.strftime("%H:%M:%S ") + str(msg)[:400])
+        del _log_buf[:-200]
+
+
+def flush_logs() -> None:
+    with _log_lock:
+        lines = _log_buf[:]
+        _log_buf.clear()
+    if not lines:
+        return
+    try:
+        api("/api/log", {"lines": lines})
+    except Exception as e:
+        print(f"[!] log upload failed: {e}", flush=True)
+
+
+def log_flusher() -> None:
+    while True:
+        time.sleep(15)
+        flush_logs()
+
+
+def hello() -> None:
+    """Tell the Worker who we are and what we have — shown on the site."""
+    def ver(cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip().splitlines()[0]
+        except Exception:
+            return "חסר"
+    info = {"ytdlp": ver(["yt-dlp", "--version"]), "node": ver(["node", "--version"]),
+            "ffmpeg": ver(["ffmpeg", "-version"])[:40], "cookies": bool(cookies_path()),
+            "mode": "render" if PORT else "loop", "public": PUBLIC_URL}
+    try:
+        api("/api/hello", info)
+    except Exception as e:
+        print(f"[!] hello failed (TRACKER_URL / AGENT_TOKEN?): {e}", flush=True)
+    log(f"סוכן עלה: yt-dlp {info['ytdlp']}, node {info['node']}, "
+        f"עוגיות {'יש' if info['cookies'] else 'אין!'}")
+
+
 def api(path: str, body: dict | None = None) -> dict:
     req = urllib.request.Request(
         TRACKER + path, method="POST",
@@ -119,7 +167,7 @@ def upload_r2(path: Path) -> str | None:
 
 
 def handle(job: dict) -> None:
-    print(f"-> {job['title']} ({job['url']})", flush=True)
+    log(f"-> מוריד: {job['title']} ({job['url']})")
     OUT.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(ytdlp_cmd(job, OUT), capture_output=True, text=True)
     files = [Path(l.strip()) for l in r.stdout.splitlines()
@@ -129,7 +177,7 @@ def handle(job: dict) -> None:
         try:
             url = upload_r2(f) or ""
         except Exception as e:  # keep the local file, still report success
-            print(f"   R2 upload failed: {e}", flush=True)
+            log(f"   R2 upload failed: {e}")
             url = ""
         if not url and PORT and PUBLIC_URL:
             url = (f"{PUBLIC_URL}/files/{urllib.parse.quote(f.name)}"
@@ -139,7 +187,7 @@ def handle(job: dict) -> None:
             note = f"זמני — להוריד בתוך כמה שעות"
         api("/api/report", {"videoId": job["videoId"], "status": "done",
                             "fileUrl": url, "fileName": f.name, "error": note})
-        print(f"   ok: {f.name}", flush=True)
+        log(f"   ok: {f.name}")
         return
     out = r.stdout + r.stderr
     if "does not pass filter" in out:
@@ -149,8 +197,10 @@ def handle(job: dict) -> None:
     else:
         errs = [l for l in out.splitlines() if "ERROR" in l or "error" in l]
         status, err = "failed", (errs[-1] if errs else f"yt-dlp exit {r.returncode}")
+        for l in (errs[-4:-1] if len(errs) > 1 else []):
+            log(f"   {l}")
     api("/api/report", {"videoId": job["videoId"], "status": status, "error": err})
-    print(f"   {status}: {err}", flush=True)
+    log(f"   {status}: {err}")
 
 
 def run_queue() -> int:
@@ -164,12 +214,13 @@ def run_queue() -> int:
             try:
                 handle(job)
             except Exception as e:
-                print(f"[!] {job.get('videoId')}: {e}", flush=True)
+                log(f"[!] {job.get('videoId')}: {e}")
                 try:
                     api("/api/report", {"videoId": job["videoId"], "status": "failed", "error": str(e)[:200]})
                 except Exception:
                     pass
             done += 1
+            flush_logs()
 
 
 # ---------- Render (web service) mode ----------
@@ -194,9 +245,9 @@ def worker_loop() -> None:
             cleanup_old_files()
             n = run_queue()
             if n:
-                print(f"pass done: {n} job(s)", flush=True)
+                log(f"pass done: {n} job(s)")
         except Exception as e:
-            print(f"[!] {e}", flush=True)
+            log(f"[!] {e}")
         finally:
             _busy.clear()
 
@@ -225,6 +276,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path.startswith("/wake"):
+            if not _busy.is_set():
+                log("קיבלתי קריאת השכמה — בודק את התור")
             _wake.set()
             return self._send(200, "ok")
         self._send(404, "not found")
@@ -253,17 +306,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._send(404, "not found")
 
+    def do_HEAD(self):
+        # Render probes the port with HEAD; answer like GET / without a body.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+
     def log_message(self, fmt, *args):
-        if "/ping" not in (args[0] if args else ""):
-            print("http:", fmt % args, flush=True)
+        line = fmt % args
+        if "/ping" not in line and "/healthz" not in line and "HEAD " not in line:
+            print("http:", line, flush=True)
 
 
 def serve() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=log_flusher, daemon=True).start()
+    hello()
     threading.Thread(target=worker_loop, daemon=True).start()
     threading.Thread(target=keep_awake_loop, daemon=True).start()
     _wake.set()  # woke up — check the queue right away
-    print(f"listening on :{PORT} (public: {PUBLIC_URL or '?'})", flush=True)
+    log(f"listening on :{PORT} (public: {PUBLIC_URL or '?'})")
     http.server.ThreadingHTTPServer(("0.0.0.0", int(PORT)), Handler).serve_forever()
     return 0
 
@@ -273,15 +335,13 @@ def main() -> int:
         sys.exit("Set TRACKER_URL and AGENT_TOKEN (see agent.env.example).")
     if PORT:
         return serve()
+    hello()
     while True:
         try:
-            jobs = api("/api/next?limit=3").get("jobs", [])
-            for job in jobs:
-                handle(job)
-            if jobs:
-                continue  # more may be waiting — ask again right away
+            run_queue()
         except Exception as e:
-            print(f"[!] {e}", flush=True)
+            log(f"[!] {e}")
+        flush_logs()
         if POLL <= 0:
             return 0
         time.sleep(POLL)

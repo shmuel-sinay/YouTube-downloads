@@ -144,19 +144,41 @@ async function checkAllChannels(env) {
     catch (e) { errors.push(ch.name + ": " + e.message); }
   }
   await putJSON(env, "lastCheck", { at: new Date().toISOString(), added, errors });
+  await addLog(env, "worker", `בדיקת ערוצים: ${channels.length} ערוצים, נוספו ${added} לתור` +
+    (errors.length ? ` · שגיאות: ${errors.join(" | ")}` : ""));
   return { added, errors };
 }
+
+// ---------- log (shown on the site's "לוגים" tab) ----------
+
+const LOG_CAP = 200;
+async function addLogs(env, src, lines) {
+  if (!lines.length) return;
+  const logs = await getJSON(env, "logs", []);
+  const t = new Date().toISOString();
+  for (const msg of lines) logs.push({ t, src, msg: String(msg).slice(0, 500) });
+  await putJSON(env, "logs", logs.slice(-LOG_CAP));
+}
+const addLog = (env, src, msg) => addLogs(env, src, [msg]);
 
 // Render's free plan sleeps after ~15 min without traffic; any request wakes
 // it. The agent then works through the queue and keeps itself awake.
 async function wakeAgent(env) {
-  if (!env.RENDER_URL) return "RENDER_URL לא מוגדר";
+  if (!env.RENDER_URL) return "RENDER_URL לא מוגדר ב-Cloudflare";
+  let res;
   try {
     const r = await fetch(env.RENDER_URL.replace(/\/$/, "") + "/wake", { method: "POST" });
-    return r.ok ? "ok" : "HTTP " + r.status;
+    const body = (await r.text()).trim();
+    // Our agent answers exactly "ok". Anything else is some other app (old
+    // code still deployed, a failed build, Render's own error page…).
+    res = r.ok && body === "ok" ? "ok"
+      : r.ok ? "השרת ענה, אבל לא כמו סוכן ההורדות — כנראה ב-Render עדיין רץ קוד ישן או שהבנייה נכשלה"
+      : `HTTP ${r.status} מ-Render`;
   } catch (e) {
-    return String(e.message || e);
+    res = "אין תשובה מ-Render: " + (e.message || e);
   }
+  await addLog(env, "worker", "השכמת שרת ההורדות: " + (res === "ok" ? "✓ ענה" : res));
+  return res;
 }
 
 // ---------- auth ----------
@@ -200,7 +222,26 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
 
   // --- agent API ---
   if (p.startsWith("/api/")) {
-    if (!isAgent(req, env)) return json({ error: "unauthorized" }, 401);
+    if (!isAgent(req, env)) {
+      await addLog(env, "worker", "⚠ הסוכן ניסה להתחבר עם AGENT_TOKEN שגוי (צריך להיות זהה ב-Cloudflare וב-Render)");
+      return json({ error: "unauthorized" }, 401);
+    }
+    const agent = await getJSON(env, "agent", {});
+    if (!agent.seen || Date.now() - Date.parse(agent.seen) > 60000) {
+      agent.seen = new Date().toISOString();
+      await putJSON(env, "agent", agent);
+    }
+    if (p === "/api/hello" && req.method === "POST") {
+      agent.info = await req.json();
+      agent.started = new Date().toISOString();
+      await putJSON(env, "agent", agent);
+      return json({ ok: true });
+    }
+    if (p === "/api/log" && req.method === "POST") {
+      const b = await req.json();
+      await addLogs(env, "render", (b.lines || []).slice(-100));
+      return json({ ok: true });
+    }
     if (p === "/api/next" && req.method === "POST") {
       const limit = Math.min(+(url.searchParams.get("limit") || 3), 20);
       const now = Date.now();
@@ -213,6 +254,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         out.push(j);
         if (out.length >= limit) break;
       }
+      if (out.length) await addLog(env, "worker", `הסוכן לקח ${out.length} משימות: ` + out.map((j) => j.title).join(" | "));
       return json({ jobs: out });
     }
     if (p === "/api/report" && req.method === "POST") {
@@ -225,6 +267,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         updated: new Date().toISOString(),
       });
       await putJSON(env, "job:" + j.videoId, j);
+      await addLog(env, "worker", `${STATUS[j.status] || j.status}: ${j.title}` + (j.error ? ` — ${j.error}` : ""));
       return json({ ok: true });
     }
     return json({ error: "not found" }, 404);
@@ -261,6 +304,10 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   if (p === "/wake" && req.method === "POST") {
     return json({ result: await wakeAgent(env) });
   }
+  if (p === "/logs/clear" && req.method === "POST") {
+    await putJSON(env, "logs", []);
+    return json({ ok: true });
+  }
   if (req.method === "POST") {
     const f = await req.formData();
     if (p === "/channels/add") {
@@ -281,6 +328,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         const take = entries.filter((e) => !(ch.skipShorts && e.isShort)).slice(0, backfill);
         await addJobs(env, take.map((e) => jobFor(ch, e)));
         await putJSON(env, "seen:" + id, entries.map((e) => e.videoId));
+        await addLog(env, "worker", `נוסף ערוץ: ${name}` + (take.length ? ` (${take.length} סרטונים לתור)` : ""));
         if (take.length) wake();
       }
       return redirect(BASE + "/");
@@ -314,11 +362,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     }
   }
 
-  if (p === "/status") {
-    const jobs = (await listJobs(env)).slice(0, 100)
-      .map(({ videoId, title, status, fileUrl, fileName, updated }) => ({ videoId, title, status, fileUrl, fileName, updated }));
-    return json({ jobs });
-  }
+  if (p === "/status") return json(await state(env));
   if (p === "/") return page("מעקב ערוצים", await dashboard(env));
   return new Response("Not found", { status: 404 });
 }
@@ -327,99 +371,260 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+const STATUS = { queued: "ממתין", taken: "בהורדה", done: "ירד ✓", failed: "נכשל", skipped: "דולג" };
+
+// Everything the page shows — also polled by the page every few seconds.
+async function state(env) {
+  const [channels, jobs, logs, agent, lastCheck] = await Promise.all([
+    getChannels(env), listJobs(env), getJSON(env, "logs", []),
+    getJSON(env, "agent", {}), getJSON(env, "lastCheck", null)]);
+  return { channels, jobs: jobs.slice(0, 150), logs: logs.slice(-LOG_CAP), agent, lastCheck,
+           renderUrl: env.RENDER_URL || "", now: new Date().toISOString() };
+}
+
+const CSS = `
+:root{--bg:#131314;--panel:#1e1f20;--panel2:#26272a;--line:#3a3b3d;--text:#e3e3e3;--muted:#9aa0a6;
+--primary:#8ab4f8;--ok:#81c995;--warn:#fdd663;--bad:#f28b82;--radius:14px}
+*{box-sizing:border-box}
+body{margin:0;font-family:Rubik,system-ui,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:15px}
+a{color:var(--primary)}
+.wrap{max-width:980px;margin:0 auto;padding:16px}
+header.top{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+header.top h1{margin:0;font-size:1.35rem;color:var(--primary)}
+.btn{font:inherit;border:0;border-radius:999px;padding:8px 16px;cursor:pointer;background:var(--primary);color:#202124;font-weight:600;text-decoration:none;display:inline-block}
+.btn.ghost{background:transparent;color:var(--primary);border:1px solid var(--line)}
+.btn.small{padding:4px 12px;font-size:.85rem}
+.btn:disabled{opacity:.5;cursor:wait}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px;margin-bottom:14px}
+.status-bar{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:999px;background:var(--panel2);font-size:.85rem;color:var(--muted)}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted)}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
+.tabs{display:flex;gap:6px;margin:6px 0 14px;flex-wrap:wrap}
+.tab{background:transparent;border:1px solid var(--line);color:var(--muted);border-radius:999px;padding:7px 16px;cursor:pointer;font:inherit}
+.tab.on{background:var(--primary);color:#202124;border-color:var(--primary);font-weight:600}
+.hidden{display:none!important}
+input,select{font:inherit;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+input:focus,select:focus{outline:none;border-color:var(--primary)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.grow{flex:1;min-width:200px}
+.muted{color:var(--muted);font-size:.85rem}
+.job{display:flex;gap:12px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)}
+.job:last-child{border-bottom:0}
+.thumb{width:96px;height:54px;border-radius:8px;object-fit:cover;background:var(--panel2);flex:none}
+.job .info{flex:1;min-width:0}
+.job .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chip{font-size:.8rem;padding:3px 10px;border-radius:999px;background:var(--panel2);white-space:nowrap}
+.chip.done{color:var(--ok)}.chip.failed{color:var(--bad)}.chip.queued,.chip.taken{color:var(--warn)}.chip.skipped{color:var(--muted)}
+.err{color:var(--bad);font-size:.8rem;margin-top:2px;word-break:break-word}
+.ch{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);gap:10px}
+.ch:last-child{border-bottom:0}
+.logs{font-family:ui-monospace,Consolas,monospace;font-size:.82rem;direction:ltr;text-align:left;background:#0d0d0e;border-radius:10px;padding:10px;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.logs .l{padding:2px 0;border-bottom:1px solid #1b1b1d}
+.logs .t{color:var(--muted)}.logs .s-render{color:var(--primary)}.logs .s-worker{color:var(--ok)}
+.logs .bad{color:var(--bad)}
+#toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);padding:10px 16px;border-radius:12px;display:none;max-width:90%}
+.login{max-width:380px;margin:12vh auto;text-align:center}
+.logs .m{unicode-bidi:isolate}
+@media (max-width:600px){.job{flex-wrap:wrap}.job .info{flex-basis:calc(100% - 100px)}.thumb{width:80px;height:45px}
+.job .chip{margin-inline-start:92px}}
+.login input{width:100%;margin:14px 0}
+`;
+
 function page(title, body) {
   return new Response(`<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>
-<style>
-body{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:0 auto;padding:16px;background:#f6f7f9;color:#222}
-h1{font-size:1.4em}h2{font-size:1.1em;margin-top:28px}
-.card{background:#fff;border-radius:10px;padding:14px;margin:10px 0;box-shadow:0 1px 3px #0001}
-input,select,button{font:inherit;padding:6px 8px;margin:3px 0}
-button{cursor:pointer;border:0;border-radius:6px;background:#2563eb;color:#fff}
-button.gray{background:#888}table{width:100%;border-collapse:collapse;font-size:.92em}
-td,th{padding:6px;border-bottom:1px solid #eee;text-align:right;vertical-align:top}
-.s-done{color:#15803d}.s-failed{color:#b91c1c}.s-queued,.s-taken{color:#a16207}.muted{color:#777;font-size:.85em}
-</style></head><body>${body}</body></html>`, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;700&display=swap" rel="stylesheet">
+<style>${CSS}</style></head><body><div class="wrap">${body}</div></body></html>`,
+    { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
 function loginForm(msg) {
-  return `<h1>מעקב ערוצים</h1><form class="card" method="post" action="${BASE}/login">
-${msg ? `<p style="color:#b91c1c">${esc(msg)}</p>` : ""}
-<input type="password" name="password" placeholder="סיסמה" autofocus> <button>כניסה</button></form>`;
+  return `<form class="card login" method="post" action="${BASE}/login">
+<h2 style="color:var(--primary);margin-top:0">📺 מעקב ערוצים</h2>
+${msg ? `<p style="color:var(--bad)">${esc(msg)}</p>` : ""}
+<input type="password" name="password" placeholder="סיסמה" autofocus>
+<button class="btn" style="width:100%">כניסה</button>
+<p><a href="/">💬 מעבר ל-Gemini</a></p></form>`;
 }
-
-const STATUS = { queued: "ממתין", taken: "בהורדה", done: "ירד ✓", failed: "נכשל", skipped: "דולג" };
 
 async function dashboard(env) {
-  const channels = await getChannels(env);
-  const jobs = await listJobs(env);
-  const last = await getJSON(env, "lastCheck", null);
-  const chRows = channels.map((c) => `<tr><td><a href="https://www.youtube.com/channel/${esc(c.id)}" target="_blank">${esc(c.name)}</a></td>
-<td>${c.mode === "video" ? "סרטון" : "שיר"}</td><td>${c.minMinutes ? c.minMinutes + " דק׳+" : "—"}</td><td>${c.skipShorts ? "בלי" : "עם"}</td>
-<td><form method="post" action="${BASE}/channels/remove" onsubmit="return confirm('להסיר?')"><input type="hidden" name="id" value="${esc(c.id)}"><button class="gray">הסר</button></form></td></tr>`).join("");
-  const jobRows = jobs.slice(0, 100).map((j) => `<tr><td>${esc(j.title)}<div class="muted">${esc(j.channelName)} · ${esc((j.published || "").slice(0, 10))}</div></td>
-<td class="s-${esc(j.status)}">${STATUS[j.status] || esc(j.status)}${j.error ? `<div class="muted">${esc(j.error)}</div>` : ""}</td>
-<td>${j.fileUrl ? `<a href="${esc(j.fileUrl)}">הורדה</a>` : ""}
-${["failed", "skipped"].includes(j.status) ? `<form method="post" action="${BASE}/jobs/retry"><input type="hidden" name="id" value="${esc(j.videoId)}"><button class="gray">שוב</button></form>` : ""}</td></tr>`).join("");
-  return `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-<h1>📺 מעקב ערוצים</h1><a href="/"><button class="gray" type="button">💬 מעבר ל-Gemini</button></a></div>
-<div class="card"><button type="button" onclick="wakeAgent(this)">⏰ הער את שרת ההורדות</button>
-<span id="wakeRes" class="muted"></span>
-<label style="display:block;margin-top:8px"><input type="checkbox" id="autoDl"> הורדה אוטומטית למחשב (כשהדף פתוח)</label>
-<div class="muted">קבצים בשרת Render נמחקים כשהוא נרדם — לכן כדאי להשאיר את הדף פתוח עם הורדה אוטומטית. בפעם הראשונה הדפדפן ישאל אם לאשר הורדה של כמה קבצים — לאשר.</div></div>
-<div class="card"><b>הוספת ערוץ</b><form method="post" action="${BASE}/channels/add">
-<input name="channel" placeholder="קישור לערוץ / @handle / UC…" required style="width:100%">
-<select name="mode"><option value="audio">שיר (MP3)</option><option value="video">סרטון (MP4)</option></select>
-אורך מינימלי (דקות): <input name="minMinutes" type="number" min="0" value="0" style="width:70px">
-<label><input type="checkbox" name="skipShorts" checked> בלי Shorts</label>
-להוריד עכשיו את האחרונים: <input name="backfill" type="number" min="0" max="15" value="0" style="width:60px">
-<button>הוסף</button></form></div>
-<div class="card"><b>הורדה חד-פעמית</b><form method="post" action="${BASE}/jobs/add">
-<input name="url" placeholder="קישור לסרטון ביוטיוב" required style="width:60%">
-<select name="mode"><option value="audio">שיר</option><option value="video">סרטון</option></select> <button>הוסף לתור</button></form></div>
-<h2>ערוצים (${channels.length})</h2>
-<div class="card"><table><tr><th>ערוץ</th><th>סוג</th><th>אורך</th><th>Shorts</th><th></th></tr>${chRows || '<tr><td colspan="5">עוד אין ערוצים</td></tr>'}</table>
-<form method="post" action="${BASE}/check"><button>בדוק עכשיו</button></form>
-<div class="muted">בדיקה אחרונה: ${last ? esc(last.at.replace("T", " ").slice(0, 16)) + " UTC · נוספו " + last.added + (last.errors.length ? " · שגיאות: " + esc(last.errors.join(" | ")) : "") : "עוד לא"}</div></div>
-<h2>תור והורדות</h2><div class="card"><table><tr><th>סרטון</th><th>מצב</th><th></th></tr>${jobRows || '<tr><td colspan="3">ריק</td></tr>'}</table></div>
+  const initial = JSON.stringify(await state(env)).replace(/</g, "\\u003c");
+  return `
+<header class="top"><h1>📺 מעקב ערוצים</h1><a class="btn ghost" href="/">💬 מעבר ל-Gemini</a></header>
+
+<div class="card status-bar">
+  <span class="pill"><span class="dot" id="agentDot"></span><span id="agentText">…</span></span>
+  <span class="pill" id="checkText">…</span>
+  <button class="btn small" id="wakeBtn" type="button">⏰ הער את שרת ההורדות</button>
+  <label class="pill" style="cursor:pointer"><input type="checkbox" id="autoDl" style="margin:0"> הורדה אוטומטית למחשב</label>
+</div>
+
+<div class="tabs">
+  <button class="tab on" data-tab="queue">📥 תור והורדות <span id="qCount"></span></button>
+  <button class="tab" data-tab="channels">📡 ערוצים <span id="cCount"></span></button>
+  <button class="tab" data-tab="add">➕ הוספה</button>
+  <button class="tab" data-tab="logs">📜 לוגים</button>
+</div>
+
+<section id="tab-queue"><div class="card" id="jobs"></div></section>
+
+<section id="tab-channels" class="hidden">
+  <div class="card" id="channels"></div>
+  <div class="card row" style="margin-top:0"><button class="btn small" id="checkBtn" type="button">🔄 בדוק עכשיו</button>
+  <span class="muted">בדיקה אוטומטית כל 3 שעות</span></div>
+</section>
+
+<section id="tab-add" class="hidden">
+  <form class="card" data-action="/channels/add">
+    <b>הוספת ערוץ למעקב</b>
+    <div class="row"><input class="grow" name="channel" placeholder="קישור לערוץ / @handle / UC…" required></div>
+    <div class="row">
+      <select name="mode"><option value="audio">🎵 שיר (MP3)</option><option value="video">🎬 סרטון (MP4)</option></select>
+      <label>אורך מינימלי <input name="minMinutes" type="number" min="0" value="0" style="width:70px"> דק׳</label>
+      <label><input type="checkbox" name="skipShorts" checked> בלי Shorts</label>
+      <label>להוריד עכשיו את <input name="backfill" type="number" min="0" max="15" value="0" style="width:60px"> האחרונים</label>
+    </div>
+    <div class="row"><button class="btn">הוסף ערוץ</button></div>
+  </form>
+  <form class="card" data-action="/jobs/add">
+    <b>הורדה חד-פעמית</b>
+    <div class="row"><input class="grow" name="url" placeholder="קישור לסרטון ביוטיוב" required>
+    <select name="mode"><option value="audio">🎵 שיר</option><option value="video">🎬 סרטון</option></select>
+    <button class="btn">הוסף לתור</button></div>
+  </form>
+</section>
+
+<section id="tab-logs" class="hidden">
+  <div class="card">
+    <div class="row" style="margin:0 0 10px;justify-content:space-between">
+      <span class="muted"><span style="color:var(--ok)">worker</span> = Cloudflare · <span style="color:var(--primary)">render</span> = שרת ההורדות</span>
+      <button class="btn small ghost" id="clearLogs" type="button">ניקוי</button>
+    </div>
+    <div class="logs" id="logs"></div>
+  </div>
+</section>
+
+<div id="toast"></div>
+
 <script>
 const B = ${JSON.stringify(BASE)};
-async function wakeAgent(btn) {
-  btn.disabled = true; document.getElementById("wakeRes").textContent = " מעיר… (עד דקה)";
-  try { const r = await (await fetch(B + "/wake", { method: "POST" })).json();
-        document.getElementById("wakeRes").textContent = r.result === "ok" ? " ✓ השרת ער" : " ✗ " + r.result; }
-  catch (e) { document.getElementById("wakeRes").textContent = " ✗ " + e; }
-  btn.disabled = false;
+const STATUS = ${JSON.stringify(STATUS)};
+let S = ${initial};
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const ago = (iso) => { if (!iso) return "אף פעם"; const m = Math.round((Date.now() - Date.parse(iso)) / 60000);
+  return m < 1 ? "עכשיו" : m < 60 ? "לפני " + m + " דק׳" : m < 1440 ? "לפני " + Math.round(m / 60) + " שע׳" : "לפני " + Math.round(m / 1440) + " ימים"; };
+const hhmm = (iso) => new Date(iso).toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+function toast(msg, ms = 4000) { const t = $("toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", ms); }
+
+function render() {
+  // agent status
+  const seen = S.agent && S.agent.seen, mins = seen ? (Date.now() - Date.parse(seen)) / 60000 : Infinity;
+  const busy = S.jobs.some((j) => j.status === "taken");
+  $("agentDot").className = "dot " + (mins < 5 ? "ok" : mins < 30 ? "warn" : "bad");
+  const info = S.agent && S.agent.info;
+  $("agentText").textContent = !S.renderUrl ? "RENDER_URL לא מוגדר" :
+    "שרת ההורדות: " + (busy ? "מוריד…" : mins < 5 ? "ער" : "ישן") + " · נראה " + ago(seen) +
+    (info && !info.cookies ? " · ⚠ אין עוגיות" : "");
+  $("checkText").textContent = "בדיקת ערוצים: " + ago(S.lastCheck && S.lastCheck.at);
+  // queue
+  const active = S.jobs.filter((j) => j.status === "queued" || j.status === "taken").length;
+  $("qCount").textContent = active ? "(" + active + ")" : "";
+  $("cCount").textContent = "(" + S.channels.length + ")";
+  $("jobs").innerHTML = S.jobs.length ? S.jobs.map((j) =>
+    '<div class="job"><img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">' +
+    '<div class="info"><div class="title" title="' + esc(j.title) + '">' + esc(j.title) + '</div>' +
+    '<div class="muted">' + esc(j.channelName) + ' · ' + (j.mode === "video" ? "🎬 סרטון" : "🎵 שיר") + ' · ' + ago(j.updated) + '</div>' +
+    (j.error ? '<div class="' + (j.status === "failed" ? "err" : "muted") + '">' + esc(j.error) + '</div>' : '') + '</div>' +
+    '<span class="chip ' + esc(j.status) + '">' + (STATUS[j.status] || esc(j.status)) + '</span>' +
+    (j.fileUrl ? '<a class="btn small" href="' + esc(j.fileUrl) + '">⬇ הורדה</a>' : '') +
+    (["failed", "skipped", "taken"].includes(j.status) ? '<button class="btn small ghost" data-retry="' + esc(j.videoId) + '">שוב</button>' : '') +
+    '</div>').join("") : '<div class="muted">התור ריק. הוסף ערוץ או קישור בלשונית ➕ הוספה.</div>';
+  // channels
+  $("channels").innerHTML = S.channels.length ? S.channels.map((c) =>
+    '<div class="ch"><div><a href="https://www.youtube.com/channel/' + esc(c.id) + '" target="_blank">' + esc(c.name) + '</a>' +
+    '<div class="muted">' + (c.mode === "video" ? "🎬 סרטון" : "🎵 שיר") + (c.minMinutes ? " · " + c.minMinutes + " דק׳ ומעלה" : "") +
+    (c.skipShorts ? " · בלי Shorts" : "") + '</div></div>' +
+    '<button class="btn small ghost" data-remove="' + esc(c.id) + '">הסר</button></div>').join("")
+    : '<div class="muted">עוד אין ערוצים. הוסף בלשונית ➕ הוספה.</div>';
+  // logs (newest at the bottom)
+  const box = $("logs"), atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  box.innerHTML = S.logs.length ? S.logs.map((l) => '<div class="l"><span class="t">' + hhmm(l.t) + '</span> <span class="s-' + esc(l.src) + '">[' + esc(l.src) + ']</span> ' +
+    '<span dir="auto" class="m ' + (/ERROR|⚠|נכשל|\\[!\\]|שגיא/.test(l.msg) ? "bad" : "") + '">' + esc(l.msg) + '</span></div>').join("") : '<span class="t">אין עדיין לוגים</span>';
+  if (atBottom) box.scrollTop = box.scrollHeight;
 }
-// Auto-download: every 30s look for newly finished files and download each
-// once (remembered in this browser). Only files finished after the box was
-// ticked, so turning it on doesn't download the whole history.
-const box = document.getElementById("autoDl");
+
+async function refresh() {
+  try { S = await (await fetch(B + "/status")).json(); render(); autoDownload(); } catch (e) {}
+}
+
+async function post(path, data) {
+  const r = await fetch(B + path, { method: "POST", body: data });
+  if (!r.ok) throw new Error((await r.text()).replace(/^Error: /, ""));
+  return r;
+}
+
+// tabs (remembered in this browser)
+function showTab(name) {
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t.dataset.tab === name));
+  document.querySelectorAll("section[id^=tab-]").forEach((s) => s.classList.toggle("hidden", s.id !== "tab-" + name));
+  try { localStorage.setItem("tab", name); } catch (e) {}
+  if (name === "logs") { const b = $("logs"); b.scrollTop = b.scrollHeight; }
+}
+document.querySelectorAll(".tab").forEach((t) => t.onclick = () => showTab(t.dataset.tab));
+try { const t = localStorage.getItem("tab"); if (t) showTab(t); } catch (e) {}
+
+// forms
+document.querySelectorAll("form[data-action]").forEach((f) => f.onsubmit = async (e) => {
+  e.preventDefault();
+  const btn = f.querySelector("button"); btn.disabled = true;
+  try { await post(f.dataset.action, new FormData(f)); f.reset(); toast("✓ נוסף"); showTab("queue"); await refresh(); }
+  catch (err) { toast("✗ " + err.message, 8000); }
+  btn.disabled = false;
+});
+document.addEventListener("click", async (e) => {
+  const r = e.target.dataset.retry, rm = e.target.dataset.remove;
+  if (r) { const d = new FormData(); d.append("id", r); await post("/jobs/retry", d).catch((x) => toast(x.message)); refresh(); }
+  if (rm && confirm("להסיר את הערוץ?")) { const d = new FormData(); d.append("id", rm); await post("/channels/remove", d).catch((x) => toast(x.message)); refresh(); }
+});
+$("wakeBtn").onclick = async () => {
+  const b = $("wakeBtn"); b.disabled = true; toast("מעיר את שרת ההורדות… (עד דקה)", 60000);
+  try { const r = await (await fetch(B + "/wake", { method: "POST" })).json(); toast(r.result === "ok" ? "✓ השרת ער ובודק את התור" : "✗ " + r.result, 10000); }
+  catch (e) { toast("✗ " + e); }
+  b.disabled = false; refresh();
+};
+$("checkBtn").onclick = async () => {
+  const b = $("checkBtn"); b.disabled = true;
+  try { await post("/check", new FormData()); toast("✓ נבדק"); } catch (e) { toast("✗ " + e.message); }
+  b.disabled = false; refresh();
+};
+$("clearLogs").onclick = async () => { await fetch(B + "/logs/clear", { method: "POST" }); refresh(); };
+
+// Auto-download: each newly finished file is downloaded once (remembered in
+// this browser) — only files finished after the box was ticked.
 const store = (k, v) => { try { v === undefined ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} };
 const load = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
-box.checked = !!load("autoDlSince");
-box.onchange = () => store("autoDlSince", box.checked ? new Date().toISOString() : undefined);
-let busy = false;
-async function poll() {
+$("autoDl").checked = !!load("autoDlSince");
+$("autoDl").onchange = (e) => store("autoDlSince", e.target.checked ? new Date().toISOString() : undefined);
+let dlBusy = false;
+async function autoDownload() {
   const since = load("autoDlSince");
-  if (!since || busy) return;
-  busy = true;
-  try {
-    const { jobs } = await (await fetch(B + "/status")).json();
-    const got = JSON.parse(load("autoDlGot") || "[]");
-    let changed = false;
-    for (const j of jobs) {
-      if (j.status !== "done" || !j.fileUrl || j.updated < since || got.includes(j.videoId)) continue;
-      const f = document.createElement("iframe");
-      f.style.display = "none"; f.src = j.fileUrl; document.body.appendChild(f);
-      got.push(j.videoId); changed = true;
-      await new Promise((r) => setTimeout(r, 1500));
-    }
-    if (changed) store("autoDlGot", JSON.stringify(got.slice(-500)));
-  } catch (e) {}
-  busy = false;
+  if (!since || dlBusy) return;
+  dlBusy = true;
+  const got = JSON.parse(load("autoDlGot") || "[]");
+  for (const j of S.jobs) {
+    if (j.status !== "done" || !j.fileUrl || j.updated < since || got.includes(j.videoId)) continue;
+    const f = document.createElement("iframe"); f.style.display = "none"; f.src = j.fileUrl; document.body.appendChild(f);
+    got.push(j.videoId); store("autoDlGot", JSON.stringify(got.slice(-500)));
+    toast("⬇ מוריד: " + j.title);
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  dlBusy = false;
 }
-setInterval(poll, 30000); poll();
+
+render(); autoDownload();
+setInterval(refresh, 8000);
 </script>`;
 }
 
