@@ -29,8 +29,10 @@ Settings come from environment variables (see agent/agent.env.example):
                   file; the local copy is then deleted.
 """
 
+import hashlib
 import http.server
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -50,7 +52,9 @@ POLL = int(os.environ.get("POLL_SECONDS", "300"))
 RES = os.environ.get("VIDEO_RES", "1080")
 AGE_LIMIT = os.environ.get("AGE_LIMIT", "17")
 PORT = os.environ.get("PORT")  # set by Render -> web-server mode
-FILE_KEY = os.environ.get("FILE_KEY") or TOKEN
+# Secret part of file links. Derived from AGENT_TOKEN (never the token
+# itself), so a shared or logged file link doesn't reveal the agent's key.
+FILE_KEY = os.environ.get("FILE_KEY") or hashlib.sha256(("files:" + TOKEN).encode()).hexdigest()[:24]
 PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
 KEEP_FILES_HOURS = float(os.environ.get("KEEP_FILES_HOURS", "6"))
 
@@ -348,7 +352,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, fmt, *args):
-        line = fmt % args
+        line = re.sub(r"([?&]k=)[^ &\"]+", r"\1***", fmt % args)  # hide file keys
         if "/ping" not in line and "/healthz" not in line and "HEAD " not in line:
             print("http:", line, flush=True)
 
