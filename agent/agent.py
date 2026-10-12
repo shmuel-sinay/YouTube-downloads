@@ -423,10 +423,49 @@ def handle_list(job: dict) -> None:
     log("   " + msg)
 
 
+def handle_search(job: dict) -> None:
+    """'singer - song' from a pasted list: search YouTube, take the first
+    result at least minMinutes long, and replace this job with that video."""
+    vid, q, min_s = job["videoId"], job.get("query") or job["title"], int(job.get("minMinutes") or 0) * 60
+    log(f"-> מחפש: {q}")
+    set_progress(vid, stage="start", pct=None, started=time.time(), mode="m4a")
+    cmd = ["yt-dlp", f"ytsearch{20 if min_s else 5}:{q}", "--flat-playlist", "--no-warnings",
+           "--print", "%(id)s\t%(duration)s\t%(title)s", "--js-runtimes", "node", "--impersonate", "chrome"]
+    cookies = cookies_path()
+    if cookies:
+        cmd += ["--cookies", cookies]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    found = None
+    for line in r.stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3 or len(parts[0]) != 11:
+            continue
+        try:
+            dur = float(parts[1])
+        except ValueError:
+            dur = None
+        if min_s and (dur is None or dur < min_s):
+            continue
+        found = {"videoId": parts[0], "title": parts[2], "duration": dur}
+        break
+    if not found:
+        errs = [l for l in r.stderr.splitlines() if "ERROR" in l]
+        why = errs[-1] if errs else ("לא נמצאה תוצאה" + (f" באורך {min_s // 60} דקות לפחות" if min_s else ""))
+        api("/api/report", {"videoId": vid, "status": "failed", "error": why})
+        log(f"   {why}")
+        return
+    api("/api/enqueue", {"items": [found], "mode": job.get("mode"), "minMinutes": job.get("minMinutes"),
+                         "channelName": "חיפוש: " + q, "replace": vid,
+                         "priority": (job.get("priority") or 0) + 1})  # download it right away
+    log(f"   נמצא: {found['title']}")
+
+
 def _handle(job: dict) -> None:
     vid = job["videoId"]
     if job.get("kind") == "list":
         return handle_list(job)
+    if job.get("kind") == "search":
+        return handle_search(job)
     log(f"-> מוריד: {job['title']} ({job['url']})")
     # pcConvert jobs skip the MP3 encode here — weigh them like fast audio.
     set_progress(vid, stage="start", pct=None, started=time.time(),

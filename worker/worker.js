@@ -298,7 +298,10 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         videoId: it.videoId, channelId: b.channelId || "", channelName: b.channelName || "",
         title: it.title || it.videoId, published: "", url: "https://www.youtube.com/watch?v=" + it.videoId,
         mode: modeOf(b.mode), minMinutes: b.minMinutes || 0, status: "queued", updated: new Date().toISOString() }));
+      if (b.priority) fresh.forEach((j) => { j.priority = b.priority; });
       await addJobs(env, fresh);
+      // A search job is replaced by the video it found (keeps the list tidy).
+      if (b.replace) await deleteJobs(env, [String(b.replace)]);
       return json({ added: fresh.length, skipped: (b.items || []).length - fresh.length });
     }
     if (p === "/api/check" && req.method === "POST") {
@@ -435,6 +438,33 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         status: "queued", priority: Date.now(), updated: new Date().toISOString() }]);
       await addLog(env, "worker", `בקשה: ${count} סרטונים מ-${name}`);
       wake();
+      return redirect(BASE + "/");
+    }
+    if (p === "/jobs/list") {
+      // A pasted list, one item per line: a video link, a playlist/channel
+      // link, or a name to search on YouTube ("singer - song").
+      const mode = modeOf(f.get("mode"));
+      const minMinutes = Math.max(0, parseInt(f.get("minMinutes") || "0", 10) || 0);
+      const lines = String(f.get("lines") || "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#")).slice(0, 300);
+      const now = Date.now(), jobs = [];
+      lines.forEach((line, i) => {
+        const base = { mode, minMinutes, status: "queued", updated: new Date().toISOString(), priority: now - i };
+        const v = line.match(/(?:v=|youtu\.be\/|shorts\/|live\/)([\w-]{11})/);
+        const pl = line.match(/[?&]list=([\w-]+)/);
+        if (v && !pl) {
+          jobs.push({ ...base, videoId: v[1], channelName: "רשימה", title: v[1], url: "https://www.youtube.com/watch?v=" + v[1] });
+        } else if (/^https?:\/\//.test(line)) {
+          // playlist / channel link: expand it like "N videos from a channel"
+          jobs.push({ ...base, kind: "list", videoId: "list-" + (now + i).toString(36), channelName: "רשימה",
+                      title: "כל הסרטונים מ: " + line, url: line, count: 300 });
+        } else {
+          jobs.push({ ...base, kind: "search", videoId: "q-" + (now + i).toString(36), channelName: "חיפוש",
+                      title: line, query: line });
+        }
+      });
+      await addJobs(env, jobs);
+      await addLog(env, "worker", `רשימה: ${jobs.length} פריטים`);
+      if (jobs.length) wake();
       return redirect(BASE + "/");
     }
     if (p === "/jobs/delete") {
@@ -622,8 +652,9 @@ a{color:var(--primary);text-decoration:none}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
 .field{display:flex;flex-direction:column;gap:6px;font-size:.82rem;color:var(--muted)}
 .field.wide{grid-column:1/-1}
-input,select{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:9px 11px;width:100%}
-input:focus,select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px #4f8cff26}
+textarea{resize:vertical;min-height:110px;line-height:1.6}
+input,select,textarea{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:9px 11px;width:100%}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px #4f8cff26}
 .check{display:flex;align-items:center;gap:8px;color:var(--text);font-size:.9rem;cursor:pointer}
 .check input{width:auto}
 .actions-row{display:flex;justify-content:flex-end;margin-top:16px}
@@ -771,6 +802,15 @@ async function dashboard(env) {
         </div>
         <div class="actions-row"><button class="btn">${icon("add")}<span>הוסף לתור</span></button></div>
       </form>
+      <form class="card" data-action="/jobs/list">
+        <h2>${icon("queue")}רשימת שירים או קישורים</h2><p class="sub">שורה לכל פריט: קישור ליוטיוב, או שם לחיפוש (זמר - שיר).</p>
+        <div class="grid">
+          <label class="field wide">הרשימה<textarea name="lines" rows="6" required placeholder="נפתלי קמפה - גרש את העצבות&#10;https://www.youtube.com/watch?v=…&#10;מוטי וייס - רפ״ב"></textarea></label>
+          <label class="field">סוג<select name="mode">${modeOptions}</select></label>
+          <label class="field">אורך מינימלי (דקות)<input name="minMinutes" type="number" min="0" value="0"></label>
+        </div>
+        <div class="actions-row"><button class="btn">${icon("download")}<span>הורד את הרשימה</span></button></div>
+      </form>
       <form class="card" data-action="/jobs/batch">
         <h2>${icon("layers")}כמות סרטונים מערוץ</h2><p class="sub">מוריד את הסרטונים האחרונים של ערוץ — כמה שתבחר.</p>
         <div class="grid">
@@ -877,8 +917,8 @@ function progHtml(id) {
 }
 function btn(act, id, ic, title, cls) { return '<button class="ibtn ' + (cls || "") + '" data-act="' + act + '" data-id="' + esc(id) + '" title="' + title + '">' + icon(ic) + '</button>'; }
 function jobRow(j) {
-  const list = j.kind === "list";
-  const thumb = list ? '<div class="thumb">' + icon("layers") + '</div>'
+  const list = j.kind === "list" || j.kind === "search";
+  const thumb = list ? '<div class="thumb">' + icon(j.kind === "search" ? "queue" : "layers") + '</div>'
     : '<img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">';
   const modeIc = j.mode === "video" ? "video" : "music";
   const meta = [esc(j.channelName || "קישור ידני"), icon(modeIc) + " " + esc(MODES[j.mode] || MODES.audio),
