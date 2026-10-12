@@ -155,7 +155,10 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
            "--retries", "8", "--fragment-retries", "8", "--extractor-retries", "3",
            "--output", str(out_dir / "%(title)s [%(id)s].%(ext)s"),
            "--print", "after_move:filepath",
-           "--no-warnings", "--no-quiet", "--no-progress",
+           "--no-warnings", "--no-quiet",
+           # One progress line at a time, in a form run_ytdlp() can parse.
+           "--progress", "--newline", "--progress-template",
+           "download:PROG %(progress._percent_str)s · %(progress._total_bytes_str)s · %(progress._speed_str)s",
            "--js-runtimes", "node", "--impersonate", "chrome",
            "--extractor-args", "youtube:player_client=web,ios,android",
            "--embed-thumbnail", "--embed-metadata"]
@@ -202,10 +205,57 @@ def upload_r2(path: Path) -> str | None:
     return TRACKER + "/files/" + urllib.request.quote(key)
 
 
+class _Result:
+    def __init__(self, returncode: int, stdout: str, stderr: str):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def run_ytdlp(cmd: list[str]) -> _Result:
+    """Run yt-dlp and report progress to the log while it works: download %
+    about once a minute, when conversion starts, and a heartbeat during long
+    silent steps (ffmpeg converting an hour-long set on a small CPU)."""
+    start = time.time()
+    state = {"last_log": start}
+    out_lines: list[str] = []
+    err_lines: list[str] = []
+    done = threading.Event()
+
+    def say(msg: str) -> None:
+        log(msg)
+        state["last_log"] = time.time()
+
+    def heartbeat() -> None:
+        while not done.wait(30):
+            if time.time() - state["last_log"] >= 120:
+                say(f"   … עדיין עובד ({int((time.time() - start) // 60)} דק׳)")
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    t_err = threading.Thread(target=lambda: err_lines.extend(proc.stderr), daemon=True)
+    t_err.start()
+    threading.Thread(target=heartbeat, daemon=True).start()
+    last_prog = 0.0
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        if line.startswith("PROG "):
+            finished = line.split("·")[0].strip().endswith("100.0%")
+            if (finished and not state.get("logged100")) or (not finished and time.time() - last_prog >= 60):
+                say("   ⬇ " + line[5:].strip())
+                last_prog = time.time()
+                state["logged100"] = finished
+            continue
+        out_lines.append(line)
+        if line.startswith(("[ExtractAudio]", "[Merger]", "[VideoRemuxer]")):
+            say("   ⚙ ממיר/מאחד (בשרת חלש זה יכול לקחת כמה דקות)…")
+    proc.wait()
+    t_err.join(timeout=5)
+    done.set()
+    return _Result(proc.returncode, "\n".join(out_lines), "".join(err_lines))
+
+
 def handle(job: dict) -> None:
     log(f"-> מוריד: {job['title']} ({job['url']})")
     OUT.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run(ytdlp_cmd(job, OUT), capture_output=True, text=True)
+    r = run_ytdlp(ytdlp_cmd(job, OUT))
     files = [Path(l.strip()) for l in r.stdout.splitlines()
              if l.strip().startswith(str(OUT)) and Path(l.strip()).is_file()]
     if files:
