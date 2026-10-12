@@ -3,6 +3,6 @@ yt-dlp[default]
 # Chrome TLS impersonation (--impersonate chrome)
 curl_cffi
 # PO Token plugin; talks to the bgutil sidecar on 127.0.0.1:4416
-bgutil-ytdlp-pot-provider
+bgutil-ytdlp-pot-provider==2.0.2
 # Only needed if you upload to R2
 boto3

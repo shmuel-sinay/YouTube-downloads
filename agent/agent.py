@@ -112,13 +112,26 @@ def hello() -> None:
             return "חסר"
     info = {"ytdlp": ver(["yt-dlp", "--version"]), "node": ver(["node", "--version"]),
             "ffmpeg": ver(["ffmpeg", "-version"])[:40], "cookies": bool(cookies_path()),
-            "mode": "render" if PORT else "loop", "public": PUBLIC_URL}
+            "pot": pot_server(), "mode": "render" if PORT else "loop", "public": PUBLIC_URL}
     try:
         api("/api/hello", info)
     except Exception as e:
         print(f"[!] hello failed (TRACKER_URL / AGENT_TOKEN?): {e}", flush=True)
     log(f"סוכן עלה: yt-dlp {info['ytdlp']}, node {info['node']}, "
-        f"עוגיות {'יש' if info['cookies'] else 'אין!'}")
+        f"עוגיות {'יש' if info['cookies'] else 'אין!'}, שרת טוקנים {info['pot'] or 'לא פעיל!'}")
+
+
+def pot_server() -> str:
+    """Version of the bgutil PO-token server on 127.0.0.1:4416, or "" if it
+    isn't answering (it starts together with the agent — give it a moment)."""
+    import urllib.request
+    for _ in range(10):
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:4416/ping", timeout=3) as r:
+                return "v" + json.loads(r.read().decode()).get("version", "?")
+        except Exception:
+            time.sleep(2)
+    return ""
 
 
 LAST_ERR = ""  # last failure talking to the Worker — returned on /wake
@@ -171,7 +184,9 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
            "download:PROG %(progress._percent_str)s · %(progress._total_bytes_str,progress._total_bytes_estimate_str)s"
            " · %(progress._speed_str)s · %(progress._eta_str)s",
            "--js-runtimes", "node", "--impersonate", "chrome",
-           "--extractor-args", "youtube:player_client=web,ios,android",
+           # ios/android ignore cookies (→ "not a bot"); yt-dlp's defaults plus
+           # mweb use the cookies and the PO tokens from the bgutil server.
+           "--extractor-args", "youtube:player_client=default,mweb",
            "--embed-thumbnail", "--embed-metadata"]
     if job.get("mode") == "video":
         cmd += ["-f", f"bv*[height<={RES}]+ba/b[height<={RES}]/bv*+ba/b",
