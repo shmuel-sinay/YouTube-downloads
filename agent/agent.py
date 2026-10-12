@@ -258,6 +258,14 @@ def _with_clients(cmd: list[str], clients: str) -> list[str]:
     return out
 
 
+def video_res(mode) -> str | None:
+    """Height limit of a video mode ("video", "video720", "video480"); None for audio."""
+    m = str(mode or "")
+    if not m.startswith("video"):
+        return None
+    return m[5:] if m[5:].isdigit() else RES
+
+
 def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
     """yt-dlp with the free anti-bot stack learned in the zmani project:
     cookies, Node for the JS challenge (yt-dlp[default] ships the solver),
@@ -280,13 +288,21 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
            # ios/android ignore cookies (→ "not a bot"); yt-dlp's defaults plus
            # mweb use the cookies and the PO tokens from the bgutil server.
            "--extractor-args", "youtube:player_client=default,mweb",
-           "--embed-thumbnail", "--embed-metadata"] + net_args()
+           ] + net_args()
     if PLUGINS.is_dir():
         cmd += ["--plugin-dirs", str(PLUGINS)]
-    if job.get("mode") == "video":
-        cmd += ["-f", f"bv*[height<={RES}]+ba/b[height<={RES}]/bv*+ba/b",
+    res = video_res(job.get("mode"))
+    if res:
+        # H.264 + AAC first: they join into an ordinary MP4 that plays
+        # everywhere. Videos skip the cover picture and tags — each of those
+        # rewrites the whole file again (minutes for a big file on the free
+        # server); the name says what it is.
+        cmd += ["-f", f"bv*[height<={res}][vcodec^=avc1]+ba[ext=m4a]/b[height<={res}][ext=mp4]"
+                      f"/bv*[height<={res}]+ba/b[height<={res}]/bv*+ba/b",
                 "--merge-output-format", "mp4", "--remux-video", "mp4"]
-    elif job.get("mode") == "m4a" or job.get("pcConvert"):
+        return _finish_cmd(cmd, job)
+    cmd += ["--embed-thumbnail", "--embed-metadata"]
+    if job.get("mode") == "m4a" or job.get("pcConvert"):
         # Fast audio: take YouTube's own AAC track as-is (no re-encode).
         # --extract-audio only re-encodes if no m4a track exists.
         cmd += ["-f", "bestaudio[ext=m4a]/bestaudio/best", "--extract-audio",
@@ -294,6 +310,10 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
     else:
         cmd += ["-f", "bestaudio/best", "--extract-audio",
                 "--audio-format", "mp3", "--audio-quality", "0"]
+    return _finish_cmd(cmd, job)
+
+
+def _finish_cmd(cmd: list[str], job: dict) -> list[str]:
     # ffmpeg writes its position to a file while converting/merging; the
     # progress monitor turns it into a percentage of the video's duration.
     pf = str(prog_file(job.get("videoId", "x")))
@@ -360,7 +380,8 @@ WEIGHTS = {
 
 def set_progress(vid: str, **kw) -> None:
     p = {**PROGRESS.get(vid, {}), **kw, "t": time.time()}
-    w = WEIGHTS.get(p.get("mode"), WEIGHTS["audio"]).get(p.get("stage"))
+    kind = "video" if video_res(p.get("mode")) else p.get("mode")
+    w = WEIGHTS.get(kind, WEIGHTS["audio"]).get(p.get("stage"))
     pct = p.get("pct")
     if p.get("stage") == "finish":
         p["overall"] = 100.0
@@ -368,7 +389,7 @@ def set_progress(vid: str, **kw) -> None:
         p["overall"] = 0.0
     elif w:
         frac = (pct or 0) / 100
-        if p.get("stage") == "download" and p.get("mode") == "video":
+        if p.get("stage") == "download" and kind == "video":
             # part 1 (video) ≈ 80% of the bytes, part 2 (audio) ≈ 20%
             frac = (0.8 * frac) if p.get("part", 1) <= 1 else (0.8 + 0.2 * frac)
         p["overall"] = round(w[0] + w[1] * frac, 1)

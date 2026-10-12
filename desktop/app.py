@@ -624,8 +624,12 @@ class Downloader(threading.Thread):
         work.mkdir(parents=True, exist_ok=True)
         try:
             audio = job.get("mode") in ("m4a", "audio")
+            # "video720" / "video480": lower quality, smaller file, faster.
+            h = (job.get("mode") or "")[5:]
+            cap = f"[height<={h}]" if h.isdigit() else ""
             opts = {"outtmpl": str(work / "%(id)s.%(ext)s"), "noplaylist": True, "quiet": True, "no_warnings": True,
-                    "format": "ba[ext=m4a]/ba" if audio else "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+                    "format": "ba[ext=m4a]/ba" if audio else
+                              f"bv*{cap}[ext=mp4]+ba[ext=m4a]/b{cap}[ext=mp4]/bv*{cap}+ba/b{cap}/b",
                     "merge_output_format": "mp4", "ffmpeg_location": ffmpeg_exe()}
             if shutil.which("node"):
                 opts["js_runtimes"] = {"node": {}}          # YouTube's JavaScript challenge

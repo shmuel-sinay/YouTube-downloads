@@ -1017,7 +1017,9 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
 // is many times faster on a small server.
 // MP3 is only made by the desktop app (it converts in seconds; the free
 // server would take many minutes), so it's offered only while the app runs.
-const MODES = { video: "סרטון · MP4", m4a: "שיר מהיר · M4A", audio: "שיר · MP3 (המרה בתוכנה)" };
+// video720 / video480: lower quality — a smaller file, so it downloads faster.
+const MODES = { video: "סרטון · MP4", video720: "סרטון · 720p (מהיר יותר)", video480: "סרטון · 480p (הכי מהיר)",
+                m4a: "שיר מהיר · M4A", audio: "שיר · MP3 (המרה בתוכנה)" };
 const modeOf = (v) => (v in MODES ? v : "video");
 
 const STATUS = { queued: "ממתין", taken: "בהורדה", done: "הושלם", failed: "נכשל", skipped: "דולג", cancelled: "בוטל", paused: "מושהה",
@@ -1491,13 +1493,15 @@ function progHtml(id) {
   const p = P[id];
   if (!p) return '<div class="pline"><span>ממתין לשרת ההורדות…</span></div><div class="bar thin busy"><i style="width:100%"></i></div>';
   const at = STAGES.findIndex((s) => s[0] === p.stage);
-  const steps = STAGES.map((s, i) => '<div class="step ' + (i < at ? "done" : i === at ? "now" : "") + '">' + s[1] + '</div>').join("");
+  // A video isn't converted, only its picture and sound joined into one MP4.
+  const label = (s) => s[0] === "convert" && /^video/.test(p.mode || "") ? "איחוד" : s[1];
+  const steps = STAGES.map((s, i) => '<div class="step ' + (i < at ? "done" : i === at ? "now" : "") + '">' + label(s) + '</div>').join("");
   const known = typeof p.pct === "number", overall = typeof p.overall === "number" ? p.overall : 0, dl = p.stage === "download";
   const nums = [dl && p.size ? p.size : "", dl && p.speed ? p.speed : "", dl && p.eta && p.eta !== "NA" ? "ETA " + p.eta : "",
     p.part > 1 ? "part " + p.part + "/2" : "", mmss(p.elapsed || 0)].filter(Boolean).join("  ·  ");
   return '<div class="steps">' + steps + '</div>' +
     '<div class="pline"><b>התקדמות כוללת</b><b>' + overall.toFixed(0) + '%</b></div><div class="bar"><i style="width:' + overall + '%"></i></div>' +
-    '<div class="pline"><span>' + ((STAGES[at] || ["", ""])[1]) + '</span><span>' + (known ? p.pct.toFixed(1) + "%" : "עובד…") + '</span></div>' +
+    '<div class="pline"><span>' + label(STAGES[at] || ["", ""]) + '</span><span>' + (known ? p.pct.toFixed(1) + "%" : "עובד…") + '</span></div>' +
     '<div class="bar thin' + (known ? "" : " busy") + '"><i style="width:' + (known ? p.pct : 100) + '%"></i></div>' +
     '<div class="nums">' + esc(nums) + '</div>';
 }
@@ -1506,7 +1510,7 @@ function jobRow(j) {
   const list = j.kind === "list" || j.kind === "search";
   const thumb = list ? '<div class="thumb">' + icon(j.kind === "search" ? "queue" : "layers") + '</div>'
     : '<img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">';
-  const modeIc = j.mode === "video" ? "video" : "music";
+  const modeIc = /^video/.test(j.mode || "") ? "video" : "music";
   const meta = [esc(j.channelName || "קישור ידני"), icon(modeIc) + " " + esc(MODES[j.mode] || MODES.audio),
     j.pcConvert ? icon("zap") + " המרה במחשב" : "", j.pcGot ? icon("monitor") + " במחשב" : "",
     icon("clock") + " " + ago(j.updated)].filter(Boolean).join('<span class="sep">•</span>');
@@ -1612,7 +1616,7 @@ function render() {
   $("channels").innerHTML = S.channels.length ? S.channels.map((c) =>
     '<div class="ch"><div class="avatar">' + esc((c.name || "?").trim().charAt(0)) + '</div><div class="info">' +
     '<div class="title"><a href="https://www.youtube.com/channel/' + esc(c.id) + '" target="_blank" rel="noopener">' + esc(c.name) + '</a></div>' +
-    '<div class="meta">' + icon(c.mode === "video" ? "video" : "music") + ' ' + esc(MODES[c.mode] || MODES.audio) +
+    '<div class="meta">' + icon(/^video/.test(c.mode || "") ? "video" : "music") + ' ' + esc(MODES[c.mode] || MODES.audio) +
     (c.minMinutes ? '<span class="sep">•</span>' + c.minMinutes + ' דק׳ ומעלה' : '') + (c.skipShorts ? '<span class="sep">•</span>בלי Shorts' : '') + '</div></div>' +
     '<div class="acts">' + btn("batch", c.id, "download", "הורד כמות סרטונים מהערוץ", "primary") + btn("remove", c.id, "trash", "הסר ערוץ", "danger") + '</div></div>').join("")
     : '<div class="empty">' + icon("channels") + '<div>עוד אין ערוצים במעקב</div></div>';
