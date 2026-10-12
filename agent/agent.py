@@ -40,6 +40,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 
 TRACKER = os.environ.get("TRACKER_URL", "").rstrip("/")
@@ -170,6 +171,17 @@ def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
     return cmd
 
 
+def to_zip(path: Path) -> Path:
+    """Wrap the media file in a .zip and delete the original. Some filters
+    (e.g. NetFree) block audio/video downloads but let zip files through.
+    ZIP_STORED: media is already compressed, so this is just a fast copy."""
+    z = path.with_name(path.stem + ".zip")
+    with zipfile.ZipFile(z, "w", zipfile.ZIP_STORED) as zf:
+        zf.write(path, path.name)
+    path.unlink(missing_ok=True)
+    return z
+
+
 def upload_r2(path: Path) -> str | None:
     """Upload to R2; return the Worker URL that serves it, or None."""
     if not os.environ.get("R2_BUCKET"):
@@ -180,7 +192,7 @@ def upload_r2(path: Path) -> str | None:
                       aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
                       region_name="auto")
     key = path.name
-    ctype = "video/mp4" if path.suffix == ".mp4" else "audio/mpeg"
+    ctype = "application/zip"
     s3.upload_file(str(path), os.environ["R2_BUCKET"], key, ExtraArgs={"ContentType": ctype})
     path.unlink(missing_ok=True)
     return TRACKER + "/files/" + urllib.request.quote(key)
@@ -193,7 +205,7 @@ def handle(job: dict) -> None:
     files = [Path(l.strip()) for l in r.stdout.splitlines()
              if l.strip().startswith(str(OUT)) and Path(l.strip()).is_file()]
     if files:
-        f = files[-1]
+        f = to_zip(files[-1])
         try:
             url = upload_r2(f) or ""
         except Exception as e:  # keep the local file, still report success
@@ -319,7 +331,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if key != FILE_KEY or "/" in name or not f.is_file():
                 return self._send(404, "not found (או שהשרת נרדם והקובץ נמחק)")
             self.send_response(200)
-            self.send_header("Content-Type", "video/mp4" if f.suffix == ".mp4" else "audio/mpeg")
+            self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Length", str(f.stat().st_size))
             self.send_header("Content-Disposition",
                              "attachment; filename*=UTF-8''" + urllib.parse.quote(f.name))
