@@ -120,6 +120,13 @@ def hello() -> None:
     log(f"סוכן עלה: yt-dlp {info['ytdlp']}, node {info['node']}, "
         f"עוגיות {'יש' if info['cookies'] else 'אין!'}, שרת טוקנים {info['pot'] or 'לא פעיל!'}, "
         f"WARP {'פעיל' if info['warp'] else 'לא פעיל'}")
+    # Show the helpers' own output when they didn't come up (Render's logs
+    # aren't reachable from the site).
+    for ok, name, path in ((info["pot"], "שרת טוקנים", "/tmp/pot.log"), (info["warp"], "WARP", "/tmp/warp.log")):
+        if not ok and Path(path).exists():
+            tail = Path(path).read_text(errors="ignore").strip().splitlines()[-5:]
+            for line in tail:
+                log(f"   [{name}] {line[:300]}")
 
 
 WARP_PROXY = "socks5://127.0.0.1:40000"
@@ -203,6 +210,27 @@ def _without(cmd: list[str], flag: str) -> list[str]:
 def _bot_check(r) -> bool:
     out = r.stdout + r.stderr
     return "confirm you" in out and "not a bot" in out
+
+
+def _refusal(r) -> str:
+    """Why YouTube refused this attempt ("" = it didn't)."""
+    out = r.stdout + r.stderr
+    if "confirm you" in out and "not a bot" in out:
+        return "not a bot"
+    if "HTTP Error 403" in out:
+        return "403"
+    if "Requested format is not available" in out:
+        return "אין פורמט"
+    return ""
+
+
+def _with_clients(cmd: list[str], clients: str) -> list[str]:
+    """cmd with another youtube:player_client list."""
+    out = list(cmd)
+    for i, a in enumerate(out):
+        if a.startswith("youtube:player_client="):
+            out[i] = "youtube:player_client=" + clients
+    return out
 
 
 def ytdlp_cmd(job: dict, out_dir: Path) -> list[str]:
@@ -538,21 +566,30 @@ def _handle(job: dict) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     _current.clear()
     cmd = ytdlp_cmd(job, OUT)
-    # YouTube's "not a bot" depends on the address and on the cookies; when
-    # it refuses, try the other routes before giving up: the same without
-    # cookies (a rejected cookie file), then without WARP (the direct route).
-    tries = [("", cmd)]
-    if "--cookies" in cmd:
-        tries.append(("בלי עוגיות", _without(cmd, "--cookies")))
+    # YouTube can refuse in two ways: "not a bot" (address/cookies) or 403 on
+    # the video data (the client type needs a token for the stream). Try other
+    # routes and client types before giving up, and say in the log which
+    # one worked.
+    nc = _without(cmd, "--cookies") if "--cookies" in cmd else cmd
+    tries = [("", cmd),
+             ("לקוח android_vr (בלי עוגיות)", _with_clients(nc, "android_vr")),
+             ("לקוח tv", _with_clients(cmd, "tv")),
+             ("לקוח tv_simply (בלי עוגיות)", _with_clients(nc, "tv_simply")),
+             ("לקוח web_safari", _with_clients(cmd, "web_safari"))]
     if "--proxy" in cmd:
         tries.append(("בלי WARP", _without(cmd, "--proxy")))
+    seen = set()
     for n, (label, c) in enumerate(tries):
+        if tuple(c) in seen:
+            continue
+        seen.add(tuple(c))
         if n:
-            log(f"   יוטיוב ביקש 'not a bot' — מנסה שוב {label}")
+            log(f"   יוטיוב סירב ({why}) — מנסה שוב: {label}")
         r = run_ytdlp(c, vid)
-        if _current.get("stopped") or not _bot_check(r):
+        why = _refusal(r)
+        if _current.get("stopped") or not why:
             if n:
-                log(f"   ✓ עבר {label}")
+                log(f"   ✓ עבד: {label}")
             break
     stopped = _current.get("stopped")
     if stopped:
