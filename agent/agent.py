@@ -221,6 +221,9 @@ def prog_file(vid: str) -> Path:
     return Path("/tmp") / f"ffprog-{vid}.txt"
 
 
+_LAST_GOOD = {"label": ""}     # the way that last got past YouTube
+
+
 def _without(cmd: list[str], flag: str) -> list[str]:
     """cmd without `flag` and its value."""
     i = cmd.index(flag)
@@ -598,6 +601,8 @@ def _handle(job: dict) -> None:
              ("לקוח web_safari", _with_clients(cmd, "web_safari"))]
     if "--proxy" in cmd:
         tries.append(("בלי WARP", _without(cmd, "--proxy")))
+    # Start with whatever worked last time (no wasted attempts once a way is found).
+    tries.sort(key=lambda t: t[0] != _LAST_GOOD["label"])
     seen = set()
     for n, (label, c) in enumerate(tries):
         if tuple(c) in seen:
@@ -609,8 +614,9 @@ def _handle(job: dict) -> None:
         why = _refusal(r)
         out = r.stdout + r.stderr
         if _current.get("stopped") or r.returncode == 0:
-            if n:
-                log(f"   ✓ עבד: {label}")
+            if r.returncode == 0 and label != _LAST_GOOD["label"]:
+                _LAST_GOOD["label"] = label
+                log(f"   ✓ עבד: {label or 'ברירת מחדל'} — מעכשיו מתחילים בדרך הזו")
             break
         if "does not pass filter" in out or "age restricted" in out or "age-restricted" in out:
             break                               # not YouTube refusing — no point retrying
