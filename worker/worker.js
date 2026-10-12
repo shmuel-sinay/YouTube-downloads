@@ -378,7 +378,7 @@ async function wakeAgent(env) {
 // keys. Every other profile has its own copy of everything under
 // "p:<id>:" — channels, queue, history, log, settings. "agent" and the
 // profile list itself stay global.
-const GLOBAL_KEYS = new Set(["agent", "profiles", "mainprof", "activity"]);
+const GLOBAL_KEYS = new Set(["agent", "profiles", "mainprof", "activity", "ytcookies"]);
 
 function profileEnv(env, pid) {
   if (!pid || pid === "main") return { ...env, PROFILE: "main" };
@@ -434,6 +434,12 @@ async function checkCode(env, pid, password) {
   if (pid === "main") return !!env.ADMIN_PASSWORD && password === env.ADMIN_PASSWORD;
   const pr = (await getJSON(env, "profiles", {}))[pid];
   return !!pr && pr.hash === await sha256("pw:" + password);
+}
+
+// Key for the cookie extension: derived from the admin password, shown to
+// the admin in Settings.
+async function cookiePushKey(env) {
+  return (await sha256("yt-cookie-push:" + env.ADMIN_PASSWORD)).slice(0, 32);
 }
 
 async function loginProfile(env, password) {
@@ -586,6 +592,11 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       await addLog(env, "worker", `${STATUS[j.status] || j.status}: ${j.title}` + (j.error ? ` — ${j.error}` : ""));
       return json({ ok: true });
     }
+    if (p === "/api/cookies" && req.method === "POST") {
+      // Fresh YouTube cookies from the browser extension (see /cookies/push).
+      const c = await getJSON(env, "ytcookies", null);
+      return json(c ? { text: c.text, at: c.at, count: c.count } : {});
+    }
     return json({ error: "not found" }, 404);
   }
 
@@ -602,6 +613,22 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   }
   if (p === "/logout") {
     return redirect(BASE + "/", { "Set-Cookie": "auth=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0" });
+  }
+  // The browser extension sends YouTube cookies here (with the admin's key);
+  // only the download server can read them back (/api/cookies).
+  if (p === "/cookies/push" && req.method === "POST") {
+    if (!env.ADMIN_PASSWORD || req.headers.get("X-Push-Key") !== await cookiePushKey(env)) {
+      return new Response("מפתח שגוי — העתק אותו מהאתר: הגדרות ← תוסף דפדפן", { status: 403 });
+    }
+    const b = await req.json();
+    const text = String(b.cookies || "");
+    if (!text.startsWith("# Netscape") || text.length > 200000) return new Response("קובץ עוגיות לא תקין", { status: 400 });
+    const old = await getJSON(env, "ytcookies", null);
+    // Write at most every 5 minutes unless something changed (saves writes).
+    if (!old || old.text !== text || Date.now() - Date.parse(old.at) > 300000) {
+      await putJSON(env, "ytcookies", { text, at: new Date().toISOString(), count: +b.count || 0 });
+    }
+    return json({ ok: true });
   }
   const pid = await whoIs(req, env);
   if (!pid) {
@@ -1006,7 +1033,12 @@ async function state(env) {
   const profile = await profileInfo(env, pid);
   const profiles = profile.admin ? [profile, ...Object.entries(profs).map(([id, v]) => ({ id, name: v.name, created: v.created,
     netfree: !!v.netfree, vault: !!v.vault, direct: !!v.direct }))] : [];
-  return { channels, jobs: jobs.slice(0, 200), logs: logs.slice(-LOG_CAP), agent, lastCheck, settings, pc, profile, profiles,
+  let cookieExt = null;
+  if (profile.admin) {
+    const c = await getJSON(env, "ytcookies", null);
+    cookieExt = { key: await cookiePushKey(env), at: c && c.at, count: c && c.count };
+  }
+  return { channels, jobs: jobs.slice(0, 200), logs: logs.slice(-LOG_CAP), agent, lastCheck, settings, pc, profile, profiles, cookieExt,
            renderUrl: env.RENDER_URL || "", now: new Date().toISOString() };
 }
 
@@ -1388,6 +1420,13 @@ async function dashboard(env) {
         <div class="actions-row" style="align-self:end;margin:0"><button class="btn">${icon("add")}<span>צור פרופיל</span></button></div>
       </form>
     </div>
+    <div class="card hidden" id="cookieCard">
+      <h2>${icon("key")}תוסף דפדפן — עוגיות יוטיוב</h2>
+      <p class="sub">התוסף שולח את עוגיות יוטיוב מהדפדפן שלך (רק לאתר הזה), ושרת ההורדות משתמש תמיד בעדכניות — בלי לייצא קבצים. מתקינים פעם אחת: מורידים את <b>YTCookies-extension.zip</b> מעמוד ההורדות של התוכנה, פותחים אותו, ב-Chrome: chrome://extensions ← מצב מפתח ← "טען תוסף לא ארוז" ← בוחרים את התיקייה. בתוסף מדביקים את המפתח.</p>
+      <div class="setting"><div class="txt"><b>מפתח לתוסף</b><span id="ckKey" style="direction:ltr;font-family:monospace"></span></div>
+        <button class="btn ghost" id="ckCopy" type="button">${icon("copy")}<span>העתק</span></button></div>
+      <div class="setting"><div class="txt"><b>עדכון אחרון מהתוסף</b><span id="ckAt"></span></div></div>
+    </div>
     <div class="card hidden" id="desktopCard">
       <h2>${icon("monitor")}התוכנה למחשב</h2>
       <div class="setting"><div class="txt"><b>הפעלה עם Windows</b><span>התוכנה תעלה ברקע כשהמחשב נדלק ותמשיך להוריד גם כשהחלון סגור (אייקון ליד השעון).</span></div>
@@ -1589,6 +1628,11 @@ function render() {
   });
   $("profileName").textContent = (S.profile && S.profile.name) || "";
   $("globalNav").classList.toggle("hidden", !(S.profile && S.profile.admin));
+  $("cookieCard").classList.toggle("hidden", !S.cookieExt);
+  if (S.cookieExt) {
+    $("ckKey").textContent = S.cookieExt.key;
+    $("ckAt").textContent = S.cookieExt.at ? ago(S.cookieExt.at) + " · " + (S.cookieExt.count || "?") + " עוגיות" : "עוד לא התקבלו עוגיות מהתוסף";
+  }
   renderDash();
   $("profilesCard").classList.toggle("hidden", !(S.profile && S.profile.admin));
   const sw = (pr, flag, label) => '<label>' + label + '<span class="switch"><input type="checkbox" data-prof="' + esc(pr.id) + '" data-flag="' + flag + '"' + (pr[flag] ? " checked" : "") + '><i></i></span></label>';
@@ -1601,6 +1645,7 @@ function render() {
   $("pcState").textContent = pcActive() ? "התוכנה פועלת עכשיו — היא מורידה." : "";
 }
 
+$("ckCopy").onclick = async () => { try { await navigator.clipboard.writeText(S.cookieExt.key); toast("המפתח הועתק"); } catch (e) { toast("סמן והעתק ידנית"); } };
 document.addEventListener("change", async (e) => {
   const t = e.target; if (!t.dataset || !t.dataset.prof) return;
   const d = new FormData(); d.append("id", t.dataset.prof); d.append(t.dataset.flag, t.checked ? "1" : "0");

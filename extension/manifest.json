@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "מעקב ערוצים — עוגיות יוטיוב",
+  "version": "1.0",
+  "description": "שולח את עוגיות יוטיוב מהדפדפן הזה רק לאתר מעקב הערוצים שלך, כדי ששרת ההורדות יעבור את בדיקת הבוט של יוטיוב.",
+  "icons": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" },
+  "action": { "default_title": "מעקב ערוצים — עוגיות", "default_popup": "popup.html" },
+  "background": { "service_worker": "background.js" },
+  "permissions": ["cookies", "alarms", "storage"],
+  "host_permissions": ["https://*.youtube.com/*", "https://*.workers.dev/*"]
+}

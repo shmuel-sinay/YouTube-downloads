@@ -60,9 +60,27 @@ PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_UR
 KEEP_FILES_HOURS = float(os.environ.get("KEEP_FILES_HOURS", "6"))
 
 
+_EXT_COOKIES = {"checked": 0.0, "text": "", "at": ""}
+
+
 def cookies_path() -> str | None:
     """yt-dlp rewrites the cookie file when it exits; Render's secret files
     are read-only, so yt-dlp always gets a fresh private copy."""
+    # 1. fresh cookies from the browser extension (via the Worker), checked
+    #    at most every 2 minutes
+    if time.time() - _EXT_COOKIES["checked"] > 120:
+        _EXT_COOKIES["checked"] = time.time()
+        try:
+            d = api("/api/cookies", {})
+            if d.get("text"):
+                _EXT_COOKIES.update(text=d["text"], at=d.get("at", ""))
+        except Exception:
+            pass
+    if _EXT_COOKIES["text"]:
+        dst = Path("/tmp/yt-cookies.txt")
+        dst.write_text(_EXT_COOKIES["text"])
+        return str(dst)
+    # 2. the cookies.txt secret file in Render
     src = os.environ.get("YTDLP_COOKIES")
     if not src or not Path(src).exists():
         return None
@@ -118,7 +136,7 @@ def hello() -> None:
     except Exception as e:
         print(f"[!] hello failed (TRACKER_URL / AGENT_TOKEN?): {e}", flush=True)
     log(f"סוכן עלה: yt-dlp {info['ytdlp']}, node {info['node']}, "
-        f"עוגיות {'יש' if info['cookies'] else 'אין!'}, שרת טוקנים {info['pot'] or 'לא פעיל!'}, "
+        f"עוגיות {('מהתוסף' if _EXT_COOKIES['text'] else 'יש') if info['cookies'] else 'אין!'}, שרת טוקנים {info['pot'] or 'לא פעיל!'}, "
         f"WARP {'פעיל' if info['warp'] else 'לא פעיל'}")
     # Show the helpers' own output when they didn't come up (Render's logs
     # aren't reachable from the site).
