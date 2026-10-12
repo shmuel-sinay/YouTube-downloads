@@ -3,7 +3,11 @@
 # the agent still runs (and says so in the site's log).
 
 # 1. PO-token server (bgutil) — the "proof of origin" YouTube asks servers for.
-node /pot/build/main.js --host 127.0.0.1 --port 4416 > /tmp/pot.log 2>&1 &
+#    Off by default: it takes ~200MB of the free plan's 512MB, and the client
+#    that gets through via WARP (tv_simply) doesn't need it. USE_POT=1 turns it on.
+if [ "${USE_POT:-0}" = "1" ]; then
+  node --max-old-space-size=160 /pot/build/main.js --host 127.0.0.1 --port 4416 > /tmp/pot.log 2>&1 &
+fi
 
 # 2. Cloudflare WARP as a local SOCKS proxy: the server's own traffic to
 #    YouTube leaves through Cloudflare's network instead of Render's address.

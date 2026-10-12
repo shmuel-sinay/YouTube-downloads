@@ -130,7 +130,7 @@ def hello() -> None:
             return "חסר"
     info = {"ytdlp": ver(["yt-dlp", "--version"]), "node": ver(["node", "--version"]),
             "ffmpeg": ver(["ffmpeg", "-version"])[:40], "cookies": bool(cookies_path()),
-            "pot": pot_server(), "warp": warp_up(wait=30), "mode": "render" if PORT else "loop", "public": PUBLIC_URL}
+            "pot": pot_server() if os.environ.get("USE_POT") == "1" else "כבוי", "warp": warp_up(wait=30), "mode": "render" if PORT else "loop", "public": PUBLIC_URL}
     try:
         api("/api/hello", info)
     except Exception as e:
@@ -594,10 +594,11 @@ def _handle(job: dict) -> None:
     # routes and client types before giving up, and say in the log which
     # one worked.
     nc = _without(cmd, "--cookies") if "--cookies" in cmd else cmd
-    tries = [("", cmd),
+    # Order = what got through on Render (via WARP): tv_simply first.
+    tries = [("לקוח tv_simply (בלי עוגיות)", _with_clients(nc, "tv_simply")),
              ("לקוח android_vr (בלי עוגיות)", _with_clients(nc, "android_vr")),
+             ("", cmd),
              ("לקוח tv", _with_clients(cmd, "tv")),
-             ("לקוח tv_simply (בלי עוגיות)", _with_clients(nc, "tv_simply")),
              ("לקוח web_safari", _with_clients(cmd, "web_safari"))]
     if "--proxy" in cmd:
         tries.append(("בלי WARP", _without(cmd, "--proxy")))
@@ -802,31 +803,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def youtube_selftest() -> None:
-    """On startup: which route gets past YouTube right now? Writes one line
-    to the site's log, e.g. "בדיקת יוטיוב: WARP ✓ · ישיר ✗" — so a block is
-    visible before any download fails."""
-    probe = "https://www.youtube.com/watch?v=jNQXAC9IVRw"     # "Me at the zoo" — always online
-    base = ["yt-dlp", probe, "--simulate", "--no-playlist", "--no-warnings", "-q",
-            "--js-runtimes", "node", "--impersonate", "chrome",
-            "--extractor-args", "youtube:player_client=default,mweb"]
-    cookies = cookies_path()
-    routes = []
-    if warp_up():
-        routes.append(("WARP", ["--proxy", WARP_PROXY, "--force-ipv4"]))
-    routes.append(("ישיר", []))
-    parts = []
-    for name, extra in routes:
-        for label, ck in ((" + עוגיות", ["--cookies", cookies] if cookies else None), ("", [])):
-            if ck is None:
-                continue
-            try:
-                r = subprocess.run(base + extra + ck, capture_output=True, text=True, timeout=120)
-                ok = r.returncode == 0
-                why = "" if ok else (" (not a bot)" if "not a bot" in r.stderr else "")
-            except Exception:
-                ok, why = False, " (timeout)"
-            parts.append(f"{name}{label} {'✓' if ok else '✗' + why}")
-    log("בדיקת יוטיוב: " + " · ".join(parts))
+    """On startup, once: does the first route (WARP + tv_simply) get past
+    YouTube? One light check (no download), skipped while a job runs — the
+    free server has only 512MB."""
+    time.sleep(20)
+    if _current.get("proc") and _current["proc"].poll() is None:
+        return
+    cmd = ["yt-dlp", "https://www.youtube.com/watch?v=jNQXAC9IVRw", "--simulate", "--no-playlist",
+           "--no-warnings", "-q", "--js-runtimes", "node", "--impersonate", "chrome",
+           "--extractor-args", "youtube:player_client=tv_simply"] + net_args()
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        res = "✓" if r.returncode == 0 else "✗" + (" (not a bot)" if "not a bot" in r.stderr else "")
+    except Exception:
+        res = "✗ (timeout)"
+    log(f"בדיקת יוטיוב ({'WARP' if warp_up() else 'ישיר'}, tv_simply): {res}")
 
 
 def serve() -> int:
