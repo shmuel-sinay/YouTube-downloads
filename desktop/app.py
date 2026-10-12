@@ -54,6 +54,21 @@ WAKE_EVERY = 300          # nudge the download server while work is waiting
 RETRY_404_HOURS = 24      # re-queue a vanished file only if it finished recently
 
 
+# Per-user choices (each person on the computer decides for themselves).
+PREFS = USERDATA / "prefs.json"
+NOTIFY_MODES = {"each": "על כל קובץ", "batch": "רק בסיום משימת הורדה", "off": "ללא התראות"}
+
+
+def get_pref(key: str, default):
+    return load_json(PREFS, {}).get(key, default)
+
+
+def set_pref(key: str, value) -> None:
+    prefs = load_json(PREFS, {})
+    prefs[key] = value
+    save_json(PREFS, prefs)
+
+
 def load_json(path: Path, default):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -130,6 +145,8 @@ class Downloader(threading.Thread):
         self.last_update_check = time.time()
         self.lock = threading.Lock()          # one download at a time
         self.notify = lambda title, msg: None  # set by the tray icon
+        self._seen: set | None = None           # files already announced
+        self._batch = 0                         # files in the current "download task"
 
     # -- helpers
     def log(self, msg: str, remote: bool = True) -> None:
@@ -224,7 +241,6 @@ class Downloader(threading.Thread):
         self.save_state()
         self.pending_got.append(job["videoId"])
         self.log(f"ירד למחשב: {final.name}")
-        self.notify("ירד קובץ חדש", final.name)
 
     def convert_to_mp3(self, zpath: Path, folder: Path) -> Path:
         """The server sent the original audio (no MP3 encode, to save its
@@ -272,7 +288,12 @@ class Downloader(threading.Thread):
         lock = DownloadLock()
         while True:
             if not lock.acquire():
-                # Another user's copy is downloading for this computer.
+                # Another user's copy is downloading for this computer; this
+                # copy still shows notifications to its own user.
+                try:
+                    self.notify_from(self.status())
+                except Exception:
+                    pass
                 time.sleep(POLL_SECONDS)
                 continue
             try:
@@ -292,11 +313,38 @@ class Downloader(threading.Thread):
                 if waiting and time.time() - self.last_wake > WAKE_EVERY:
                     self.last_wake = time.time()
                     self.s.post(self.base + "/wake", timeout=90)
+                self.notify_from(st)
             except Exception as e:
                 self.log(f"שגיאה: {e}", remote=False)
             self.check_for_update()
             self.flush_logs()
             time.sleep(POLL_SECONDS)
+
+    def notify_from(self, st: dict) -> None:
+        """Notifications per this user's choice: each file that reached the
+        computer, one summary when the queue empties, or none. Works the same
+        in every user's copy (whichever one did the downloading)."""
+        jobs = st.get("jobs", [])
+        landed = {j["videoId"]: j for j in jobs if j.get("status") == "done" and j.get("pcGot")}
+        if self._seen is None:                       # first look: don't announce old files
+            self._seen = set(landed)
+            return
+        new = [landed[v] for v in landed if v not in self._seen]
+        self._seen |= set(landed)
+        mode = get_pref("notify", "each")
+        if mode == "each":
+            for j in new[:5]:
+                self.notify("ירד קובץ חדש", j.get("title") or j["videoId"])
+            if len(new) > 5:
+                self.notify("ירדו קבצים חדשים", f"ועוד {len(new) - 5} קבצים")
+        elif mode == "batch":
+            self._batch += len(new)
+            busy = any(j.get("status") in ("queued", "taken") for j in jobs)
+            if self._batch and not busy:
+                self.notify("ההורדות הסתיימו", f"ירדו {self._batch} קבצים לתיקייה")
+                self._batch = 0
+        else:
+            self._batch = 0
 
     def check_for_update(self) -> None:
         """While running, just announce a new version; it installs itself
@@ -668,7 +716,16 @@ class Api:
         return [v for v, p in self.dl.state.get("files", {}).items() if Path(p).exists()]
 
     def app_info(self) -> dict:
-        return {"folder": self.cfg["folder"], "version": bundled_version()[:7], "autostart": get_autostart()}
+        return {"folder": self.cfg["folder"], "version": bundled_version()[:7], "autostart": get_autostart(),
+                "notify": get_pref("notify", "each")}
+
+    def get_notify(self) -> str:
+        return get_pref("notify", "each")
+
+    def set_notify(self, mode: str) -> str:
+        if mode in NOTIFY_MODES:
+            set_pref("notify", mode)
+        return get_pref("notify", "each")
 
     def set_autostart(self, on: bool) -> bool:
         set_autostart(bool(on))
@@ -681,8 +738,16 @@ def make_tray(on_open, on_quit, cfg: dict):
         import pystray
         from PIL import Image
         img = Image.open(icon_path())
+        def pick(mode):
+            return lambda icon, item: set_pref("notify", mode)
+
+        def is_on(mode):
+            return lambda item: get_pref("notify", "each") == mode
+        notify_menu = pystray.Menu(*[pystray.MenuItem(label, pick(m), checked=is_on(m), radio=True)
+                                     for m, label in NOTIFY_MODES.items()])
         menu = pystray.Menu(
             pystray.MenuItem("פתח", lambda: on_open(), default=True),
+            pystray.MenuItem("התראות", notify_menu),
             pystray.MenuItem("פתח את תיקיית ההורדות", lambda: os.startfile(cfg["folder"])),
             pystray.MenuItem("יציאה", lambda: on_quit()))
         return pystray.Icon(APP, img, "מעקב ערוצים — מוריד ברקע", menu)

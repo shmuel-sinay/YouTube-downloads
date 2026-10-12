@@ -857,6 +857,8 @@ async function dashboard(env) {
       <h2>${icon("monitor")}התוכנה למחשב</h2>
       <div class="setting"><div class="txt"><b>הפעלה עם Windows</b><span>התוכנה תעלה ברקע כשהמחשב נדלק ותמשיך להוריד גם כשהחלון סגור (אייקון ליד השעון).</span></div>
         <label class="switch"><input type="checkbox" id="autostart"><i></i></label></div>
+      <div class="setting"><div class="txt"><b>התראות</b><span>לכל משתמש במחשב הבחירה שלו.</span></div>
+        <select id="notifyMode" style="width:auto"><option value="each">על כל קובץ</option><option value="batch">רק בסיום משימת הורדה</option><option value="off">ללא התראות</option></select></div>
       <div class="setting"><div class="txt"><b>תיקיית הורדות</b><span id="folderPath"></span></div>
         <button class="btn ghost" id="openFolder" type="button">${icon("folder")}<span>פתח</span></button></div>
       <div class="setting"><div class="txt"><b>גרסה</b><span id="appVersion"></span></div></div>
@@ -1083,6 +1085,8 @@ async function initDesktop() {
     $("autostart").checked = !!info.autostart;
     $("autostart").onchange = async (e) => { await APP().set_autostart(e.target.checked); toast(e.target.checked ? "תעלה עם Windows" : "לא תעלה עם Windows"); };
     $("openFolder").onclick = () => APP().open_folder();
+    $("notifyMode").value = info.notify || "each";
+    $("notifyMode").onchange = async (e) => { await APP().set_notify(e.target.value); toast("ההתראות עודכנו"); };
     render();
   } catch (e) {}
 }
