@@ -173,8 +173,9 @@ class Vault:
                 continue          # damaged / foreign file — skip
         return sorted(out, key=lambda e: e.get("added", ""), reverse=True)
 
-    def extract(self, eid: str, dest_dir: str | Path) -> Path:
-        """Decrypt one entry into dest_dir (under its real name)."""
+    def extract(self, eid: str, dest_dir: str | Path, progress=None) -> Path:
+        """Decrypt one entry into dest_dir (under its real name).
+        progress(bytes_written_so_far) is called after every chunk."""
         f, aes, h = self._open(self.dir / (eid + ".ytv"))
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -182,7 +183,7 @@ class Vault:
         out_path = dest_dir / name
         try:
             with f, out_path.open("wb") as out:
-                n = 1
+                n, written = 1, 0
                 while True:
                     raw = f.read(4)
                     if len(raw) < 4:
@@ -190,9 +191,14 @@ class Vault:
                     (ln,) = struct.unpack(">I", raw)
                     blob = f.read(ln)
                     try:
-                        out.write(aes.decrypt(_nonce(n), blob, b""))
+                        data, last = aes.decrypt(_nonce(n), blob, b""), False
                     except Exception:
-                        out.write(aes.decrypt(_nonce(n), blob, b"end"))
+                        data, last = aes.decrypt(_nonce(n), blob, b"end"), True
+                    out.write(data)
+                    written += len(data)
+                    if progress:
+                        progress(written)
+                    if last:
                         break
                     n += 1
         except Exception:
