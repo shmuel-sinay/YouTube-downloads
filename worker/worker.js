@@ -545,8 +545,10 @@ async function geminiCall(env, model, body, only) {
   const ready = all.filter((k) => !((k.until || {})[model] > now));
   if (!ready.length) {
     const t = Math.min(...all.map((k) => (k.until || {})[model] || now));
-    return { error: "כל המפתחות מוגבלים כרגע עד " + new Date(t).toLocaleTimeString("he-IL", { timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit" }) +
-      " — אפשר להוסיף מפתח בהגדרות", status: 429 };
+    const img = /image/.test(model);
+    return { error: (img ? "יצירת תמונות דורשת חשבון Google עם חיוב פעיל (לא זמינה בחינם). " : "") +
+      "כל המפתחות מוגבלים כרגע עד " + new Date(t).toLocaleTimeString("he-IL", { timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit" }) +
+      (img ? "" : " — אפשר להוסיף מפתח בהגדרות"), status: 429 };
   }
   let last = "", changed = false;
   for (const k of ready) {
