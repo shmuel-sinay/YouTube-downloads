@@ -1215,6 +1215,9 @@ class Api:
             return "ok"
         return "אין גרסה חדשה, או שההורדה נכשלה (פרטים בלוג)"
 
+    def restart(self) -> str:
+        return restart_app()
+
     def nf_test(self, link: str) -> str:
         """Admin: check one video against NetFree right now (to calibrate)."""
         dl = self._dl()
@@ -1280,6 +1283,18 @@ def open_vault_window(cfg: dict) -> None:
     w.events.closed += closed
 
 
+def restart_app() -> str:
+    """Close this copy and start a fresh one — which, as on every start,
+    installs a newer version first if there is one."""
+    if not getattr(sys, "frozen", False):
+        return "לא זמין בהרצה מקוד"
+    args = [a for a in sys.argv[1:] if a not in ("--after-update", "--background") and not a.isdigit()]
+    subprocess.Popen([sys.executable] + args + ["--after-update", str(os.getpid())], close_fds=True)
+    if _QUIT.get("fn"):
+        threading.Timer(1.0, _QUIT["fn"]).start()
+    return "ok"
+
+
 def make_tray(on_open, on_quit):
     """Icon next to the clock: keeps the app running with the window closed.
     Nothing personal in its menu — anyone at the computer can click it."""
@@ -1289,6 +1304,7 @@ def make_tray(on_open, on_quit):
         img = Image.open(icon_path())
         menu = pystray.Menu(
             pystray.MenuItem("פתח", lambda: on_open(), default=True),
+            pystray.MenuItem("הפעל מחדש (ומתעדכן)", lambda: restart_app()),
             pystray.MenuItem("יציאה", lambda: on_quit()))
         return pystray.Icon(APP, img, f"מעקב ערוצים {bundled_version_name()} — מוריד ברקע", menu)
     except Exception:

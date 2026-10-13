@@ -1556,7 +1556,8 @@ async function dashboard(env) {
       <div class="setting hidden" id="nfTestRow"><div class="txt"><b>בדיקת נטפרי</b><span>הדבק קישור לסרטון — התוכנה בודקת דרך החיבור בבית אם הוא פתוח בנטפרי. <span id="nfTestOut" style="white-space:pre-wrap"></span></span></div>
         <span style="display:flex;gap:8px"><input id="nfTestUrl" placeholder="https://youtu.be/…" style="width:200px"><button class="btn ghost" id="nfTestBtn" type="button">בדוק</button></span></div>
       <div class="setting"><div class="txt"><b>גרסה</b><span id="appVersion"></span></div>
-        <button class="btn hidden" id="updateNow" type="button">${icon("download")}<span>עדכן עכשיו</span></button></div>
+        <span style="display:flex;gap:8px"><button class="btn hidden" id="updateNow" type="button">${icon("download")}<span>עדכן עכשיו</span></button>
+        <button class="btn ghost" id="restartApp" type="button" title="סוגר ופותח את התוכנה מחדש, ומתקין גרסה חדשה אם יש">${icon("refresh")}<span>הפעל מחדש</span></button></span></div>
       <div class="vnotes hidden" id="whatsNew">
         <details open><summary id="newTitle">מה חדש בגרסה האחרונה</summary><div id="newNotes"></div></details>
         <details><summary>כל השינויים</summary><div id="changelog"></div></details>
@@ -1963,6 +1964,10 @@ async function loadVersion() {
   $("appVersion").innerHTML = 'מותקנת: <span style="font-weight:600;color:var(--text)">' + esc(v.installed) + "</span>" +
     (v.latest ? (v.update ? ' · <span class="vnew">יש גרסה חדשה: ' + esc(v.latest) + '</span>' : ' · <span class="vok">' + icon("check") + ' זו הגרסה האחרונה</span>') : (v.error ? " · " + esc(v.error) : ""));
   $("updateNow").classList.toggle("hidden", !v.update);
+  $("restartApp").onclick = async () => {
+    if (!APP().restart) return toast("הכפתור יעבוד מגרסה 1.27 — בינתיים: יציאה מהאייקון ליד השעון ופתיחה מחדש", 8000);
+    toast("מפעיל מחדש… (אם יש גרסה חדשה — היא מותקנת)", 10000); const r = await APP().restart(); if (r !== "ok") toast(r, 6000);
+  };
   $("updateNow").onclick = async () => {
     $("updateNow").disabled = true; toast("מוריד את גרסה " + v.latest + "…", 60000);
     const r = await APP().update_now();
