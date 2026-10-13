@@ -891,6 +891,44 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     await addLog(env, "worker", `ההיסטוריה נוקתה: ${done.length} פריטים`);
     return json({ deleted: done.map((j) => j.videoId) });
   }
+  // --- images from Gemini, for the desktop app only ---
+  // The picture never leaves here as a picture: it's scrambled (AES-GCM,
+  // see scrambleImage) into plain bytes, and the app unscrambles and shows it
+  // on the computer. Not offered to a NetFree-restricted profile.
+  if (p === "/img/make" && req.method === "POST") {
+    if ((await profileInfo(env, pid)).netfree) return json({ error: "לא זמין בפרופיל הזה" }, 403);
+    if (!env.GEMINI_API_KEY) return json({ error: "חסר Secret בשם GEMINI_API_KEY ב-Worker" }, 400);
+    const prompt = String((await req.json()).prompt || "").trim().slice(0, 2000);
+    if (!prompt) return json({ error: "צריך לכתוב מה לצייר" }, 400);
+    const model = env.IMAGE_MODEL || "gemini-2.5-flash-image";
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }],
+                             generationConfig: { responseModalities: ["TEXT", "IMAGE"] } }),
+    });
+    // The answer is ~2MB of JSON with the picture as base64. The free plan
+    // allows ~10ms of work per request, so no parsing or decoding here: the
+    // base64 text is cut out with indexOf and scrambled as it is (native
+    // code); the app decodes it.
+    const text = await r.text();
+    const at = text.indexOf('"inlineData"');
+    const dk = at < 0 ? -1 : text.indexOf('"data"', at);
+    const ds = dk < 0 ? -1 : text.indexOf('"', text.indexOf(":", dk + 6)) + 1;
+    if (ds <= 0) {
+      let d = {}; try { d = JSON.parse(text); } catch (e) {}
+      const parts = (d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts) || [];
+      const why = (d.error && d.error.message) || parts.map((x) => x.text).filter(Boolean).join(" ") ||
+        (d.candidates && d.candidates[0] && d.candidates[0].finishReason) || ("HTTP " + r.status + " " + text.slice(0, 120));
+      return json({ error: "Gemini לא החזיר תמונה: " + String(why).slice(0, 300) }, 502);
+    }
+    const de = text.indexOf('"', ds), b64 = text.slice(ds, de);
+    // mimeType sits next to data, before or after it.
+    const mt = /"mimeType"\s*:\s*"([^"]+)"/;
+    const mime = (mt.exec(text.slice(at, dk)) || mt.exec(text.slice(de, de + 200)) || [])[1] || "image/png";
+    return new Response(await scrambleImage(new TextEncoder().encode(b64), mime + ";base64"), {
+      headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
+  }
   if (req.method === "POST") {
     const f = await req.formData();
     if (p === "/channels/add") {
@@ -1055,44 +1093,6 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     }
   }
 
-  // --- images from Gemini, for the desktop app only ---
-  // The picture never leaves here as a picture: it's scrambled (AES-GCM,
-  // see scrambleImage) into plain bytes, and the app unscrambles and shows it
-  // on the computer. Not offered to a NetFree-restricted profile.
-  if (p === "/img/make" && req.method === "POST") {
-    if ((await profileInfo(env, pid)).netfree) return json({ error: "לא זמין בפרופיל הזה" }, 403);
-    if (!env.GEMINI_API_KEY) return json({ error: "חסר Secret בשם GEMINI_API_KEY ב-Worker" }, 400);
-    const prompt = String((await req.json()).prompt || "").trim().slice(0, 2000);
-    if (!prompt) return json({ error: "צריך לכתוב מה לצייר" }, 400);
-    const model = env.IMAGE_MODEL || "gemini-2.5-flash-image";
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
-      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }],
-                             generationConfig: { responseModalities: ["TEXT", "IMAGE"] } }),
-    });
-    // The answer is ~2MB of JSON with the picture as base64. The free plan
-    // allows ~10ms of work per request, so no parsing or decoding here: the
-    // base64 text is cut out with indexOf and scrambled as it is (native
-    // code); the app decodes it.
-    const text = await r.text();
-    const at = text.indexOf('"inlineData"');
-    const dk = at < 0 ? -1 : text.indexOf('"data"', at);
-    const ds = dk < 0 ? -1 : text.indexOf('"', text.indexOf(":", dk + 6)) + 1;
-    if (ds <= 0) {
-      let d = {}; try { d = JSON.parse(text); } catch (e) {}
-      const parts = (d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts) || [];
-      const why = (d.error && d.error.message) || parts.map((x) => x.text).filter(Boolean).join(" ") ||
-        (d.candidates && d.candidates[0] && d.candidates[0].finishReason) || ("HTTP " + r.status + " " + text.slice(0, 120));
-      return json({ error: "Gemini לא החזיר תמונה: " + String(why).slice(0, 300) }, 502);
-    }
-    const de = text.indexOf('"', ds), b64 = text.slice(ds, de);
-    // mimeType sits next to data, before or after it.
-    const mt = /"mimeType"\s*:\s*"([^"]+)"/;
-    const mime = (mt.exec(text.slice(at, dk)) || mt.exec(text.slice(de, de + 200)) || [])[1] || "image/png";
-    return new Response(await scrambleImage(new TextEncoder().encode(b64), mime + ";base64"), {
-      headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
-  }
   if (p === "/status") {
     if (url.searchParams.get("client") === "pc") {
       // Heartbeat from the desktop app (written at most every 3 minutes to
