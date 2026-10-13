@@ -23,7 +23,10 @@ def unscramble(blob: bytes) -> tuple[str, bytes]:
         raise ValueError("לא קובץ תמונה של התוכנה")
     plain = AESGCM(KEY).decrypt(blob[4:16], blob[16:], None)
     n = plain[0]
-    return plain[1:1 + n].decode(), plain[1 + n:]
+    mime, data = plain[1:1 + n].decode(), plain[1 + n:]
+    if mime.endswith(";base64"):          # the Worker sends the base64 text as is
+        mime, data = mime[:-7], base64.b64decode(data.replace(b"\\", b""))
+    return mime, data
 
 
 class Gallery:

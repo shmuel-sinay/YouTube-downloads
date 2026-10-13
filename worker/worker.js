@@ -496,6 +496,7 @@ function isAgent(req, env) {
 // ---------- routing ----------
 
 // Scrambled picture: "YTI1" + 12-byte IV + AES-GCM(mime length, mime, bytes).
+// A mime ending in ";base64" means the bytes are the picture's base64 text.
 // The key is fixed (desktop/images.py has the same): the point is that what
 // travels and what the browser holds is not an image, not secrecy.
 const IMG_KEY_TEXT = "yt-tracker-image-v1";
@@ -1070,16 +1071,26 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }],
                              generationConfig: { responseModalities: ["TEXT", "IMAGE"] } }),
     });
-    const d = await r.json().catch(() => ({}));
-    const parts = (d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts) || [];
-    const img = parts.find((x) => x.inlineData && x.inlineData.data);
-    if (!img) {
+    // The answer is ~2MB of JSON with the picture as base64. The free plan
+    // allows ~10ms of work per request, so no parsing or decoding here: the
+    // base64 text is cut out with indexOf and scrambled as it is (native
+    // code); the app decodes it.
+    const text = await r.text();
+    const at = text.indexOf('"inlineData"');
+    const dk = at < 0 ? -1 : text.indexOf('"data"', at);
+    const ds = dk < 0 ? -1 : text.indexOf('"', text.indexOf(":", dk + 6)) + 1;
+    if (ds <= 0) {
+      let d = {}; try { d = JSON.parse(text); } catch (e) {}
+      const parts = (d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts) || [];
       const why = (d.error && d.error.message) || parts.map((x) => x.text).filter(Boolean).join(" ") ||
-        (d.candidates && d.candidates[0] && d.candidates[0].finishReason) || ("HTTP " + r.status);
+        (d.candidates && d.candidates[0] && d.candidates[0].finishReason) || ("HTTP " + r.status + " " + text.slice(0, 120));
       return json({ error: "Gemini לא החזיר תמונה: " + String(why).slice(0, 300) }, 502);
     }
-    const bytes = Uint8Array.from(atob(img.inlineData.data), (c) => c.charCodeAt(0));
-    return new Response(await scrambleImage(bytes, img.inlineData.mimeType || "image/png"), {
+    const de = text.indexOf('"', ds), b64 = text.slice(ds, de);
+    // mimeType sits next to data, before or after it.
+    const mt = /"mimeType"\s*:\s*"([^"]+)"/;
+    const mime = (mt.exec(text.slice(at, dk)) || mt.exec(text.slice(de, de + 200)) || [])[1] || "image/png";
+    return new Response(await scrambleImage(new TextEncoder().encode(b64), mime + ";base64"), {
       headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
   }
   if (p === "/status") {
@@ -1896,7 +1907,7 @@ $("imgMake").onclick = async () => {
   try {
     const r = await fetch(B + "/img/make", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }) });
     if ((r.headers.get("content-type") || "").includes("json")) throw new Error((await r.json()).error || "שגיאה");
-    if (!r.ok) throw new Error("HTTP " + r.status);
+    if (!r.ok) throw new Error("HTTP " + r.status + " " + (await r.text()).slice(0, 200));
     await APP().img_save(b64(await r.arrayBuffer()), prompt);
     $("imgStatus").textContent = ""; await loadImages();
   } catch (e) { $("imgStatus").textContent = ""; toast("שגיאה: " + (e.message || e), 8000); }
