@@ -574,6 +574,24 @@ async function geminiCall(env, model, body, only) {
   return { error: "כל המפתחות נכשלו — " + last, status: 429 };
 }
 
+// Rewrite a free-text image request (any language, with chatter like
+// "give me a picture of…") into a short, direct English prompt for FLUX.
+// Returns "" if Gemini can't be reached, so the caller keeps the original.
+async function cleanImagePrompt(env, prompt) {
+  const instruction = "Rewrite the following into a concise English image-generation prompt: " +
+    "keep only the visual description, drop phrases like 'give me a picture of', translate to English, " +
+    "add a short style hint if missing. Output ONLY the prompt, one line, no quotes.\n\n" + prompt;
+  try {
+    const call = await geminiCall(env, "gemini-2.5-flash",
+      JSON.stringify({ contents: [{ parts: [{ text: instruction }] }], generationConfig: { temperature: 0.4, maxOutputTokens: 120 } }));
+    if (call.error) return "";
+    const d = await call.res.json();
+    const t = d && d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts &&
+      d.candidates[0].content.parts.map((x) => x.text || "").join(" ").trim();
+    return (t || "").replace(/^["']|["']$/g, "").slice(0, 500);
+  } catch (e) { return ""; }
+}
+
 const json = (v, status = 200) => new Response(JSON.stringify(v), {
   status, headers: { "Content-Type": "application/json; charset=utf-8" } });
 const redirect = (to, headers = {}) => new Response(null, { status: 303, headers: { Location: to, ...headers } });
@@ -963,11 +981,17 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (!prompt) return json({ error: "צריך לכתוב מה לצייר" }, 400);
     // Free source: Pollinations returns the image bytes directly, no key.
     if (ib.src === "free") {
+      // FLUX works best with a short, direct English description. Turn the
+      // user's free text (often Hebrew, with "give me a picture of…") into a
+      // clean English prompt via Gemini (free text model). Falls back to the
+      // original text if Gemini isn't available.
+      const cleaned = await cleanImagePrompt(rootEnv, prompt);
+      const finalPrompt = cleaned || prompt;
       // Pollinations is moving to a key/credit model; keep the endpoint and an
       // optional token configurable (FREE_IMG_URL, FREE_IMG_TOKEN) so a change
       // in their policy needs no code change. {prompt} in the URL is replaced.
       const base = rootEnv.FREE_IMG_URL || "https://image.pollinations.ai/prompt/{prompt}?width=1024&height=1024&nologo=true&model=flux";
-      const u = base.replace("{prompt}", encodeURIComponent(prompt)) +
+      const u = base.replace("{prompt}", encodeURIComponent(finalPrompt)) +
         (base.includes("?") ? "&" : "?") + "seed=" + Math.floor(Math.random() * 1e9);
       const hdr = rootEnv.FREE_IMG_TOKEN ? { Authorization: "Bearer " + rootEnv.FREE_IMG_TOKEN } : {};
       const pr = await fetch(u, { headers: hdr });
