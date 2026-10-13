@@ -552,15 +552,19 @@ async function geminiCall(env, model, body, only) {
   for (const k of ready) {
     const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", {
       method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": k.key }, body });
-    const bad400 = res.status === 400 && /API_KEY_INVALID|API key not valid|API key expired/i.test(await res.clone().text());
-    if (!(res.status === 429 || res.status === 401 || res.status === 403 || bad400)) {
+    const peek = res.ok ? "" : await res.clone().text();
+    const bad400 = res.status === 400 && /API_KEY_INVALID|API key not valid|API key expired/i.test(peek);
+    const capped = /spending cap/i.test(peek);           // the project's monthly spend cap (AI Studio)
+    if (!(res.status === 429 || res.status === 401 || res.status === 403 || bad400 || capped)) {
       if (k.err) { setKey(ks, k.i, { err: "" }); changed = true; }
       if (changed) await putJSON(env, "gemkeys", ks);    // the keys that failed on the way rest
       return { res };
     }
     const t = await res.text();
     let msg = t; try { msg = JSON.parse(t).error.message || t; } catch (e) {}
-    const rest = res.status !== 429 ? now + 86400000 : /per ?day|PerDay|limit: 0/i.test(t) ? nextQuotaReset() : now + 65000;
+    const month = new Date(); month.setUTCMonth(month.getUTCMonth() + 1, 1); month.setUTCHours(8, 0, 0, 0);
+    const rest = capped ? month.getTime() : res.status !== 429 ? now + 86400000
+      : /per ?day|PerDay|limit: 0/i.test(t) ? nextQuotaReset() : now + 65000;
     setKey(ks, k.i, { until: { ...(k.until || {}), [model]: rest }, err: String(msg).slice(0, 200), errAt: new Date().toISOString() });
     last = k.label + ": " + String(msg).slice(0, 160); changed = true;
   }
