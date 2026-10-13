@@ -55,7 +55,7 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --name YTTracker
           --icon desktop/icon.ico --add-data "desktop/icon.ico;."
           --add-data "desktop/version.txt;." --add-data "desktop/CHANGELOG.md;."
-          --collect-all imageio_ffmpeg --collect-all webview --collect-all yt_dlp --hidden-import pystray._win32 --hidden-import vault --hidden-import vault_ui --hidden-import netfree --exclude-module tkinter --paths desktop
+          --collect-all imageio_ffmpeg --collect-all webview --collect-all yt_dlp --hidden-import pystray._win32 --hidden-import vault --hidden-import vault_ui --hidden-import netfree --hidden-import images --exclude-module tkinter --paths desktop
           desktop/app.py
 
       - name: Zip it too (some filters block .exe downloads)

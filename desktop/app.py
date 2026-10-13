@@ -1079,6 +1079,32 @@ class Api:
     def download_now(self, vid: str) -> str:
         return self._dl().download_now(vid)
 
+    # -- pictures made with Gemini (kept scrambled; see images.py)
+    def _gallery(self):
+        from images import Gallery
+        dl = self._dl()
+        if dl.cfg.get("netfree"):
+            raise PermissionError("לא זמין בפרופיל הזה")
+        return Gallery(USERDATA / f"images-{dl.pid}")
+
+    def img_save(self, b64: str, prompt: str) -> str:
+        return self._gallery().add(str(b64), str(prompt))
+
+    def img_list(self) -> list:
+        return self._gallery().list()
+
+    def img_get(self, iid: str) -> str:
+        return self._gallery().data_url(str(iid))
+
+    def img_export(self, iid: str) -> str:
+        dest = self._gallery().export(str(iid), Path.home() / "Pictures" / "Gemini")
+        subprocess.Popen(["explorer", "/select,", str(dest)])
+        return str(dest)
+
+    def img_delete(self, iid: str) -> bool:
+        self._gallery().delete(str(iid))
+        return True
+
     def open_folder(self) -> None:
         dl = self._dl()
         if dl.cfg.get("vault_dir"):

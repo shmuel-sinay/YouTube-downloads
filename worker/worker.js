@@ -495,6 +495,23 @@ function isAgent(req, env) {
 
 // ---------- routing ----------
 
+// Scrambled picture: "YTI1" + 12-byte IV + AES-GCM(mime length, mime, bytes).
+// The key is fixed (desktop/images.py has the same): the point is that what
+// travels and what the browser holds is not an image, not secrecy.
+const IMG_KEY_TEXT = "yt-tracker-image-v1";
+async function scrambleImage(bytes, mime) {
+  const key = await crypto.subtle.importKey("raw", await crypto.subtle.digest("SHA-256", new TextEncoder().encode(IMG_KEY_TEXT)),
+                                            "AES-GCM", false, ["encrypt"]);
+  const m = new TextEncoder().encode(mime);
+  const plain = new Uint8Array(1 + m.length + bytes.length);
+  plain[0] = m.length; plain.set(m, 1); plain.set(bytes, 1 + m.length);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
+  const out = new Uint8Array(4 + 12 + ct.length);
+  out.set(new TextEncoder().encode("YTI1")); out.set(iv, 4); out.set(ct, 16);
+  return out;
+}
+
 const json = (v, status = 200) => new Response(JSON.stringify(v), {
   status, headers: { "Content-Type": "application/json; charset=utf-8" } });
 const redirect = (to, headers = {}) => new Response(null, { status: 303, headers: { Location: to, ...headers } });
@@ -1037,6 +1054,34 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     }
   }
 
+  // --- images from Gemini, for the desktop app only ---
+  // The picture never leaves here as a picture: it's scrambled (AES-GCM,
+  // see scrambleImage) into plain bytes, and the app unscrambles and shows it
+  // on the computer. Not offered to a NetFree-restricted profile.
+  if (p === "/img/make" && req.method === "POST") {
+    if ((await profileInfo(env, pid)).netfree) return json({ error: "לא זמין בפרופיל הזה" }, 403);
+    if (!env.GEMINI_API_KEY) return json({ error: "חסר Secret בשם GEMINI_API_KEY ב-Worker" }, 400);
+    const prompt = String((await req.json()).prompt || "").trim().slice(0, 2000);
+    if (!prompt) return json({ error: "צריך לכתוב מה לצייר" }, 400);
+    const model = env.IMAGE_MODEL || "gemini-2.5-flash-image";
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }],
+                             generationConfig: { responseModalities: ["TEXT", "IMAGE"] } }),
+    });
+    const d = await r.json().catch(() => ({}));
+    const parts = (d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts) || [];
+    const img = parts.find((x) => x.inlineData && x.inlineData.data);
+    if (!img) {
+      const why = (d.error && d.error.message) || parts.map((x) => x.text).filter(Boolean).join(" ") ||
+        (d.candidates && d.candidates[0] && d.candidates[0].finishReason) || ("HTTP " + r.status);
+      return json({ error: "Gemini לא החזיר תמונה: " + String(why).slice(0, 300) }, 502);
+    }
+    const bytes = Uint8Array.from(atob(img.inlineData.data), (c) => c.charCodeAt(0));
+    return new Response(await scrambleImage(bytes, img.inlineData.mimeType || "image/png"), {
+      headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
+  }
   if (p === "/status") {
     if (url.searchParams.get("client") === "pc") {
       // Heartbeat from the desktop app (written at most every 3 minutes to
@@ -1124,6 +1169,7 @@ const IC = {
   edit: '<path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
   logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
   lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>',
 };
 const icon = (n, cls = "") => `<svg class="i ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${IC[n] || ""}</svg>`;
 
@@ -1207,6 +1253,13 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .stat .v{font-size:2rem;font-weight:600;margin-top:6px;font-variant-numeric:tabular-nums}
 .stat .s{color:var(--muted);font-size:.78rem;margin-top:2px}
 .dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}.dgrid .card{margin:0}
+.imggrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;margin-top:14px}
+.imgcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}
+.imgcard img{width:100%;aspect-ratio:1;object-fit:cover;display:block;background:var(--panel2);cursor:zoom-in}
+.imgcard .cap{padding:8px 10px;font-size:.85rem;color:var(--muted);display:flex;gap:6px;align-items:center}
+.imgcard .cap span{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.imgbig{position:fixed;inset:0;background:#000d;display:grid;place-items:center;z-index:50;cursor:zoom-out}
+.imgbig img{max-width:94vw;max-height:94vh;border-radius:10px}
 .mini{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)}.mini:last-child{border-bottom:0}
 .mini .pos{flex:none;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--panel2);color:var(--muted);font-size:.8rem;font-variant-numeric:tabular-nums}
 .mini .t{flex:1;min-width:0}.mini .t b{display:block;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1336,6 +1389,7 @@ async function dashboard(env) {
   <button class="nav" data-page="logs">${icon("logs")}<span>לוגים</span></button>
   <button class="nav" data-page="settings">${icon("settings")}<span>הגדרות</span></button>
   <button class="nav hidden" id="vaultNav" type="button">${icon("lock")}<span>כספת</span></button>
+  <button class="nav hidden" data-page="images" id="imgNav">${icon("image")}<span>תמונות</span></button>
   <div class="grow"></div>
   <a class="nav extra" href="/">${icon("chat")}<span>Gemini</span></a>
 </aside>
@@ -1433,6 +1487,17 @@ async function dashboard(env) {
     </div>
   </section>
 
+  <section data-p="images" class="hidden">
+    <div class="card">
+      <h2>${icon("image")}תמונה חדשה עם Gemini</h2>
+      <p class="sub">התמונה עוברת מעורבלת ונפתחת רק כאן בתוכנה. באתר עצמו לא נשמרת שום תמונה.</p>
+      <textarea id="imgPrompt" rows="3" style="width:100%;box-sizing:border-box" placeholder="מה לצייר? למשל: נוף הרים בשקיעה, בסגנון ציור שמן"></textarea>
+      <div class="actions-row" style="margin-top:10px"><button class="btn" id="imgMake" type="button">${icon("zap")}<span>צור תמונה</span></button>
+      <span class="sub" id="imgStatus" style="margin:0"></span></div>
+    </div>
+    <div id="imgGrid" class="imggrid"></div>
+  </section>
+
   <section data-p="logs" class="hidden">
     <div class="actions-row" style="margin:0 0 12px;gap:8px;justify-content:space-between;align-items:center">
       <span class="sub" style="margin:0">worker = Cloudflare · render = שרת ההורדות · pc = התוכנה במחשב</span>
@@ -1511,7 +1576,7 @@ function toast(msg, ms) { const t = $("toast"); t.textContent = msg; t.style.dis
 const APP = () => window.pywebview && window.pywebview.api;   // running inside the desktop app?
 
 // ---------- pages ----------
-const TITLES = { dash: "לוח בקרה", global: "לוח בקרה כללי", queue: "תור הורדות", channels: "ערוצים", add: "הוספה", logs: "לוגים", settings: "הגדרות" };
+const TITLES = { dash: "לוח בקרה", global: "לוח בקרה כללי", queue: "תור הורדות", channels: "ערוצים", add: "הוספה", logs: "לוגים", settings: "הגדרות", images: "תמונות" };
 function showPage(name) {
   if (name === "global" && !(S.profile && S.profile.admin)) name = "dash";
   document.querySelectorAll(".nav[data-page]").forEach((n) => n.classList.toggle("on", n.dataset.page === name));
@@ -1520,6 +1585,7 @@ function showPage(name) {
   try { localStorage.setItem("page", name); } catch (e) {}
   if (name === "logs") { const b = $("logs"); b.scrollTop = b.scrollHeight; }
   if (name === "global") setTimeout(loadGlobal, 0);
+  if (name === "images") setTimeout(loadImages, 0);
 }
 document.querySelectorAll(".nav[data-page]").forEach((n) => n.onclick = () => showPage(n.dataset.page));
 try { const p = localStorage.getItem("page"); if (p && TITLES[p]) showPage(p); } catch (e) {}
@@ -1670,6 +1736,7 @@ function render() {
     if (!mp3ok && o.selected) o.parentNode.value = "video";
   });
   $("profileName").textContent = (S.profile && S.profile.name) || "";
+  $("imgNav").classList.toggle("hidden", !(APP() && APP().img_list && S.profile && !S.profile.netfree));
   $("globalNav").classList.toggle("hidden", !(S.profile && S.profile.admin));
   $("cookieCard").classList.toggle("hidden", !S.cookieExt);
   if (S.cookieExt) {
@@ -1727,6 +1794,7 @@ const MSG = { pause: "הושהה", resume: "ממשיך", priority: "יורד ע�
 document.addEventListener("click", async (e) => {
   const el = e.target.closest("[data-act]"); if (!el) return;
   const act = el.dataset.act, id = el.dataset.id, d = new FormData(); d.append("id", id);
+  if (act.startsWith("img")) return;                 // the images page handles these
   try {
     if (act === "cancel" && !confirm("לבטל את ההורדה?")) return;
     if (act === "remove" && !confirm("להסיר את הערוץ מהמעקב?")) return;
@@ -1806,6 +1874,42 @@ async function autoDownload() {
   }
   dlBusy = false;
 }
+
+// ---------- images (desktop app only) ----------
+// The site fetches the scrambled bytes; the app keeps them scrambled on disk
+// and hands back a picture only to show it here.
+function b64(buf) { let s = ""; const a = new Uint8Array(buf); for (let i = 0; i < a.length; i += 32768) s += String.fromCharCode.apply(null, a.subarray(i, i + 32768)); return btoa(s); }
+async function loadImages() {
+  if (!(APP() && APP().img_list)) return;
+  const list = await APP().img_list();
+  $("imgGrid").innerHTML = list.length ? list.map((m) => '<div class="imgcard"><img data-img="' + esc(m.id) + '" alt="">' +
+    '<div class="cap"><span title="' + esc(m.prompt) + '">' + esc(m.prompt) + '</span>' +
+    btn("imgsave", m.id, "download", "שמור כקובץ תמונה") + btn("imgdel", m.id, "trash", "מחק", "danger") + '</div></div>').join("")
+    : '<div class="empty">' + icon("image") + '<div>עוד אין תמונות</div></div>';
+  for (const el of document.querySelectorAll("img[data-img]")) {
+    try { el.src = await APP().img_get(el.dataset.img); } catch (e) {}
+  }
+}
+$("imgMake").onclick = async () => {
+  const prompt = $("imgPrompt").value.trim(); if (!prompt) return toast("כתוב מה לצייר");
+  $("imgMake").disabled = true; $("imgStatus").textContent = "Gemini מצייר… (עד חצי דקה)";
+  try {
+    const r = await fetch(B + "/img/make", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }) });
+    if ((r.headers.get("content-type") || "").includes("json")) throw new Error((await r.json()).error || "שגיאה");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    await APP().img_save(b64(await r.arrayBuffer()), prompt);
+    $("imgStatus").textContent = ""; await loadImages();
+  } catch (e) { $("imgStatus").textContent = ""; toast("שגיאה: " + (e.message || e), 8000); }
+  $("imgMake").disabled = false;
+};
+document.addEventListener("click", async (e) => {
+  const big = e.target.closest(".imgbig"); if (big) return big.remove();
+  const im = e.target.closest("img[data-img]");
+  if (im && im.src) { const d = document.createElement("div"); d.className = "imgbig"; d.innerHTML = '<img src="' + im.src + '">'; document.body.appendChild(d); return; }
+  const b = e.target.closest("button[data-act]"); if (!b) return;
+  if (b.dataset.act === "imgsave") { const f = await APP().img_export(b.dataset.id); if (f) toast("נשמר: " + f, 6000); }
+  if (b.dataset.act === "imgdel" && confirm("למחוק את התמונה?")) { await APP().img_delete(b.dataset.id); loadImages(); }
+});
 
 // ---------- desktop app extras ----------
 async function loadHave() { if (!APP()) return; try { HAVE = new Set(await APP().downloaded()); } catch (e) {} }
