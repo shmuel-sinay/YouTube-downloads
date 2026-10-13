@@ -642,13 +642,15 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (!j) return json({ error: "no such job" }, 404);
       const ks = await getJSON(env, "gemkeys", {});
       ks.keys = ks.keys || [];
-      const vk = videoKey(ks), keys = vk ? [vk] : geminiKeys(env, ks);   // the paid video key alone, when there is one
+      // Veo only with the paid video key (it has no free tier); without one the
+      // Action makes the video for free on Hugging Face.
+      const vk = videoKey(ks), keys = vk ? [vk] : [];
       if (req.method === "GET") {                        // starting: the prompt and the keys to try, in order
         if (j.status !== "queued") return json({ error: "already taken" }, 409);
         Object.assign(j, { status: "running", run: String(url.searchParams.get("run") || "") });
         await putJSON(env, key, j);
         const now = Date.now();
-        return json({ prompt: j.prompt, model: j.model,
+        return json({ prompt: j.prompt, model: j.model, paid: !!vk,
           keys: keys.filter((k) => !((k.until || {})[j.model] > now)).map((k) => ({ i: k.i, key: k.key })) });
       }
       // Finished: keys that Google refused rest, like in geminiCall.
@@ -1738,7 +1740,7 @@ async function dashboard(env) {
   <section data-p="videos" class="hidden">
     <div class="card">
       <h2>${icon("video")}סרטון חדש עם Gemini</h2>
-      <p class="sub">הסרטון נוצר בשרת ב-GitHub, עובר מעורבל ונפתח רק כאן בתוכנה. באתר עצמו לא נשמר שום סרטון. יצירת סרטון (Veo) דורשת מפתח עם חיוב פעיל ב-Google.</p>
+      <p class="sub">הסרטון נוצר בשרת ב-GitHub, עובר מעורבל ונפתח רק כאן בתוכנה. באתר עצמו לא נשמר שום סרטון. בלי מפתח בתשלום הוא נוצר בחינם ב-Hugging Face (מכסה יומית קטנה, איכות נמוכה מ-Veo).</p>
       <textarea id="vidPrompt" rows="3" placeholder="מה לצלם? למשל: גלים מתנפצים על סלעים בשקיעה, צילום רחפן איטי"></textarea>
       <div class="imgbar"><button class="btn" id="vidMake" type="button">${icon("zap")}<span>צור סרטון</span></button>
       <span class="sub" style="margin:0">Ctrl+Enter ליצירה</span></div>
@@ -1785,7 +1787,7 @@ async function dashboard(env) {
       </div>
       <p class="sub" style="margin:8px 0 0">מפתח חדש: aistudio.google.com/apikey ← Create API key</p>
       <h2 style="margin-top:20px">${icon("video")}מפתח בתשלום לסרטונים</h2>
-      <p class="sub">מפתח מפרויקט עם חיוב פעיל (Google Cloud). כשהוא מוגדר, סרטונים משתמשים רק בו, ותמונות והצ'אט לעולם לא — כדי שלא ישלמו עליהם. בלעדיו, סרטונים מנסים את המפתחות שלמעלה.</p>
+      <p class="sub">מפתח מפרויקט עם חיוב פעיל (Google Cloud). כשהוא מוגדר, סרטונים משתמשים רק בו, ותמונות והצ'אט לעולם לא — כדי שלא ישלמו עליהם. בלעדיו, סרטונים נוצרים בחינם ב-Hugging Face.</p>
       <div id="vkeyRow"></div>
       <div class="cbar" style="margin-top:12px">
         <input id="vkeyValue" placeholder="AIza…" style="flex:1;min-width:180px">
