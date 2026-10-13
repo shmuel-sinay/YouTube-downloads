@@ -57,7 +57,7 @@ TMP = USERDATA / "tmp"                 # decrypted copies for playing — wiped 
 DEFAULT_SITE = "https://my-gemini.g47ben.workers.dev"
 # Where new versions are published (GitHub release built by desktop.yml).
 RELEASE_API = "https://api.github.com/repos/shmuel-sinay/YouTube-downloads/releases/tags/desktop-latest"
-UPDATE_CHECK_HOURS = 1
+UPDATE_CHECK_HOURS = 1 / 3   # every 20 minutes (one small request)
 POLL_SECONDS = 20
 WAKE_EVERY = 300          # nudge the download server while work is waiting
 RETRY_404_HOURS = 24      # re-queue a vanished file only if it finished recently
@@ -1195,10 +1195,10 @@ class Api:
 
     def version_info(self) -> dict:
         """Installed version vs. the newest one, with what's new (the same
-        request the app makes anyway to update itself; cached 10 minutes)."""
+        request the app makes anyway to update itself; cached a minute)."""
         out = {"installed": bundled_version_name(), "changelog": _bundled("CHANGELOG.md"), "frozen": getattr(sys, "frozen", False)}
         try:
-            lat = latest_release_info(max_age=600)
+            lat = latest_release_info(max_age=60)
             out.update(latest=lat["name"] or lat["sha"][:7], notes=lat["notes"], published=lat["published"],
                        update=getattr(sys, "frozen", False) and not same_version(bundled_version(), lat["sha"]))
         except Exception as e:
