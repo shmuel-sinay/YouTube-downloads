@@ -37,7 +37,6 @@ export default {
       env = await withStore(env);
       store = env.DB;
       const res = await route(req, env, ctx);
-      if (store) await autoCheck(env);
       if (store && store.flush) await store.flush();
       return res;
     } catch (e) {
@@ -48,28 +47,12 @@ export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
       env = await withStore(env);
-      await putJSON(env, "autocheck", { at: Date.now() });
       for (const pid of await profileIds(env)) await checkAllChannels(profileEnv(env, pid));
       if (env.DB && env.DB.flush) await env.DB.flush();
       await wakeAgent(env);
     })());
   },
 };
-
-// Channels are checked every 3 hours even without a Cron Trigger: the first
-// request after 3 hours (the desktop app and the download server ask all the
-// time) runs the check for every profile.
-const AUTO_CHECK_MS = 3 * 60 * 60 * 1000;
-async function autoCheck(env) {
-  try {
-    const last = await getJSON(env, "autocheck", { at: 0 });
-    if (Date.now() - (last.at || 0) < AUTO_CHECK_MS) return;
-    await putJSON(env, "autocheck", { at: Date.now() });
-    let added = 0;
-    for (const pid of await profileIds(env)) added += (await checkAllChannels(profileEnv(env, pid))).added;
-    if (added) await wakeAgent(env);
-  } catch (e) { console.log("autoCheck: " + (e && e.message || e)); }
-}
 
 // ---------- storage ----------
 // Where the data lives:
@@ -417,7 +400,7 @@ async function wakeAgent(env) {
 // keys. Every other profile has its own copy of everything under
 // "p:<id>:" — channels, queue, history, log, settings. "agent" and the
 // profile list itself stay global.
-const GLOBAL_KEYS = new Set(["agent", "profiles", "mainprof", "activity", "ytcookies", "autocheck"]);
+const GLOBAL_KEYS = new Set(["agent", "profiles", "mainprof", "activity", "ytcookies"]);
 
 function profileEnv(env, pid) {
   if (!pid || pid === "main") return { ...env, PROFILE: "main" };
