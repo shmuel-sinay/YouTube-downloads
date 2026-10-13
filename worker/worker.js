@@ -958,8 +958,20 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   // on the computer. Not offered to a NetFree-restricted profile.
   if (p === "/img/make" && req.method === "POST") {
     if ((await profileInfo(env, pid)).netfree) return json({ error: "לא זמין בפרופיל הזה" }, 403);
-    const prompt = String((await req.json()).prompt || "").trim().slice(0, 2000);
+    const ib = await req.json();
+    const prompt = String(ib.prompt || "").trim().slice(0, 2000);
     if (!prompt) return json({ error: "צריך לכתוב מה לצייר" }, 400);
+    // Free source: Pollinations returns the image bytes directly, no key.
+    if (ib.src === "free") {
+      const u = "https://image.pollinations.ai/prompt/" + encodeURIComponent(prompt) +
+        "?width=1024&height=1024&nologo=true&model=flux&seed=" + Math.floor(Math.random() * 1e9);
+      const pr = await fetch(u);
+      if (!pr.ok) return json({ error: "שירות התמונות החינמי עמוס כרגע (" + pr.status + ") — נסה שוב בעוד רבע דקה" }, 502);
+      const mime = pr.headers.get("content-type") || "image/jpeg";
+      if (!/^image\//.test(mime)) return json({ error: "השירות החינמי לא החזיר תמונה — נסה שוב" }, 502);
+      return new Response(await scrambleImage(new Uint8Array(await pr.arrayBuffer()), mime), {
+        headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
+    }
     const model = env.IMAGE_MODEL || "gemini-2.5-flash-image";
     const call = await geminiCall(rootEnv, model, JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }],
                                                                   generationConfig: { responseModalities: ["TEXT", "IMAGE"] } }));
@@ -1600,11 +1612,13 @@ async function dashboard(env) {
 
   <section data-p="images" class="hidden">
     <div class="card">
-      <h2>${icon("image")}תמונה חדשה עם Gemini</h2>
-      <p class="sub">התמונה עוברת מעורבלת ונפתחת רק כאן בתוכנה. באתר עצמו לא נשמרת שום תמונה.</p>
+      <h2>${icon("image")}תמונה חדשה</h2>
+      <p class="sub">נפתחת רק כאן בתוכנה. באתר עצמו לא נשמרת תמונה.</p>
       <textarea id="imgPrompt" rows="3" placeholder="מה לצייר? למשל: נוף הרים בשקיעה, בסגנון ציור שמן"></textarea>
-      <div class="imgbar"><button class="btn" id="imgMake" type="button">${icon("zap")}<span>צור תמונה</span></button>
-      <span class="sub" style="margin:0">Ctrl+Enter ליצירה</span></div>
+      <div class="imgbar">
+        <select id="imgSrc" style="width:auto"><option value="free">חינם (Pollinations)</option><option value="gemini">Gemini (איכות גבוהה · דורש חיוב)</option></select>
+        <button class="btn" id="imgMake" type="button">${icon("zap")}<span>צור תמונה</span></button>
+        <span class="sub" style="margin:0">Ctrl+Enter</span></div>
     </div>
     <div id="imgGrid" class="imggrid"></div>
   </section>
@@ -2028,7 +2042,7 @@ $("imgMake").onclick = async () => {
   const empty = $("imgGrid").querySelector(".empty"); if (empty) empty.remove();
   $("imgGrid").insertAdjacentHTML("afterbegin", '<div class="imgcard wait" id="imgWait"><div class="ph">' + icon("image") + '</div><div class="cap"><span>' + esc(prompt) + '</span></div></div>');
   try {
-    const r = await fetch(B + "/img/make", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }) });
+    const r = await fetch(B + "/img/make", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt, src: $("imgSrc").value }) });
     if ((r.headers.get("content-type") || "").includes("json")) throw new Error((await r.json()).error || "שגיאה");
     if (!r.ok) throw new Error("HTTP " + r.status + " " + (await r.text()).slice(0, 200));
     await APP().img_save(b64(await r.arrayBuffer()), prompt);
