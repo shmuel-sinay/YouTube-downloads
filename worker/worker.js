@@ -993,18 +993,25 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       // Pollinations is moving to a key/credit model; keep the endpoint and an
       // optional token configurable (FREE_IMG_URL, FREE_IMG_TOKEN) so a change
       // in their policy needs no code change. {prompt} in the URL is replaced.
-      const base = rootEnv.FREE_IMG_URL || "https://image.pollinations.ai/prompt/{prompt}?width=1024&height=1024&nologo=true&model=flux";
-      const u = base.replace("{prompt}", encodeURIComponent(finalPrompt)) +
-        (base.includes("?") ? "&" : "?") + "seed=" + Math.floor(Math.random() * 1e9);
       const hdr = rootEnv.FREE_IMG_TOKEN ? { Authorization: "Bearer " + rootEnv.FREE_IMG_TOKEN } : {};
-      let pr;
-      try {
-        pr = await fetch(u, { headers: hdr, signal: AbortSignal.timeout(80000) });
-      } catch (e) {
-        return json({ error: "שירות התמונות החינמי לא הגיב בזמן — נסה שוב בעוד רבע דקה, או עבור ל-Gemini" }, 504);
+      const seed = Math.floor(Math.random() * 1e9);
+      // Try the configured/flux model, then fall back to turbo (the free one)
+      // if flux is gated behind credits.
+      const urlFor = (model) => {
+        const base = rootEnv.FREE_IMG_URL || "https://image.pollinations.ai/prompt/{prompt}?width=1024&height=1024&nologo=true&model=" + model;
+        return base.replace("{prompt}", encodeURIComponent(finalPrompt)) + (base.includes("?") ? "&" : "?") + "seed=" + seed;
+      };
+      const tryModel = async (model) => {
+        try { return await fetch(urlFor(model), { headers: hdr, signal: AbortSignal.timeout(80000) }); }
+        catch (e) { return null; }
+      };
+      let pr = await tryModel("flux");
+      if (pr && (pr.status === 401 || pr.status === 402 || pr.status === 403) && !rootEnv.FREE_IMG_URL) {
+        pr = await tryModel("turbo");                    // flux needs credits → the free model
       }
+      if (!pr) return json({ error: "שירות התמונות החינמי לא הגיב בזמן — נסה שוב בעוד רבע דקה, או עבור ל-Gemini" }, 504);
       if (pr.status === 401 || pr.status === 402 || pr.status === 403)
-        return json({ error: "שירות התמונות החינמי דורש עכשיו מפתח. אפשר להירשם ב-enter.pollinations.ai ולשים אותו ב-Worker כ-FREE_IMG_TOKEN, או להשתמש ב-Gemini." }, 402);
+        return json({ error: "שירות התמונות החינמי דורש עכשיו מפתח/קרדיטים. אפשר להירשם בחינם ב-enter.pollinations.ai, לקבל מפתח ולשים אותו ב-Worker כ-FREE_IMG_TOKEN — או להשתמש ב-Gemini." }, 402);
       if (!pr.ok) return json({ error: "שירות התמונות החינמי עמוס כרגע (" + pr.status + ") — נסה שוב בעוד רבע דקה" }, 502);
       const mime = pr.headers.get("content-type") || "image/jpeg";
       if (!/^image\//.test(mime)) return json({ error: "השירות החינמי לא החזיר תמונה — נסה שוב, או עבור ל-Gemini" }, 502);
