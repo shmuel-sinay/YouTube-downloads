@@ -582,8 +582,11 @@ async function cleanImagePrompt(env, prompt) {
     "keep only the visual description, drop phrases like 'give me a picture of', translate to English, " +
     "add a short style hint if missing. Output ONLY the prompt, one line, no quotes.\n\n" + prompt;
   try {
-    const call = await geminiCall(env, "gemini-2.5-flash",
-      JSON.stringify({ contents: [{ parts: [{ text: instruction }] }], generationConfig: { temperature: 0.4, maxOutputTokens: 120 } }));
+    const call = await Promise.race([
+      geminiCall(env, "gemini-2.5-flash",
+        JSON.stringify({ contents: [{ parts: [{ text: instruction }] }], generationConfig: { temperature: 0.4, maxOutputTokens: 120 } })),
+      new Promise((res) => setTimeout(() => res({ error: "timeout" }), 15000)),
+    ]);
     if (call.error) return "";
     const d = await call.res.json();
     const t = d && d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts &&
@@ -994,13 +997,20 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const u = base.replace("{prompt}", encodeURIComponent(finalPrompt)) +
         (base.includes("?") ? "&" : "?") + "seed=" + Math.floor(Math.random() * 1e9);
       const hdr = rootEnv.FREE_IMG_TOKEN ? { Authorization: "Bearer " + rootEnv.FREE_IMG_TOKEN } : {};
-      const pr = await fetch(u, { headers: hdr });
+      let pr;
+      try {
+        pr = await fetch(u, { headers: hdr, signal: AbortSignal.timeout(80000) });
+      } catch (e) {
+        return json({ error: "שירות התמונות החינמי לא הגיב בזמן — נסה שוב בעוד רבע דקה, או עבור ל-Gemini" }, 504);
+      }
       if (pr.status === 401 || pr.status === 402 || pr.status === 403)
         return json({ error: "שירות התמונות החינמי דורש עכשיו מפתח. אפשר להירשם ב-enter.pollinations.ai ולשים אותו ב-Worker כ-FREE_IMG_TOKEN, או להשתמש ב-Gemini." }, 402);
       if (!pr.ok) return json({ error: "שירות התמונות החינמי עמוס כרגע (" + pr.status + ") — נסה שוב בעוד רבע דקה" }, 502);
       const mime = pr.headers.get("content-type") || "image/jpeg";
-      if (!/^image\//.test(mime)) return json({ error: "השירות החינמי לא החזיר תמונה — נסה שוב" }, 502);
-      return new Response(await scrambleImage(new Uint8Array(await pr.arrayBuffer()), mime), {
+      if (!/^image\//.test(mime)) return json({ error: "השירות החינמי לא החזיר תמונה — נסה שוב, או עבור ל-Gemini" }, 502);
+      const bytes = new Uint8Array(await pr.arrayBuffer());
+      if (bytes.length < 500) return json({ error: "השירות החינמי החזיר תמונה ריקה — נסה שוב" }, 502);
+      return new Response(await scrambleImage(bytes, mime), {
         headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
     }
     const model = env.IMAGE_MODEL || "gemini-2.5-flash-image";
