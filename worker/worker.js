@@ -515,7 +515,8 @@ async function scrambleImage(bytes, mime) {
 }
 
 // ---------- Gemini keys: a pool that moves on when one runs out ----------
-// "gemkeys" = { keys: [{key, label, until: {model: ms}, err, errAt}], builtin: {...} }
+// "gemkeys" = { keys: [{key, label, until: {model: ms}, err, errAt}], builtin: {...},
+//               video: {...} } — video: a separate paid key, used only for videos (i "v")
 // (kept in the site's database, added in settings — not in the code, which
 // is public on GitHub). A key that hits its daily quota rests until it resets
 // (midnight in California ≈ 08:00 UTC), a per-minute limit rests a minute, a
@@ -525,6 +526,7 @@ function geminiKeys(env, ks) {
   if (env.GEMINI_API_KEY) list.push({ key: env.GEMINI_API_KEY, label: "המפתח המובנה", ...(ks.builtin || {}), i: "b" });
   return list;
 }
+const videoKey = (ks) => ks.video && ks.video.key ? { ...ks.video, i: "v" } : null;
 function nextQuotaReset() {
   const d = new Date(); d.setUTCHours(8, 0, 0, 0);
   if (d.getTime() <= Date.now()) d.setUTCDate(d.getUTCDate() + 1);
@@ -532,6 +534,7 @@ function nextQuotaReset() {
 }
 function setKey(ks, i, v) {
   if (i === "b") ks.builtin = { ...(ks.builtin || {}), ...v };
+  else if (i === "v") ks.video = { ...ks.video, ...v };
   else ks.keys[i] = { ...ks.keys[i], ...v };
 }
 // Was Google's answer a problem with the key itself (quota, spend cap, bad
@@ -554,7 +557,8 @@ function keyTrouble(ks, k, model, status, t) {
 async function geminiCall(env, model, body, only) {
   const ks = await getJSON(env, "gemkeys", {});
   ks.keys = ks.keys || [];
-  const all = geminiKeys(env, ks).filter((k) => only === undefined || String(k.i) === String(only));
+  const all = only === undefined ? geminiKeys(env, ks)
+    : [...geminiKeys(env, ks), videoKey(ks)].filter((k) => k && String(k.i) === String(only));
   if (!all.length) return { error: "אין מפתח Gemini — מוסיפים בהגדרות ← מפתחות Gemini", status: 400 };
   const now = Date.now();
   const ready = all.filter((k) => !((k.until || {})[model] > now));
@@ -638,7 +642,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (!j) return json({ error: "no such job" }, 404);
       const ks = await getJSON(env, "gemkeys", {});
       ks.keys = ks.keys || [];
-      const keys = geminiKeys(env, ks);
+      const vk = videoKey(ks), keys = vk ? [vk] : geminiKeys(env, ks);   // the paid video key alone, when there is one
       if (req.method === "GET") {                        // starting: the prompt and the keys to try, in order
         if (j.status !== "queued") return json({ error: "already taken" }, 409);
         Object.assign(j, { status: "running", run: String(url.searchParams.get("run") || "") });
@@ -1114,14 +1118,21 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         if (key.length < 10 || key.length > 200 || /\s/.test(key)) return json({ error: "מפתח לא תקין (ריק או עם רווחים)" }, 400);
         if (ks.keys.some((k) => k.key === key) || key === rootEnv.GEMINI_API_KEY) return json({ error: "המפתח כבר ברשימה" }, 400);
         ks.keys.push({ key, label: String(b.label || "").trim().slice(0, 40) || "מפתח " + (ks.keys.length + 1), added: new Date().toISOString() });
-      } else if (b.op === "del" && ks.keys[i]) ks.keys.splice(i, 1);
+      } else if (b.op === "vset") {
+        const key = String(b.key || "").trim();
+        if (key.length < 10 || key.length > 200 || /\s/.test(key)) return json({ error: "מפתח לא תקין (ריק או עם רווחים)" }, 400);
+        ks.video = { key, label: "מפתח בתשלום לסרטונים", added: new Date().toISOString() };
+      } else if (b.op === "vdel") delete ks.video;
+      else if (b.op === "del" && ks.keys[i]) ks.keys.splice(i, 1);
       else if (b.op === "up" && i > 0 && ks.keys[i]) ks.keys.splice(i - 1, 0, ks.keys.splice(i, 1)[0]);
-      else if (b.op === "reset") setKey(ks, b.i === "b" ? "b" : i, { until: {}, err: "" });
+      else if (b.op === "reset" && (b.i !== "v" || ks.video)) setKey(ks, b.i === "b" || b.i === "v" ? b.i : i, { until: {}, err: "" });
       await putJSON(rootEnv, "gemkeys", ks);
     }
     const now = Date.now();
-    return json({ keys: geminiKeys(rootEnv, ks).map((k) => ({ i: k.i, label: k.label, mask: k.key.slice(0, 6) + "…" + k.key.slice(-4),
-      err: k.err || "", resting: Object.values(k.until || {}).filter((t) => t > now).sort()[0] || 0 })) });
+    const show = (k) => ({ i: k.i, label: k.label, mask: k.key.slice(0, 6) + "…" + k.key.slice(-4),
+      err: k.err || "", resting: Object.values(k.until || {}).filter((t) => t > now).sort()[0] || 0 });
+    const vk = videoKey(ks);
+    return json({ keys: geminiKeys(rootEnv, ks).map(show), video: vk ? show(vk) : null });
   }
   if (req.method === "POST") {
     const f = await req.formData();
@@ -1773,6 +1784,13 @@ async function dashboard(env) {
         <button class="btn" id="keyAdd" type="button">${icon("add")}<span>הוסף</span></button>
       </div>
       <p class="sub" style="margin:8px 0 0">מפתח חדש: aistudio.google.com/apikey ← Create API key</p>
+      <h2 style="margin-top:20px">${icon("video")}מפתח בתשלום לסרטונים</h2>
+      <p class="sub">מפתח מפרויקט עם חיוב פעיל (Google Cloud). כשהוא מוגדר, סרטונים משתמשים רק בו, ותמונות והצ'אט לעולם לא — כדי שלא ישלמו עליהם. בלעדיו, סרטונים מנסים את המפתחות שלמעלה.</p>
+      <div id="vkeyRow"></div>
+      <div class="cbar" style="margin-top:12px">
+        <input id="vkeyValue" placeholder="AIza…" style="flex:1;min-width:180px">
+        <button class="btn" id="vkeySet" type="button">${icon("check")}<span>שמור</span></button>
+      </div>
     </div>
     <div class="card hidden" id="cookieCard">
       <h2>${icon("key")}תוסף דפדפן — עוגיות יוטיוב</h2>
@@ -2253,15 +2271,27 @@ function keysRender(d) {
     (k.i !== "b" && k.i > 0 ? '<button class="ibtn" data-key="up" data-i="' + k.i + '" title="העלה למעלה">' + icon("now") + '</button>' : '') +
     (k.i !== "b" ? '<button class="ibtn danger" data-key="del" data-i="' + k.i + '" title="מחק">' + icon("trash") + '</button>' : '') + '</div>').join("")
     : '<div class="sub" style="margin:0">אין עדיין מפתחות.</div>';
+  const v = d.video;
+  $("vkeyRow").innerHTML = v ? '<div class="keyrow"><div class="t"><b>' + esc(v.label) + '</b><span>' + esc(v.mask) +
+    (v.resting ? ' · <span class="bad">נח עד ' + new Date(v.resting).toLocaleString("he-IL", { weekday: "short", hour: "2-digit", minute: "2-digit" }) + '</span>' : ' · פעיל') +
+    (v.err ? ' · ' + esc(v.err) : '') + '</span></div>' +
+    '<button class="btn ghost" data-key="test" data-i="v" type="button">בדוק</button>' +
+    (v.resting || v.err ? '<button class="btn ghost" data-key="reset" data-i="v" type="button">שחרר</button>' : '') +
+    '<button class="ibtn danger" data-key="vdel" data-i="v" title="מחק">' + icon("trash") + '</button></div>'
+    : '<div class="sub" style="margin:0">לא הוגדר.</div>';
 }
 async function loadKeys() { if (S.profile && S.profile.admin) try { keysRender(await keysOp()); } catch (e) {} }
+$("vkeySet").onclick = async () => {
+  try { keysRender(await keysOp({ op: "vset", key: $("vkeyValue").value })); $("vkeyValue").value = ""; toast("המפתח לסרטונים נשמר"); }
+  catch (e) { toast("שגיאה: " + e.message, 6000); }
+};
 $("keyAdd").onclick = async () => {
   try { keysRender(await keysOp({ op: "add", key: $("keyValue").value, label: $("keyLabel").value })); $("keyValue").value = ""; $("keyLabel").value = ""; toast("המפתח נוסף"); }
   catch (e) { toast("שגיאה: " + e.message, 6000); }
 };
 document.addEventListener("click", async (e) => {
   const b = e.target.closest("[data-key]"); if (!b) return;
-  if (b.dataset.key === "del" && !confirm("למחוק את המפתח?")) return;
+  if ((b.dataset.key === "del" || b.dataset.key === "vdel") && !confirm("למחוק את המפתח?")) return;
   if (b.dataset.key === "test") toast("בודק…");
   try { const d = await keysOp({ op: b.dataset.key, i: b.dataset.i }); if (d.msg) { toast(d.msg, 8000); loadKeys(); } else keysRender(d); }
   catch (x) { toast("שגיאה: " + x.message, 6000); }

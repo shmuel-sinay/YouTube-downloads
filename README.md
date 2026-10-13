@@ -107,7 +107,7 @@ Cloudflare Worker (my-gemini)            Render (שרת ההורדות)
 1. **GitHub → Settings → Developer settings → Fine-grained tokens → Generate**: רק למאגר הזה, הרשאה **Actions: Read and write**. את הטוקן שמים ב-Worker כ-Secret בשם **GH_TOKEN**.
 2. **במאגר → Settings → Secrets and variables → Actions**: `TRACKER_URL` (כמו ב-Render, `https://my-gemini.<שם>.workers.dev/yt`) ו-`AGENT_TOKEN` (אותו ערך כמו ב-Worker).
 3. קובץ ה-workflow צריך להיות בענף הראשי של המאגר.
-4. מפתח Gemini עם חיוב פעיל (Veo לא בחינם). אופציונלי ב-Worker: `VIDEO_MODEL` (ברירת מחדל `veo-3.0-fast-generate-001`), `GH_REPO`, `GH_REF`.
+4. מפתח Gemini עם חיוב פעיל (Veo לא בחינם): באתר, **הגדרות ← מפתחות Gemini ← מפתח בתשלום לסרטונים**. כשהוא מוגדר, רק סרטונים משתמשים בו (תמונות והצ'אט ממשיכים עם המפתחות החינמיים). מנוי Gemini/Google AI (Plus/Pro) לא נותן מפתח API — צריך חיוב בפרויקט ב-Google Cloud. אופציונלי ב-Worker: `VIDEO_MODEL` (ברירת מחדל `veo-3.0-fast-generate-001`), `GH_REPO`, `GH_REF`.
 
 ## שימוש
 
