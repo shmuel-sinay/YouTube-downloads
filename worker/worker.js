@@ -495,7 +495,7 @@ function isAgent(req, env) {
 
 // ---------- routing ----------
 
-// Scrambled picture: "YTI1" + 12-byte IV + AES-GCM(mime length, mime, bytes).
+// Scrambled picture or video: "YTI1" + 12-byte IV + AES-GCM(mime length, mime, bytes).
 // A mime ending in ";base64" means the bytes are the picture's base64 text.
 // The key is fixed (desktop/images.py has the same): the point is that what
 // travels and what the browser holds is not an image, not secrecy.
@@ -535,8 +535,9 @@ function setKey(ks, i, v) {
 }
 // Sends body (a Gemini request, as text or bytes) to model with the first key
 // that isn't resting; on a quota or key error marks it and tries the next.
-// only: just this key (the "test" button). → { res } or { error, status }.
-async function geminiCall(env, model, body, only) {
+// only: just this key (the "test" button). action: the model method
+// (":predictLongRunning" for videos). → { res, k } or { error, status }.
+async function geminiCall(env, model, body, only, action = ":generateContent") {
   const ks = await getJSON(env, "gemkeys", {});
   ks.keys = ks.keys || [];
   const all = geminiKeys(env, ks).filter((k) => only === undefined || String(k.i) === String(only));
@@ -550,7 +551,7 @@ async function geminiCall(env, model, body, only) {
   }
   let last = "", changed = false;
   for (const k of ready) {
-    const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", {
+    const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + action, {
       method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": k.key }, body });
     const peek = res.ok ? "" : await res.clone().text();
     const bad400 = res.status === 400 && /API_KEY_INVALID|API key not valid|API key expired/i.test(peek);
@@ -558,7 +559,7 @@ async function geminiCall(env, model, body, only) {
     if (!(res.status === 429 || res.status === 401 || res.status === 403 || bad400 || capped)) {
       if (k.err) { setKey(ks, k.i, { err: "" }); changed = true; }
       if (changed) await putJSON(env, "gemkeys", ks);    // the keys that failed on the way rest
-      return { res };
+      return { res, k: k.i };
     }
     const t = await res.text();
     let msg = t; try { msg = JSON.parse(t).error.message || t; } catch (e) {}
@@ -987,6 +988,46 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     return new Response(await scrambleImage(new TextEncoder().encode(b64), mime + ";base64"), {
       headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
   }
+  // --- videos from Gemini (Veo), for the desktop app only ---
+  // Same idea as the pictures: the video leaves here scrambled. Veo takes a
+  // minute or more, so it's two steps: /vid/start begins it and says which
+  // key did (only that key can read the result), and the page asks /vid/poll
+  // every few seconds until it answers with the scrambled video.
+  if (p === "/vid/start" && req.method === "POST") {
+    if ((await profileInfo(env, pid)).netfree) return json({ error: "לא זמין בפרופיל הזה" }, 403);
+    const prompt = String((await req.json()).prompt || "").trim().slice(0, 2000);
+    if (!prompt) return json({ error: "צריך לכתוב מה לצלם" }, 400);
+    const model = env.VIDEO_MODEL || "veo-3.0-fast-generate-001";
+    const call = await geminiCall(rootEnv, model, JSON.stringify({ instances: [{ prompt }], parameters: { aspectRatio: "16:9" } }),
+                                  undefined, ":predictLongRunning");
+    if (call.error) return json({ error: call.error }, call.status);
+    const d = await call.res.json().catch(() => ({}));
+    if (!d.name) return json({ error: "Gemini לא התחיל סרטון: " + String((d.error && d.error.message) || "HTTP " + call.res.status).slice(0, 300) }, 502);
+    return json({ op: d.name, k: call.k });
+  }
+  if (p === "/vid/poll" && req.method === "POST") {
+    if ((await profileInfo(env, pid)).netfree) return json({ error: "לא זמין בפרופיל הזה" }, 403);
+    const b = await req.json();
+    // Only an operation name, so the key can't be sent anywhere else.
+    if (!/^models\/[\w.-]+\/operations\/[\w-]+$/.test(String(b.op || ""))) return json({ error: "בקשה לא תקינה" }, 400);
+    const ks = await getJSON(rootEnv, "gemkeys", {});
+    const k = geminiKeys(rootEnv, ks).find((x) => String(x.i) === String(b.k));
+    if (!k) return json({ error: "המפתח שהתחיל את הסרטון כבר לא ברשימה" }, 400);
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/" + b.op, { headers: { "x-goog-api-key": k.key } });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) return json({ error: "Gemini: " + String((d.error && d.error.message) || "HTTP " + r.status).slice(0, 300) }, 502);
+    if (!d.done) return json({ done: false });
+    const g = (d.response && d.response.generateVideoResponse) || {};
+    const uri = g.generatedSamples && g.generatedSamples[0] && g.generatedSamples[0].video && g.generatedSamples[0].video.uri;
+    if (!uri) return json({ error: (g.raiMediaFilteredReasons || []).join(" ") ||
+      "Gemini סיים בלי סרטון. כדאי לנסח אחרת, למשל: \"סרטון של גלים מתנפצים על סלעים בשקיעה\"" }, 502);
+    if (!uri.startsWith("https://generativelanguage.googleapis.com/")) return json({ error: "כתובת סרטון לא צפויה" }, 502);
+    const v = await fetch(uri, { headers: { "x-goog-api-key": k.key } });
+    if (!v.ok) return json({ error: "הורדת הסרטון מ-Gemini נכשלה: HTTP " + v.status }, 502);
+    const mime = (v.headers.get("content-type") || "").split(";")[0].startsWith("video/") ? v.headers.get("content-type").split(";")[0] : "video/mp4";
+    return new Response(await scrambleImage(new Uint8Array(await v.arrayBuffer()), mime), {
+      headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
+  }
   // --- the key pool (admin): add, remove, move up, release, test ---
   if (p === "/keys" && pid === "main") {
     const ks = await getJSON(rootEnv, "gemkeys", {});
@@ -1362,6 +1403,10 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .imgcard .cap span{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .imgbig{position:fixed;inset:0;background:#000d;display:grid;place-items:center;z-index:50;cursor:zoom-out}
 .imgbig img{max-width:94vw;max-height:94vh;border-radius:10px}
+#vidPrompt{min-height:76px;resize:vertical}
+.vidgrid{grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
+.imgcard video{width:100%;aspect-ratio:16/9;display:block;background:#000}
+.imgcard.wait .ph.v{aspect-ratio:16/9}
 .mini{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)}.mini:last-child{border-bottom:0}
 .mini .pos,.keyrow .pos{flex:none;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--panel2);color:var(--muted);font-size:.8rem;font-variant-numeric:tabular-nums}
 .mini .t{flex:1;min-width:0}.mini .t b{display:block;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1499,6 +1544,7 @@ async function dashboard(env) {
   <button class="nav" data-page="settings">${icon("settings")}<span>הגדרות</span></button>
   <button class="nav hidden" id="vaultNav" type="button">${icon("lock")}<span>כספת</span></button>
   <button class="nav hidden" data-page="images" id="imgNav">${icon("image")}<span>תמונות</span></button>
+  <button class="nav hidden" data-page="videos" id="vidNav">${icon("video")}<span>סרטונים</span></button>
   <div class="grow"></div>
   <a class="nav extra" href="/">${icon("chat")}<span>Gemini</span></a>
 </aside>
@@ -1607,6 +1653,17 @@ async function dashboard(env) {
     <div id="imgGrid" class="imggrid"></div>
   </section>
 
+  <section data-p="videos" class="hidden">
+    <div class="card">
+      <h2>${icon("video")}סרטון חדש עם Gemini</h2>
+      <p class="sub">הסרטון עובר מעורבל ונפתח רק כאן בתוכנה. באתר עצמו לא נשמר שום סרטון. יצירת סרטון (Veo) דורשת מפתח עם חיוב פעיל ב-Google.</p>
+      <textarea id="vidPrompt" rows="3" placeholder="מה לצלם? למשל: גלים מתנפצים על סלעים בשקיעה, צילום רחפן איטי"></textarea>
+      <div class="imgbar"><button class="btn" id="vidMake" type="button">${icon("zap")}<span>צור סרטון</span></button>
+      <span class="sub" style="margin:0">Ctrl+Enter ליצירה</span></div>
+    </div>
+    <div id="vidGrid" class="imggrid vidgrid"></div>
+  </section>
+
   <section data-p="logs" class="hidden">
     <div class="actions-row" style="margin:0 0 12px;gap:8px;justify-content:space-between;align-items:center">
       <span class="sub" style="margin:0">worker = Cloudflare · render = שרת ההורדות · pc = התוכנה במחשב</span>
@@ -1697,7 +1754,7 @@ function toast(msg, ms) { const t = $("toast"); t.textContent = msg; t.style.dis
 const APP = () => window.pywebview && window.pywebview.api;   // running inside the desktop app?
 
 // ---------- pages ----------
-const TITLES = { dash: "לוח בקרה", global: "לוח בקרה כללי", queue: "תור הורדות", channels: "ערוצים", add: "הוספה", logs: "לוגים", settings: "הגדרות", images: "תמונות" };
+const TITLES = { dash: "לוח בקרה", global: "לוח בקרה כללי", queue: "תור הורדות", channels: "ערוצים", add: "הוספה", logs: "לוגים", settings: "הגדרות", images: "תמונות", videos: "סרטונים" };
 function showPage(name) {
   if (name === "global" && !(S.profile && S.profile.admin)) name = "dash";
   document.querySelectorAll(".nav[data-page]").forEach((n) => n.classList.toggle("on", n.dataset.page === name));
@@ -1707,6 +1764,7 @@ function showPage(name) {
   if (name === "logs") { const b = $("logs"); b.scrollTop = b.scrollHeight; }
   if (name === "global") setTimeout(loadGlobal, 0);
   if (name === "images") setTimeout(loadImages, 0);
+  if (name === "videos") setTimeout(loadVideos, 0);
   if (name === "settings") setTimeout(loadKeys, 0);
 }
 document.querySelectorAll(".nav[data-page]").forEach((n) => n.onclick = () => showPage(n.dataset.page));
@@ -1861,6 +1919,7 @@ function render() {
   });
   $("profileName").textContent = (S.profile && S.profile.name) || "";
   $("imgNav").classList.toggle("hidden", !(APP() && APP().img_list && S.profile && !S.profile.netfree));
+  $("vidNav").classList.toggle("hidden", !(APP() && APP().vid_list && S.profile && !S.profile.netfree));
   $("globalNav").classList.toggle("hidden", !(S.profile && S.profile.admin));
   $("cookieCard").classList.toggle("hidden", !S.cookieExt);
   if (S.cookieExt) {
@@ -1919,7 +1978,7 @@ const MSG = { pause: "הושהה", resume: "ממשיך", priority: "יורד ע�
 document.addEventListener("click", async (e) => {
   const el = e.target.closest("[data-act]"); if (!el) return;
   const act = el.dataset.act, id = el.dataset.id, d = new FormData(); d.append("id", id);
-  if (act.startsWith("img")) return;                 // the images page handles these
+  if (act.startsWith("img") || act.startsWith("vid")) return;   // the images / videos pages handle these
   try {
     if (act === "cancel" && !confirm("לבטל את ההורדה?")) return;
     if (act === "remove" && !confirm("להסיר את הערוץ מהמעקב?")) return;
@@ -2043,6 +2102,63 @@ document.addEventListener("click", async (e) => {
   if (b.dataset.act === "imgsave") { const f = await APP().img_export(b.dataset.id); if (f) toast("נשמר: " + f, 6000); }
   if (b.dataset.act === "imgdel" && confirm("למחוק את התמונה?")) { await APP().img_delete(b.dataset.id); loadImages(); }
   if (b.dataset.act === "imgvault") { try { await APP().img_to_vault(b.dataset.id); toast("הועבר לכספת"); loadImages(); } catch (x) { toast("שגיאה: " + x, 6000); } }
+});
+
+// ---------- videos (desktop app only) ----------
+// Same as the pictures: scrambled bytes from the site, kept scrambled by the
+// app, which hands back a playable video only to show it here.
+async function loadVideos() {
+  if (!(APP() && APP().vid_list)) return;
+  const list = await APP().vid_list();
+  const hasVault = APP().vid_to_vault && S.profile && S.profile.vault;
+  const wait = $("vidWait");
+  $("vidGrid").innerHTML = list.length ? list.map((m) => '<div class="imgcard"><video data-vid="' + esc(m.id) + '" controls preload="metadata"></video>' +
+    '<div class="cap"><span title="' + esc(m.prompt) + '">' + esc(m.prompt) + '</span>' +
+    (hasVault ? btn("vidvault", m.id, "lock", "העבר לכספת") : "") +
+    btn("vidsave", m.id, "download", "שמור כקובץ וידאו") + btn("viddel", m.id, "trash", "מחק", "danger") + '</div></div>').join("")
+    : (wait ? "" : '<div class="empty">' + icon("video") + '<div>עוד אין סרטונים</div></div>');
+  if (wait) $("vidGrid").prepend(wait);              // still making one
+  for (const el of document.querySelectorAll("video[data-vid]")) {
+    try { el.src = await APP().vid_get(el.dataset.vid); } catch (e) {}
+  }
+}
+const VID_BTN = $("vidMake").innerHTML;
+$("vidPrompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("vidMake").click(); });
+$("vidMake").onclick = async () => {
+  const prompt = $("vidPrompt").value.trim(); if (!prompt) return toast("כתוב מה לצלם");
+  if ($("vidMake").disabled) return;
+  $("vidMake").disabled = true;
+  const busy = (t) => $("vidMake").innerHTML = '<span class="spin"></span><span>' + t + '</span>';
+  busy("מתחיל…");
+  const empty = $("vidGrid").querySelector(".empty"); if (empty) empty.remove();
+  $("vidGrid").insertAdjacentHTML("afterbegin", '<div class="imgcard wait" id="vidWait"><div class="ph v">' + icon("video") + '</div><div class="cap"><span>' + esc(prompt) + '</span></div></div>');
+  const call = async (path, body) => {
+    const r = await fetch(B + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if ((r.headers.get("content-type") || "").includes("json")) { const d = await r.json(); if (d.error) throw new Error(d.error); return d; }
+    if (!r.ok) throw new Error("HTTP " + r.status + " " + (await r.text()).slice(0, 200));
+    return r;
+  };
+  try {
+    const job = await call("/vid/start", { prompt });
+    const t0 = Date.now();
+    for (;;) {                                       // Veo usually takes 1-3 minutes
+      busy("מצלם… " + mmss(Math.round((Date.now() - t0) / 1000)) + " (בדרך כלל 1-3 דקות)");
+      await new Promise((ok) => setTimeout(ok, 8000));
+      if (Date.now() - t0 > 10 * 60000) throw new Error("לקח יותר מ-10 דקות — כדאי לנסות שוב");
+      const r = await call("/vid/poll", job);
+      if (r instanceof Response) { busy("שומר…"); await APP().vid_save(b64(await r.arrayBuffer()), prompt); break; }
+    }
+    $("vidPrompt").value = "";
+  } catch (e) { toast("שגיאה: " + (e.message || e), 8000); }
+  const w = $("vidWait"); if (w) w.remove();
+  await loadVideos();
+  $("vidMake").disabled = false; $("vidMake").innerHTML = VID_BTN;
+};
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-act]"); if (!b || !b.dataset.act.startsWith("vid")) return;
+  if (b.dataset.act === "vidsave") { const f = await APP().vid_export(b.dataset.id); if (f) toast("נשמר: " + f, 6000); }
+  if (b.dataset.act === "viddel" && confirm("למחוק את הסרטון?")) { await APP().vid_delete(b.dataset.id); loadVideos(); }
+  if (b.dataset.act === "vidvault") { try { await APP().vid_to_vault(b.dataset.id); toast("הועבר לכספת"); loadVideos(); } catch (x) { toast("שגיאה: " + x, 6000); } }
 });
 
 // ---------- Gemini keys (admin) ----------

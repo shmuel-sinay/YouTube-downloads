@@ -1,8 +1,8 @@
-"""Pictures made with Gemini (the site's "תמונות" page).
+"""Pictures and videos made with Gemini (the site's "תמונות" / "סרטונים" pages).
 
 They arrive scrambled ("YTI1" + IV + AES-GCM, same fixed key as the Worker's
-scrambleImage) and stay that way on disk; a picture exists only in memory,
-to be shown in the window — or as a real file when the user saves one.
+scrambleImage) and stay that way on disk; a picture or video exists only in
+memory, to be shown in the window — or as a real file when the user saves one.
 """
 
 import base64
@@ -15,12 +15,13 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 KEY = hashlib.sha256(b"yt-tracker-image-v1").digest()
-EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+       "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov"}
 
 
 def unscramble(blob: bytes) -> tuple[str, bytes]:
     if blob[:4] != b"YTI1":
-        raise ValueError("לא קובץ תמונה של התוכנה")
+        raise ValueError("לא קובץ של התוכנה")
     plain = AESGCM(KEY).decrypt(blob[4:16], blob[16:], None)
     n = plain[0]
     mime, data = plain[1:1 + n].decode(), plain[1 + n:]
@@ -30,11 +31,12 @@ def unscramble(blob: bytes) -> tuple[str, bytes]:
 
 
 class Gallery:
-    """One profile's pictures: <id>.yti (scrambled) + index.json (prompts)."""
+    """One profile's pictures (or videos): <id>.yti (scrambled) + index.json (prompts)."""
 
-    def __init__(self, folder: Path):
+    def __init__(self, folder: Path, default_ext: str = ".png"):
         self.dir = folder
         self.index_file = folder / "index.json"
+        self.default_ext = default_ext
 
     def _index(self) -> list[dict]:
         try:
@@ -74,9 +76,10 @@ class Gallery:
         prompt = next((m["prompt"] for m in self._index() if m["id"] == iid), iid)
         name = "".join(c for c in prompt[:40] if c not in '<>:"/\\|?*\n\r').strip() or iid
         folder.mkdir(parents=True, exist_ok=True)
-        dest = folder / (name + EXT.get(mime, ".png"))
+        ext = EXT.get(mime, self.default_ext)
+        dest = folder / (name + ext)
         if dest.exists():
-            dest = folder / (f"{name} {iid}" + EXT.get(mime, ".png"))
+            dest = folder / (f"{name} {iid}" + ext)
         dest.write_bytes(data)
         return dest
 
