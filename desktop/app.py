@@ -1124,6 +1124,11 @@ class Api:
         g.delete(str(iid))
         return "ok"
 
+    def open_url(self, url: str) -> bool:
+        if str(url).startswith(("https://", "http://")):
+            webbrowser.open(str(url))
+        return True
+
     def open_folder(self) -> None:
         dl = self._dl()
         if dl.cfg.get("vault_dir"):

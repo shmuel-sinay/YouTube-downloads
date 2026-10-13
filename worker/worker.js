@@ -1619,12 +1619,12 @@ async function dashboard(env) {
   <section data-p="settings" class="hidden">
     <div class="card">
       <h2>${icon("settings")}הורדה והמרה</h2>
-      <div class="setting"><div class="txt"><b>הורדה אוטומטית בדפדפן</b><span>כשהדף פתוח בדפדפן, כל קובץ שמוכן יורד לבד — רק כשהתוכנה למחשב לא פועלת, כדי שלא יירד פעמיים. <b id="pcState" style="display:inline"></b></span></div>
+      <div class="setting"><div class="txt"><b>הורדה אוטומטית בדפדפן</b><span>יורד לבד כשהדף פתוח (רק כשהתוכנה למחשב סגורה). <b id="pcState" style="display:inline"></b></span></div>
         <label class="switch"><input type="checkbox" id="autoDl"><i></i></label></div>
     </div>
     <div class="card hidden" id="profilesCard">
       <h2>${icon("users")}פרופילים</h2>
-      <p class="sub">לכל פרופיל קוד משלו (רק המנהל קובע ומשנה אותו), ותור, ערוצים והיסטוריה נפרדים לגמרי. <b>רק פתוח בנטפרי</b> — יורד רק מה שנטפרי מאשר. <b>מוריד מהמחשב</b> — ההורדה נעשית בתוכנה במחשב של המשתמש (לא בשרת, שיוטיוב חוסם): לפרופיל לא מוגבל, אם נכשל — עובר לשרת; לפרופיל "רק פתוח בנטפרי" ההורדה עצמה היא הבדיקה. <b>כספת</b> — הקבצים נשמרים מוצפנים.</p>
+      <p class="sub">לכל פרופיל קוד, תור, ערוצים והיסטוריה נפרדים. <a id="profHelp" href="#" style="color:var(--primary)">הסבר על ההגדרות</a></p>
       <div id="profilesList"></div>
       <form class="grid" data-action="/profiles/add" style="margin-top:12px">
         <label class="field">שם<input name="name" placeholder="למשל: אחי" required></label>
@@ -1637,32 +1637,31 @@ async function dashboard(env) {
     </div>
     <div class="card hidden" id="keysCard">
       <h2>${icon("key")}מפתחות Gemini</h2>
-      <p class="sub">כשמפתח מגיע למגבלה, עוברים אוטומטית לבא ברשימה (מלמעלה למטה). מפתח שנגמרה לו המכסה היומית חוזר לבד ב-11:00 בבוקר שעון ישראל (10:00 בחורף). המפתחות שמורים במסד הנתונים של האתר, לא בקוד.</p>
       <div id="keysList"></div>
       <div class="cbar" style="margin-top:12px">
-        <input id="keyLabel" placeholder="שם (לא חובה)" style="width:140px">
-        <input id="keyValue" placeholder="AIza…" style="flex:1;min-width:180px">
+        <input id="keyLabel" placeholder="שם (לא חובה)" style="width:130px">
+        <input id="keyValue" placeholder="מפתח API" style="flex:1;min-width:160px">
+        <button class="btn ghost" id="keyGet" type="button" title="יצירת מפתח ב-Google AI Studio">${icon("link")}<span>צור מפתח</span></button>
         <button class="btn" id="keyAdd" type="button">${icon("add")}<span>הוסף</span></button>
       </div>
-      <p class="sub" style="margin:8px 0 0">מפתח חדש: aistudio.google.com/apikey ← Create API key</p>
     </div>
     <div class="card hidden" id="cookieCard">
       <h2>${icon("key")}תוסף דפדפן — עוגיות יוטיוב</h2>
-      <p class="sub">התוסף שולח את עוגיות יוטיוב מהדפדפן שלך (רק לאתר הזה), ושרת ההורדות משתמש תמיד בעדכניות — בלי לייצא קבצים. מתקינים פעם אחת: מורידים את <b>YTCookies-extension.zip</b> מעמוד ההורדות של התוכנה, פותחים אותו, ב-Chrome: chrome://extensions ← מצב מפתח ← "טען תוסף לא ארוז" ← בוחרים את התיקייה. בתוסף מדביקים את המפתח.</p>
+      <p class="sub">שומר את עוגיות יוטיוב מהדפדפן מעודכנות בשרת ההורדות. <a id="extHelp" href="#" style="color:var(--primary)">הוראות התקנה</a></p>
       <div class="setting"><div class="txt"><b>מפתח לתוסף</b><span id="ckKey" style="direction:ltr;font-family:monospace"></span></div>
         <button class="btn ghost" id="ckCopy" type="button">${icon("copy")}<span>העתק</span></button></div>
       <div class="setting"><div class="txt"><b>עדכון אחרון מהתוסף</b><span id="ckAt"></span></div></div>
     </div>
     <div class="card hidden" id="desktopCard">
       <h2>${icon("monitor")}התוכנה למחשב</h2>
-      <div class="setting"><div class="txt"><b>הפעלה עם Windows</b><span>התוכנה תעלה ברקע כשהמחשב נדלק ותמשיך להוריד גם כשהחלון סגור (אייקון ליד השעון).</span></div>
+      <div class="setting"><div class="txt"><b>הפעלה עם Windows</b><span>עולה ברקע עם המחשב וממשיכה להוריד.</span></div>
         <label class="switch"><input type="checkbox" id="autostart"><i></i></label></div>
       <div class="setting"><div class="txt"><b>התראות</b><span>לכל משתמש במחשב הבחירה שלו.</span></div>
         <select id="notifyMode" style="width:auto"><option value="each">על כל קובץ</option><option value="batch">רק בסיום משימת הורדה</option><option value="off">ללא התראות</option></select></div>
       <div class="setting"><div class="txt"><b>תיקיית הורדות</b><span id="folderPath"></span></div>
         <span style="display:flex;gap:8px"><button class="btn ghost hidden" id="pickFolder" type="button">${icon("edit")}<span>שנה</span></button>
         <button class="btn ghost" id="openFolder" type="button">${icon("folder")}<span>פתח</span></button></span></div>
-      <div class="setting hidden" id="nfTestRow"><div class="txt"><b>בדיקת נטפרי</b><span>הדבק קישור לסרטון — התוכנה בודקת דרך החיבור בבית אם הוא פתוח בנטפרי. <span id="nfTestOut" style="white-space:pre-wrap"></span></span></div>
+      <div class="setting hidden" id="nfTestRow"><div class="txt"><b>בדיקת נטפרי</b><span>בדיקה אם סרטון פתוח בנטפרי. <span id="nfTestOut" style="white-space:pre-wrap"></span></span></div>
         <span style="display:flex;gap:8px"><input id="nfTestUrl" placeholder="https://youtu.be/…" style="width:200px"><button class="btn ghost" id="nfTestBtn" type="button">בדוק</button></span></div>
       <div class="setting"><div class="txt"><b>גרסה</b><span id="appVersion"></span></div>
         <span style="display:flex;gap:8px"><button class="btn hidden" id="updateNow" type="button">${icon("download")}<span>עדכן עכשיו</span></button>
@@ -2067,6 +2066,12 @@ $("keyAdd").onclick = async () => {
   try { keysRender(await keysOp({ op: "add", key: $("keyValue").value, label: $("keyLabel").value })); $("keyValue").value = ""; $("keyLabel").value = ""; toast("המפתח נוסף"); }
   catch (e) { toast("שגיאה: " + e.message, 6000); }
 };
+$("keyValue").addEventListener("keydown", (e) => { if (e.key === "Enter") $("keyAdd").click(); });
+const openUrl = (u) => { if (APP() && APP().open_url) APP().open_url(u); else window.open(u, "_blank"); };
+$("keyGet").onclick = () => openUrl("https://aistudio.google.com/apikey");
+// Help links: the short cards stay clean; the full text appears on demand.
+$("profHelp").onclick = (e) => { e.preventDefault(); toast("קוד — רק המנהל קובע ומשנה. רק פתוח בנטפרי — יורד רק מה שנטפרי מאשר. מוריד מהמחשב — ההורדה בתוכנה ולא בשרת. כספת — הקבצים נשמרים מוצפנים.", 12000); };
+$("extHelp").onclick = (e) => { e.preventDefault(); toast("מורידים YTCookies-extension.zip מעמוד ההורדות, פותחים, וב-Chrome: chrome://extensions ← מצב מפתח ← טען תוסף לא ארוז ← בוחרים את התיקייה. מדביקים בתוסף את המפתח שלמטה.", 14000); };
 document.addEventListener("click", async (e) => {
   const b = e.target.closest("[data-key]"); if (!b) return;
   if (b.dataset.key === "del" && !confirm("למחוק את המפתח?")) return;
