@@ -417,7 +417,7 @@ async function wakeAgent(env) {
 // keys. Every other profile has its own copy of everything under
 // "p:<id>:" — channels, queue, history, log, settings. "agent" and the
 // profile list itself stay global.
-const GLOBAL_KEYS = new Set(["agent", "profiles", "mainprof", "activity", "ytcookies", "autocheck"]);
+const GLOBAL_KEYS = new Set(["agent", "profiles", "mainprof", "activity", "ytcookies", "autocheck", "gemkeys"]);
 
 function profileEnv(env, pid) {
   if (!pid || pid === "main") return { ...env, PROFILE: "main" };
@@ -511,6 +511,61 @@ async function scrambleImage(bytes, mime) {
   const out = new Uint8Array(4 + 12 + ct.length);
   out.set(new TextEncoder().encode("YTI1")); out.set(iv, 4); out.set(ct, 16);
   return out;
+}
+
+// ---------- Gemini keys: a pool that moves on when one runs out ----------
+// "gemkeys" = { keys: [{key, label, until: {model: ms}, err, errAt}], builtin: {...} }
+// (kept in the site's database, added in settings — not in the code, which
+// is public on GitHub). A key that hits its daily quota rests until it resets
+// (midnight in California ≈ 08:00 UTC), a per-minute limit rests a minute, a
+// key Google rejects rests a day.
+function geminiKeys(env, ks) {
+  const list = (ks.keys || []).map((k, i) => ({ ...k, i }));
+  if (env.GEMINI_API_KEY) list.push({ key: env.GEMINI_API_KEY, label: "המפתח המובנה", ...(ks.builtin || {}), i: "b" });
+  return list;
+}
+function nextQuotaReset() {
+  const d = new Date(); d.setUTCHours(8, 0, 0, 0);
+  if (d.getTime() <= Date.now()) d.setUTCDate(d.getUTCDate() + 1);
+  return d.getTime();
+}
+function setKey(ks, i, v) {
+  if (i === "b") ks.builtin = { ...(ks.builtin || {}), ...v };
+  else ks.keys[i] = { ...ks.keys[i], ...v };
+}
+// Sends body (a Gemini request, as text or bytes) to model with the first key
+// that isn't resting; on a quota or key error marks it and tries the next.
+// only: just this key (the "test" button). → { res } or { error, status }.
+async function geminiCall(env, model, body, only) {
+  const ks = await getJSON(env, "gemkeys", {});
+  ks.keys = ks.keys || [];
+  const all = geminiKeys(env, ks).filter((k) => only === undefined || String(k.i) === String(only));
+  if (!all.length) return { error: "אין מפתח Gemini — מוסיפים בהגדרות ← מפתחות Gemini", status: 400 };
+  const now = Date.now();
+  const ready = all.filter((k) => !((k.until || {})[model] > now));
+  if (!ready.length) {
+    const t = Math.min(...all.map((k) => (k.until || {})[model] || now));
+    return { error: "כל המפתחות מוגבלים כרגע עד " + new Date(t).toLocaleTimeString("he-IL", { timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit" }) +
+      " — אפשר להוסיף מפתח בהגדרות", status: 429 };
+  }
+  let last = "", changed = false;
+  for (const k of ready) {
+    const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", {
+      method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": k.key }, body });
+    const bad400 = res.status === 400 && /API_KEY_INVALID|API key not valid|API key expired/i.test(await res.clone().text());
+    if (!(res.status === 429 || res.status === 401 || res.status === 403 || bad400)) {
+      if (k.err) { setKey(ks, k.i, { err: "" }); changed = true; }
+      if (changed) await putJSON(env, "gemkeys", ks);    // the keys that failed on the way rest
+      return { res };
+    }
+    const t = await res.text();
+    let msg = t; try { msg = JSON.parse(t).error.message || t; } catch (e) {}
+    const rest = res.status !== 429 ? now + 86400000 : /per ?day|PerDay|limit: 0/i.test(t) ? nextQuotaReset() : now + 65000;
+    setKey(ks, k.i, { until: { ...(k.until || {}), [model]: rest }, err: String(msg).slice(0, 200), errAt: new Date().toISOString() });
+    last = k.label + ": " + String(msg).slice(0, 160); changed = true;
+  }
+  await putJSON(env, "gemkeys", ks);
+  return { error: "כל המפתחות נכשלו — " + last, status: 429 };
 }
 
 const json = (v, status = 200) => new Response(JSON.stringify(v), {
@@ -897,16 +952,13 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   // on the computer. Not offered to a NetFree-restricted profile.
   if (p === "/img/make" && req.method === "POST") {
     if ((await profileInfo(env, pid)).netfree) return json({ error: "לא זמין בפרופיל הזה" }, 403);
-    if (!env.GEMINI_API_KEY) return json({ error: "חסר Secret בשם GEMINI_API_KEY ב-Worker" }, 400);
     const prompt = String((await req.json()).prompt || "").trim().slice(0, 2000);
     if (!prompt) return json({ error: "צריך לכתוב מה לצייר" }, 400);
     const model = env.IMAGE_MODEL || "gemini-2.5-flash-image";
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
-      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }],
-                             generationConfig: { responseModalities: ["TEXT", "IMAGE"] } }),
-    });
+    const call = await geminiCall(rootEnv, model, JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }],
+                                                                  generationConfig: { responseModalities: ["TEXT", "IMAGE"] } }));
+    if (call.error) return json({ error: call.error }, call.status);
+    const r = call.res;
     // The answer is ~2MB of JSON with the picture as base64. The free plan
     // allows ~10ms of work per request, so no parsing or decoding here: the
     // base64 text is cut out with indexOf and scrambled as it is (native
@@ -920,7 +972,9 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const parts = (d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts) || [];
       const why = (d.error && d.error.message) || parts.map((x) => x.text).filter(Boolean).join(" ") ||
         (d.candidates && d.candidates[0] && d.candidates[0].finishReason) || ("HTTP " + r.status + " " + text.slice(0, 120));
-      return json({ error: "Gemini לא החזיר תמונה: " + String(why).slice(0, 300) }, 502);
+      return json({ error: why === "STOP"
+        ? "Gemini סיים בלי לצייר. כדאי לנסח כבקשה מפורשת, למשל: \"צור תמונה של נוף הרים בשקיעה\""
+        : "Gemini לא החזיר תמונה: " + String(why).slice(0, 300) }, 502);
     }
     const de = text.indexOf('"', ds), b64 = text.slice(ds, de);
     // mimeType sits next to data, before or after it.
@@ -928,6 +982,30 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const mime = (mt.exec(text.slice(at, dk)) || mt.exec(text.slice(de, de + 200)) || [])[1] || "image/png";
     return new Response(await scrambleImage(new TextEncoder().encode(b64), mime + ";base64"), {
       headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
+  }
+  // --- the key pool (admin): add, remove, move up, release, test ---
+  if (p === "/keys" && pid === "main") {
+    const ks = await getJSON(rootEnv, "gemkeys", {});
+    ks.keys = ks.keys || [];
+    if (req.method === "POST") {
+      const b = await req.json(), i = parseInt(b.i, 10);
+      if (b.op === "test") {
+        const r = await geminiCall(rootEnv, "gemini-2.5-flash", JSON.stringify({ contents: [{ parts: [{ text: "ping" }] }] }), b.i);
+        return json({ msg: r.error || (r.res.ok ? "המפתח עובד ✓" : "HTTP " + r.res.status) });
+      }
+      if (b.op === "add") {
+        const key = String(b.key || "").trim();
+        if (!/^[\w-]{20,80}$/.test(key)) return json({ error: "זה לא נראה כמו מפתח (AIza…)" }, 400);
+        if (ks.keys.some((k) => k.key === key) || key === rootEnv.GEMINI_API_KEY) return json({ error: "המפתח כבר ברשימה" }, 400);
+        ks.keys.push({ key, label: String(b.label || "").trim().slice(0, 40) || "מפתח " + (ks.keys.length + 1), added: new Date().toISOString() });
+      } else if (b.op === "del" && ks.keys[i]) ks.keys.splice(i, 1);
+      else if (b.op === "up" && i > 0 && ks.keys[i]) ks.keys.splice(i - 1, 0, ks.keys.splice(i, 1)[0]);
+      else if (b.op === "reset") setKey(ks, b.i === "b" ? "b" : i, { until: {}, err: "" });
+      await putJSON(rootEnv, "gemkeys", ks);
+    }
+    const now = Date.now();
+    return json({ keys: geminiKeys(rootEnv, ks).map((k) => ({ i: k.i, label: k.label, mask: k.key.slice(0, 6) + "…" + k.key.slice(-4),
+      err: k.err || "", resting: Object.values(k.until || {}).filter((t) => t > now).sort()[0] || 0 })) });
   }
   if (req.method === "POST") {
     const f = await req.formData();
@@ -1270,6 +1348,9 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 @keyframes spin{to{transform:rotate(360deg)}}
 .imgcard.wait .ph{aspect-ratio:1;display:grid;place-items:center;color:var(--muted);background:linear-gradient(110deg,var(--panel2) 30%,var(--line) 50%,var(--panel2) 70%);background-size:300% 100%;animation:shim 1.6s linear infinite}
 @keyframes shim{to{background-position:-150% 0}}
+.keyrow{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)}.keyrow:last-child{border-bottom:0}
+.keyrow .t{flex:1;min-width:0}.keyrow .t b{display:block}.keyrow .t span{color:var(--muted);font-size:.85rem;overflow-wrap:anywhere}
+.cbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.cbar select,.cbar input{width:auto}.cbar .grow{flex:1}
 .imggrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;margin-top:14px}
 .imgcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}
 .imgcard img{width:100%;aspect-ratio:1;object-fit:cover;display:block;background:var(--panel2);cursor:zoom-in}
@@ -1278,7 +1359,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .imgbig{position:fixed;inset:0;background:#000d;display:grid;place-items:center;z-index:50;cursor:zoom-out}
 .imgbig img{max-width:94vw;max-height:94vh;border-radius:10px}
 .mini{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)}.mini:last-child{border-bottom:0}
-.mini .pos{flex:none;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--panel2);color:var(--muted);font-size:.8rem;font-variant-numeric:tabular-nums}
+.mini .pos,.keyrow .pos{flex:none;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--panel2);color:var(--muted);font-size:.8rem;font-variant-numeric:tabular-nums}
 .mini .t{flex:1;min-width:0}.mini .t b{display:block;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mini .t span{color:var(--muted);font-size:.78rem}
 .mini .t .bad{color:var(--bad)}
@@ -1550,6 +1631,17 @@ async function dashboard(env) {
         <div class="actions-row" style="align-self:end;margin:0"><button class="btn">${icon("add")}<span>צור פרופיל</span></button></div>
       </form>
     </div>
+    <div class="card hidden" id="keysCard">
+      <h2>${icon("key")}מפתחות Gemini</h2>
+      <p class="sub">כשמפתח מגיע למגבלה, עוברים אוטומטית לבא ברשימה (מלמעלה למטה). מפתח שנגמרה לו המכסה היומית חוזר לבד ב-11:00 בבוקר שעון ישראל (10:00 בחורף). המפתחות שמורים במסד הנתונים של האתר, לא בקוד.</p>
+      <div id="keysList"></div>
+      <div class="cbar" style="margin-top:12px">
+        <input id="keyLabel" placeholder="שם (לא חובה)" style="width:140px">
+        <input id="keyValue" placeholder="AIza…" style="flex:1;min-width:180px">
+        <button class="btn" id="keyAdd" type="button">${icon("add")}<span>הוסף</span></button>
+      </div>
+      <p class="sub" style="margin:8px 0 0">מפתח חדש: aistudio.google.com/apikey ← Create API key</p>
+    </div>
     <div class="card hidden" id="cookieCard">
       <h2>${icon("key")}תוסף דפדפן — עוגיות יוטיוב</h2>
       <p class="sub">התוסף שולח את עוגיות יוטיוב מהדפדפן שלך (רק לאתר הזה), ושרת ההורדות משתמש תמיד בעדכניות — בלי לייצא קבצים. מתקינים פעם אחת: מורידים את <b>YTCookies-extension.zip</b> מעמוד ההורדות של התוכנה, פותחים אותו, ב-Chrome: chrome://extensions ← מצב מפתח ← "טען תוסף לא ארוז" ← בוחרים את התיקייה. בתוסף מדביקים את המפתח.</p>
@@ -1611,6 +1703,7 @@ function showPage(name) {
   if (name === "logs") { const b = $("logs"); b.scrollTop = b.scrollHeight; }
   if (name === "global") setTimeout(loadGlobal, 0);
   if (name === "images") setTimeout(loadImages, 0);
+  if (name === "settings") setTimeout(loadKeys, 0);
 }
 document.querySelectorAll(".nav[data-page]").forEach((n) => n.onclick = () => showPage(n.dataset.page));
 // Names on hover — in a narrow window the side bar shows icons only.
@@ -1772,6 +1865,7 @@ function render() {
   }
   renderDash();
   $("profilesCard").classList.toggle("hidden", !(S.profile && S.profile.admin));
+  $("keysCard").classList.toggle("hidden", !(S.profile && S.profile.admin));
   const sw = (pr, flag, label) => '<label>' + label + '<span class="switch"><input type="checkbox" data-prof="' + esc(pr.id) + '" data-flag="' + flag + '"' + (pr[flag] ? " checked" : "") + '><i></i></span></label>';
   if (!document.activeElement || !document.activeElement.dataset || !document.activeElement.dataset.prof)
   $("profilesList").innerHTML = (S.profiles || []).map((pr) =>
@@ -1944,6 +2038,36 @@ document.addEventListener("click", async (e) => {
   if (b.dataset.act === "imgdel" && confirm("למחוק את התמונה?")) { await APP().img_delete(b.dataset.id); loadImages(); }
 });
 
+// ---------- Gemini keys (admin) ----------
+async function keysOp(body) {
+  const r = await fetch(B + "/keys", body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+  const d = await r.json(); if (d.error) throw new Error(d.error); return d;
+}
+function keysRender(d) {
+  if (d.msg) return toast(d.msg, 8000);
+  const n = d.keys.length;
+  $("keysList").innerHTML = n ? d.keys.map((k, x) => '<div class="keyrow"><span class="pos">' + (x + 1) + '</span><div class="t"><b>' + esc(k.label) + '</b><span>' + esc(k.mask) +
+    (k.resting ? ' · <span class="bad">נח עד ' + new Date(k.resting).toLocaleString("he-IL", { weekday: "short", hour: "2-digit", minute: "2-digit" }) + '</span>' : ' · פעיל') +
+    (k.err ? ' · ' + esc(k.err) : '') + '</span></div>' +
+    '<button class="btn ghost" data-key="test" data-i="' + k.i + '" type="button">בדוק</button>' +
+    (k.resting || k.err ? '<button class="btn ghost" data-key="reset" data-i="' + k.i + '" type="button">שחרר</button>' : '') +
+    (k.i !== "b" && k.i > 0 ? '<button class="ibtn" data-key="up" data-i="' + k.i + '" title="העלה למעלה">' + icon("now") + '</button>' : '') +
+    (k.i !== "b" ? '<button class="ibtn danger" data-key="del" data-i="' + k.i + '" title="מחק">' + icon("trash") + '</button>' : '') + '</div>').join("")
+    : '<div class="sub" style="margin:0">אין עדיין מפתחות.</div>';
+}
+async function loadKeys() { if (S.profile && S.profile.admin) try { keysRender(await keysOp()); } catch (e) {} }
+$("keyAdd").onclick = async () => {
+  try { keysRender(await keysOp({ op: "add", key: $("keyValue").value, label: $("keyLabel").value })); $("keyValue").value = ""; $("keyLabel").value = ""; toast("המפתח נוסף"); }
+  catch (e) { toast("שגיאה: " + e.message, 6000); }
+};
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-key]"); if (!b) return;
+  if (b.dataset.key === "del" && !confirm("למחוק את המפתח?")) return;
+  if (b.dataset.key === "test") toast("בודק…");
+  try { const d = await keysOp({ op: b.dataset.key, i: b.dataset.i }); if (d.msg) { toast(d.msg, 8000); loadKeys(); } else keysRender(d); }
+  catch (x) { toast("שגיאה: " + x.message, 6000); }
+});
+
 // ---------- desktop app extras ----------
 async function loadHave() { if (!APP()) return; try { HAVE = new Set(await APP().downloaded()); } catch (e) {} }
 async function initDesktop() {
@@ -2017,7 +2141,6 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) refr
 // ================================================================
 
 async function gemini(request, env) {
-  const GEMINI_API_KEY = env.GEMINI_API_KEY;
   const SECRET_PASSWORD = env.GEMINI_PASSWORD;
 
   if (request.method === "GET") {
@@ -2030,15 +2153,10 @@ async function gemini(request, env) {
       if (!SECRET_PASSWORD || body.password !== SECRET_PASSWORD) {
         return new Response("Unauthorized", { status: 401 });
       }
-      if (!GEMINI_API_KEY) {
-        return new Response("חסר Secret בשם GEMINI_API_KEY ב-Worker.", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
-      }
-      const geminiApiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_API_KEY;
-      const geminiResponse = await fetch(geminiApiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: body.contents }),
-      });
+      // Keys come from the pool (settings → Gemini keys); moves on when one runs out.
+      const call = await geminiCall(env, "gemini-2.5-flash", JSON.stringify({ contents: body.contents }));
+      if (call.error) return new Response(call.error, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+      const geminiResponse = call.res;
       const data = await geminiResponse.json();
       let aiText = "";
       if (data && data.candidates && data.candidates.length > 0) {
