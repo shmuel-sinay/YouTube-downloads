@@ -21,6 +21,7 @@
 //   Variable:              RENDER_URL — the download server, e.g.
 //                          https://my-agent.onrender.com (woken up on demand)
 //   Cron Trigger:          e.g. "0 */3 * * *"
+//   Optional GH_TOKEN:     the "סרטונים" page (made on GitHub Actions, see README)
 //   Optional R2 binding:   FILES
 
 const BASE = "/yt";     // where the tracker lives; "/" stays the Gemini chat
@@ -533,11 +534,24 @@ function setKey(ks, i, v) {
   if (i === "b") ks.builtin = { ...(ks.builtin || {}), ...v };
   else ks.keys[i] = { ...ks.keys[i], ...v };
 }
+// Was Google's answer a problem with the key itself (quota, spend cap, bad
+// key)? Then the key rests (until in ks) and the message is returned; null
+// means the key is fine. Also used for the video Action's tries (/api/vid/job).
+function keyTrouble(ks, k, model, status, t) {
+  const bad400 = status === 400 && /API_KEY_INVALID|API key not valid|API key expired/i.test(t);
+  const capped = /spending cap/i.test(t);              // the project's monthly spend cap (AI Studio)
+  if (!(status === 429 || status === 401 || status === 403 || bad400 || capped)) return null;
+  let msg = t; try { msg = JSON.parse(t).error.message || t; } catch (e) {}
+  const now = Date.now(), month = new Date(); month.setUTCMonth(month.getUTCMonth() + 1, 1); month.setUTCHours(8, 0, 0, 0);
+  const rest = capped ? month.getTime() : status !== 429 ? now + 86400000
+    : /per ?day|PerDay|limit: 0/i.test(t) ? nextQuotaReset() : now + 65000;
+  setKey(ks, k.i, { until: { ...(k.until || {}), [model]: rest }, err: String(msg).slice(0, 200), errAt: new Date().toISOString() });
+  return String(msg);
+}
 // Sends body (a Gemini request, as text or bytes) to model with the first key
 // that isn't resting; on a quota or key error marks it and tries the next.
-// only: just this key (the "test" button). action: the model method
-// (":predictLongRunning" for videos). → { res, k } or { error, status }.
-async function geminiCall(env, model, body, only, action = ":generateContent") {
+// only: just this key (the "test" button). → { res } or { error, status }.
+async function geminiCall(env, model, body, only) {
   const ks = await getJSON(env, "gemkeys", {});
   ks.keys = ks.keys || [];
   const all = geminiKeys(env, ks).filter((k) => only === undefined || String(k.i) === String(only));
@@ -551,26 +565,42 @@ async function geminiCall(env, model, body, only, action = ":generateContent") {
   }
   let last = "", changed = false;
   for (const k of ready) {
-    const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + action, {
+    const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", {
       method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": k.key }, body });
-    const peek = res.ok ? "" : await res.clone().text();
-    const bad400 = res.status === 400 && /API_KEY_INVALID|API key not valid|API key expired/i.test(peek);
-    const capped = /spending cap/i.test(peek);           // the project's monthly spend cap (AI Studio)
-    if (!(res.status === 429 || res.status === 401 || res.status === 403 || bad400 || capped)) {
+    const msg = keyTrouble(ks, k, model, res.status, res.ok ? "" : await res.clone().text());
+    if (msg === null) {
       if (k.err) { setKey(ks, k.i, { err: "" }); changed = true; }
       if (changed) await putJSON(env, "gemkeys", ks);    // the keys that failed on the way rest
-      return { res, k: k.i };
+      return { res };
     }
-    const t = await res.text();
-    let msg = t; try { msg = JSON.parse(t).error.message || t; } catch (e) {}
-    const month = new Date(); month.setUTCMonth(month.getUTCMonth() + 1, 1); month.setUTCHours(8, 0, 0, 0);
-    const rest = capped ? month.getTime() : res.status !== 429 ? now + 86400000
-      : /per ?day|PerDay|limit: 0/i.test(t) ? nextQuotaReset() : now + 65000;
-    setKey(ks, k.i, { until: { ...(k.until || {}), [model]: rest }, err: String(msg).slice(0, 200), errAt: new Date().toISOString() });
-    last = k.label + ": " + String(msg).slice(0, 160); changed = true;
+    last = k.label + ": " + msg.slice(0, 160); changed = true;
   }
   await putJSON(env, "gemkeys", ks);
   return { error: "כל המפתחות נכשלו — " + last, status: 429 };
+}
+
+// ---------- videos: GitHub Actions does the work ----------
+// GH_TOKEN: a fine-grained token for this repository with "Actions: read and
+// write" (start the run, read and delete its artifact). GH_REPO / GH_REF
+// override the repository and branch.
+const gh = (env, path, opts = {}) => fetch("https://api.github.com/repos/" + (env.GH_REPO || "shmuel-sinay/YouTube-downloads") + path, {
+  ...opts, headers: { Authorization: "Bearer " + env.GH_TOKEN, Accept: "application/vnd.github+json",
+                      "User-Agent": "yt-tracker-worker", "X-GitHub-Api-Version": "2022-11-28" } });
+// An artifact comes as a zip with one file. Uploaded with compression-level 0,
+// so getting it out is slicing (or a native inflate) — no work for the free plan.
+async function unzipOne(buf) {
+  const b = new Uint8Array(buf), v = new DataView(buf);
+  let e = b.length - 22;
+  while (e >= 0 && v.getUint32(e, true) !== 0x06054b50) e--;   // end of central directory
+  if (e < 0) throw new Error("not a zip");
+  const cd = v.getUint32(e + 16, true);
+  if (v.getUint32(cd, true) !== 0x02014b50) throw new Error("bad zip");
+  const method = v.getUint16(cd + 10, true), size = v.getUint32(cd + 20, true), lh = v.getUint32(cd + 42, true);
+  const start = lh + 30 + v.getUint16(lh + 26, true) + v.getUint16(lh + 28, true);
+  const data = b.subarray(start, start + size);
+  if (method === 0) return data;
+  if (method !== 8) throw new Error("zip method " + method);
+  return new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer());
 }
 
 const json = (v, status = 200) => new Response(JSON.stringify(v), {
@@ -600,6 +630,37 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (!isAgent(req, env)) {
       await addLog(env, "worker", "⚠ הסוכן ניסה להתחבר עם AGENT_TOKEN שגוי (צריך להיות זהה ב-Cloudflare וב-Render)");
       return json({ error: "unauthorized" }, 401);
+    }
+    // The video Action (.github/workflows/video.yml), with the same token.
+    if (p === "/api/vid/job") {
+      const id = String(url.searchParams.get("id") || ""), key = "vidjob:" + id;
+      const j = /^[0-9a-f]{16}$/.test(id) && await getJSON(env, key, null);
+      if (!j) return json({ error: "no such job" }, 404);
+      const ks = await getJSON(env, "gemkeys", {});
+      ks.keys = ks.keys || [];
+      const keys = geminiKeys(env, ks);
+      if (req.method === "GET") {                        // starting: the prompt and the keys to try, in order
+        if (j.status !== "queued") return json({ error: "already taken" }, 409);
+        Object.assign(j, { status: "running", run: String(url.searchParams.get("run") || "") });
+        await putJSON(env, key, j);
+        const now = Date.now();
+        return json({ prompt: j.prompt, model: j.model,
+          keys: keys.filter((k) => !((k.until || {})[j.model] > now)).map((k) => ({ i: k.i, key: k.key })) });
+      }
+      // Finished: keys that Google refused rest, like in geminiCall.
+      const b = await req.json();
+      let changed = false;
+      for (const f of (b.failed || []).slice(0, 20)) {
+        const k = keys.find((x) => String(x.i) === String(f.i));
+        if (k && keyTrouble(ks, k, j.model, +f.status, String(f.text || "")) !== null) changed = true;
+      }
+      const ok = (b.used !== undefined) && keys.find((x) => String(x.i) === String(b.used));
+      if (ok && ok.err) { setKey(ks, ok.i, { err: "" }); changed = true; }
+      if (changed) await putJSON(env, "gemkeys", ks);
+      if (b.status === "done") j.status = "done";
+      else Object.assign(j, { status: "failed", error: String(b.error || "השרת ב-GitHub נכשל").slice(0, 400) });
+      await putJSON(env, key, j);
+      return json({ ok: true });
     }
     const agent = await getJSON(env, "agent", {});
     if (!agent.seen || Date.now() - Date.parse(agent.seen) > 180000) {
@@ -989,43 +1050,53 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
   }
   // --- videos from Gemini (Veo), for the desktop app only ---
-  // Same idea as the pictures: the video leaves here scrambled. Veo takes a
-  // minute or more, so it's two steps: /vid/start begins it and says which
-  // key did (only that key can read the result), and the page asks /vid/poll
-  // every few seconds until it answers with the scrambled video.
-  if (p === "/vid/start" && req.method === "POST") {
+  // The work happens on GitHub (.github/workflows/video.yml): Veo takes
+  // minutes and the video is megabytes, too much for a request here. This
+  // only starts the Action and, at the end, passes on the scrambled file it
+  // left (an artifact) — the same scrambled format as the pictures.
+  if (p.startsWith("/vid/") && req.method === "POST") {
     if ((await profileInfo(env, pid)).netfree) return json({ error: "לא זמין בפרופיל הזה" }, 403);
-    const prompt = String((await req.json()).prompt || "").trim().slice(0, 2000);
-    if (!prompt) return json({ error: "צריך לכתוב מה לצלם" }, 400);
-    const model = env.VIDEO_MODEL || "veo-3.0-fast-generate-001";
-    const call = await geminiCall(rootEnv, model, JSON.stringify({ instances: [{ prompt }], parameters: { aspectRatio: "16:9" } }),
-                                  undefined, ":predictLongRunning");
-    if (call.error) return json({ error: call.error }, call.status);
-    const d = await call.res.json().catch(() => ({}));
-    if (!d.name) return json({ error: "Gemini לא התחיל סרטון: " + String((d.error && d.error.message) || "HTTP " + call.res.status).slice(0, 300) }, 502);
-    return json({ op: d.name, k: call.k });
-  }
-  if (p === "/vid/poll" && req.method === "POST") {
-    if ((await profileInfo(env, pid)).netfree) return json({ error: "לא זמין בפרופיל הזה" }, 403);
+    if (!rootEnv.GH_TOKEN) return json({ error: "חסר GH_TOKEN ב-Worker — ראה README ← סרטונים" }, 400);
     const b = await req.json();
-    // Only an operation name, so the key can't be sent anywhere else.
-    if (!/^models\/[\w.-]+\/operations\/[\w-]+$/.test(String(b.op || ""))) return json({ error: "בקשה לא תקינה" }, 400);
-    const ks = await getJSON(rootEnv, "gemkeys", {});
-    const k = geminiKeys(rootEnv, ks).find((x) => String(x.i) === String(b.k));
-    if (!k) return json({ error: "המפתח שהתחיל את הסרטון כבר לא ברשימה" }, 400);
-    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/" + b.op, { headers: { "x-goog-api-key": k.key } });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok || d.error) return json({ error: "Gemini: " + String((d.error && d.error.message) || "HTTP " + r.status).slice(0, 300) }, 502);
-    if (!d.done) return json({ done: false });
-    const g = (d.response && d.response.generateVideoResponse) || {};
-    const uri = g.generatedSamples && g.generatedSamples[0] && g.generatedSamples[0].video && g.generatedSamples[0].video.uri;
-    if (!uri) return json({ error: (g.raiMediaFilteredReasons || []).join(" ") ||
-      "Gemini סיים בלי סרטון. כדאי לנסח אחרת, למשל: \"סרטון של גלים מתנפצים על סלעים בשקיעה\"" }, 502);
-    if (!uri.startsWith("https://generativelanguage.googleapis.com/")) return json({ error: "כתובת סרטון לא צפויה" }, 502);
-    const v = await fetch(uri, { headers: { "x-goog-api-key": k.key } });
-    if (!v.ok) return json({ error: "הורדת הסרטון מ-Gemini נכשלה: HTTP " + v.status }, 502);
-    const mime = (v.headers.get("content-type") || "").split(";")[0].startsWith("video/") ? v.headers.get("content-type").split(";")[0] : "video/mp4";
-    return new Response(await scrambleImage(new Uint8Array(await v.arrayBuffer()), mime), {
+    if (p === "/vid/start") {
+      const prompt = String(b.prompt || "").trim().slice(0, 2000);
+      if (!prompt) return json({ error: "צריך לכתוב מה לצלם" }, 400);
+      const id = [...crypto.getRandomValues(new Uint8Array(8))].map((x) => x.toString(16).padStart(2, "0")).join("");
+      await putJSON(rootEnv, "vidjob:" + id, { id, pid, prompt, model: rootEnv.VIDEO_MODEL || "veo-3.0-fast-generate-001",
+                                               status: "queued", at: Date.now() });
+      let ref = rootEnv.GH_REF;
+      if (!ref) ref = (await (await gh(rootEnv, "")).json()).default_branch || "main";
+      const r = await gh(rootEnv, "/actions/workflows/video.yml/dispatches", { method: "POST", body: JSON.stringify({ ref, inputs: { job: id } }) });
+      if (!r.ok) {
+        await rootEnv.DB.delete("vidjob:" + id);
+        return json({ error: "GitHub לא הפעיל את השרת: HTTP " + r.status + " " + (await r.text()).slice(0, 200) }, 502);
+      }
+      return json({ job: id });
+    }
+    const id = String(b.job || "");
+    const j = /^[0-9a-f]{16}$/.test(id) && await getJSON(rootEnv, "vidjob:" + id, null);
+    if (!j || j.pid !== pid) return json({ error: "הסרטון לא נמצא" }, 404);
+    if (p === "/vid/done") {                             // saved in the app: clean up on GitHub
+      if (j.artifact) await gh(rootEnv, "/actions/artifacts/" + j.artifact, { method: "DELETE" });
+      await rootEnv.DB.delete("vidjob:" + id);
+      return json({ ok: true });
+    }
+    if (p !== "/vid/poll") return json({ error: "not found" }, 404);
+    if (j.status === "queued" || j.status === "running") {
+      if (Date.now() - j.at > 25 * 60000) { await rootEnv.DB.delete("vidjob:" + id); return json({ error: "השרת ב-GitHub לא סיים תוך 25 דקות — כדאי לנסות שוב" }, 504); }
+      return json({ done: false, stage: j.status });
+    }
+    if (j.status !== "done") { await rootEnv.DB.delete("vidjob:" + id); return json({ error: j.error || "השרת ב-GitHub נכשל" }, 502); }
+    const arts = (await (await gh(rootEnv, "/actions/runs/" + j.run + "/artifacts")).json()).artifacts || [];
+    const art = arts.find((x) => x.name === "vid-" + id);
+    if (!art) return json({ error: "הקובץ לא נמצא ב-GitHub" }, 502);
+    if (j.artifact !== art.id) { j.artifact = art.id; await putJSON(rootEnv, "vidjob:" + id, j); }
+    // The zip link sends on to a signed storage address — fetched without our token.
+    const z = await gh(rootEnv, "/actions/artifacts/" + art.id + "/zip", { redirect: "manual" });
+    const loc = z.headers.get("location");
+    const zr = loc ? await fetch(loc) : z;
+    if (!zr.ok) return json({ error: "הורדת הקובץ מ-GitHub נכשלה: HTTP " + zr.status }, 502);
+    return new Response(await unzipOne(await zr.arrayBuffer()), {
       headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
   }
   // --- the key pool (admin): add, remove, move up, release, test ---
@@ -1656,7 +1727,7 @@ async function dashboard(env) {
   <section data-p="videos" class="hidden">
     <div class="card">
       <h2>${icon("video")}סרטון חדש עם Gemini</h2>
-      <p class="sub">הסרטון עובר מעורבל ונפתח רק כאן בתוכנה. באתר עצמו לא נשמר שום סרטון. יצירת סרטון (Veo) דורשת מפתח עם חיוב פעיל ב-Google.</p>
+      <p class="sub">הסרטון נוצר בשרת ב-GitHub, עובר מעורבל ונפתח רק כאן בתוכנה. באתר עצמו לא נשמר שום סרטון. יצירת סרטון (Veo) דורשת מפתח עם חיוב פעיל ב-Google.</p>
       <textarea id="vidPrompt" rows="3" placeholder="מה לצלם? למשל: גלים מתנפצים על סלעים בשקיעה, צילום רחפן איטי"></textarea>
       <div class="imgbar"><button class="btn" id="vidMake" type="button">${icon("zap")}<span>צור סרטון</span></button>
       <span class="sub" style="margin:0">Ctrl+Enter ליצירה</span></div>
@@ -2141,12 +2212,17 @@ $("vidMake").onclick = async () => {
   try {
     const job = await call("/vid/start", { prompt });
     const t0 = Date.now();
-    for (;;) {                                       // Veo usually takes 1-3 minutes
-      busy("מצלם… " + mmss(Math.round((Date.now() - t0) / 1000)) + " (בדרך כלל 1-3 דקות)");
+    let stage = "queued";
+    for (;;) {                                       // the GitHub server starts in ~30s, Veo takes 1-3 minutes
+      busy((stage === "queued" ? "מפעיל שרת ב-GitHub… " : "מצלם… ") + mmss(Math.round((Date.now() - t0) / 1000)) + " (בדרך כלל 2-4 דקות)");
       await new Promise((ok) => setTimeout(ok, 8000));
-      if (Date.now() - t0 > 10 * 60000) throw new Error("לקח יותר מ-10 דקות — כדאי לנסות שוב");
       const r = await call("/vid/poll", job);
-      if (r instanceof Response) { busy("שומר…"); await APP().vid_save(b64(await r.arrayBuffer()), prompt); break; }
+      if (r instanceof Response) {
+        busy("שומר…"); await APP().vid_save(b64(await r.arrayBuffer()), prompt);
+        call("/vid/done", job).catch(() => {});
+        break;
+      }
+      stage = r.stage;
     }
     $("vidPrompt").value = "";
   } catch (e) { toast("שגיאה: " + (e.message || e), 8000); }
