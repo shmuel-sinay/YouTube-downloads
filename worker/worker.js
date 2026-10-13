@@ -583,7 +583,7 @@ async function cleanImagePrompt(env, prompt) {
     "add a short style hint if missing. Output ONLY the prompt, one line, no quotes.\n\n" + prompt;
   try {
     const call = await Promise.race([
-      geminiCall(env, "gemini-2.5-flash",
+      geminiCall(env, (env.CHAT_MODEL || "gemini-3.8-flash"),
         JSON.stringify({ contents: [{ parts: [{ text: instruction }] }], generationConfig: { temperature: 0.4, maxOutputTokens: 120 } })),
       new Promise((res) => setTimeout(() => res({ error: "timeout" }), 15000)),
     ]);
@@ -1056,7 +1056,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (req.method === "POST") {
       const b = await req.json(), i = parseInt(b.i, 10);
       if (b.op === "test") {
-        const r = await geminiCall(rootEnv, "gemini-2.5-flash", JSON.stringify({ contents: [{ parts: [{ text: "ping" }] }] }), b.i);
+        const r = await geminiCall(rootEnv, (rootEnv.CHAT_MODEL || "gemini-3.8-flash"), JSON.stringify({ contents: [{ parts: [{ text: "ping" }] }] }), b.i);
         return json({ msg: r.error || (r.res.ok ? "המפתח עובד ✓" : "HTTP " + r.res.status) });
       }
       if (b.op === "add") {
@@ -2230,7 +2230,7 @@ async function gemini(request, env) {
         return new Response("Unauthorized", { status: 401 });
       }
       // Keys come from the pool (settings → Gemini keys); moves on when one runs out.
-      const call = await geminiCall(env, "gemini-2.5-flash", JSON.stringify({ contents: body.contents }));
+      const call = await geminiCall(env, (env.CHAT_MODEL || "gemini-3.8-flash"), JSON.stringify({ contents: body.contents }));
       if (call.error) return new Response(call.error, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
       const geminiResponse = call.res;
       const data = await geminiResponse.json();
