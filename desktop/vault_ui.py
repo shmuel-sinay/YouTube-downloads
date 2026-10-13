@@ -144,6 +144,16 @@ class VaultApi:
         self._require()
         return self._v.list()
 
+    def image(self, eid: str) -> str:
+        """An image entry as a data URL, decrypted in memory only (no file on
+        disk), for showing inside the vault. Up to 25MB."""
+        self._require()
+        import base64
+        data, h = self._v.read_bytes(eid, limit=25 << 20)
+        ext = (h.get("name", "").rsplit(".", 1)[-1] or "png").lower()
+        mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp", "gif": "gif", "bmp": "bmp"}.get(ext, "png")
+        return f"data:image/{mime};base64," + base64.b64encode(data).decode()
+
     def play(self, eid: str) -> str:
         """Decrypt to this user's private temp folder and open in the default player."""
         self._require()
@@ -331,6 +341,10 @@ input[type=checkbox]{width:17px;height:17px;padding:0;accent-color:var(--primary
 .row{display:flex;align-items:center;gap:12px;padding:9px 14px;border-bottom:1px solid var(--line);cursor:pointer;user-select:none}
 .row:last-child{border-bottom:0}.row:hover{background:#ffffff06}.row.sel{background:#4f8cff14}
 .row .ic{color:var(--muted)}.row .name{flex:1;min-width:0}
+.row .ic.thumb{width:40px;height:40px;border-radius:7px;overflow:hidden;background:var(--panel2);display:grid;place-items:center}
+.row .ic.thumb img{width:100%;height:100%;object-fit:cover}
+#lightbox{position:fixed;inset:0;background:#000d;display:grid;place-items:center;z-index:100;cursor:zoom-out}
+#lightbox img{max-width:94vw;max-height:94vh;border-radius:8px}
 .row .name b{display:block;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .muted{color:var(--muted);font-size:.8rem}
 .ibtn{display:inline-grid;place-items:center;width:32px;height:32px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--muted);cursor:pointer;flex:none}
@@ -395,10 +409,12 @@ const SVG = (p) => '<svg class="i" viewBox="0 0 24 24" fill="none" stroke="curre
 const IC = { video: SVG('<path d="M23 7l-7 5 7 5z"/><rect x="1" y="5" width="15" height="14" rx="2"/>'),
   audio: SVG('<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>'),
   file: SVG('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>'),
+  image: SVG('<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>'),
   folder: SVG('<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>'),
   play: '<svg class="i" viewBox="0 0 24 24" fill="currentColor"><path d="M6 4l14 8-14 8z"/></svg>' };
 const kindOf = (x) => { const e = (x.name || "").split(".").pop().toLowerCase();
-  return ["mp4", "webm", "mkv", "mov", "avi"].includes(e) ? "video" : ["mp3", "m4a", "opus", "ogg", "wav", "flac", "aac"].includes(e) ? "audio" : "file"; };
+  return ["mp4", "webm", "mkv", "mov", "avi"].includes(e) ? "video" : ["mp3", "m4a", "opus", "ogg", "wav", "flac", "aac"].includes(e) ? "audio"
+    : ["png", "jpg", "jpeg", "webp", "gif", "bmp"].includes(e) ? "image" : "file"; };
 let ITEMS = [], SEL = new Set(), Q = "", KIND = "", SORT = "new", LAST = null;
 function toast(m, ms) { const t = $("toast"); t.textContent = m; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", ms || 3500); }
 async function start() {
@@ -439,7 +455,7 @@ function render() {
   const focus = document.activeElement && document.activeElement.id === "q";
   $("view").innerHTML = '<div class="wrap"><div class="bar">' +
     '<input class="search" id="q" placeholder="חיפוש…" value="' + esc(Q) + '" oninput="Q=this.value;render()">' +
-    '<select onchange="KIND=this.value;render()"><option value="">כל הסוגים</option><option value="video"' + (KIND === "video" ? " selected" : "") + '>סרטונים</option><option value="audio"' + (KIND === "audio" ? " selected" : "") + '>שירים</option></select>' +
+    '<select onchange="KIND=this.value;render()"><option value="">כל הסוגים</option><option value="video"' + (KIND === "video" ? " selected" : "") + '>סרטונים</option><option value="audio"' + (KIND === "audio" ? " selected" : "") + '>שירים</option><option value="image"' + (KIND === "image" ? " selected" : "") + '>תמונות</option></select>' +
     '<select onchange="SORT=this.value;render()">' + [["new", "חדש קודם"], ["old", "ישן קודם"], ["name", "לפי שם"], ["size", "הגדולים קודם"]].map(([v, l]) => '<option value="' + v + '"' + (SORT === v ? " selected" : "") + '>' + l + '</option>').join("") + '</select>' +
     '<button class="btn ghost" onclick="load()">רענן</button></div>' +
     '<div class="selbar"><label><input type="checkbox" id="all" ' + (allOn ? "checked" : "") + ' onchange="selAll(this.checked)">בחר הכל' + (Q || KIND ? " (מהמוצגים)" : "") + '</label>' +
@@ -449,16 +465,19 @@ function render() {
     '<button class="btn ghost" ' + (SEL.size ? "" : "disabled") + ' onclick="exportSel()">ייצוא לתיקייה</button>' +
     '<button class="btn danger" ' + (SEL.size ? "" : "disabled") + ' onclick="delSel()">מחק</button></div>' +
     '<div class="list">' + (list.length ? list.map((x) => '<div class="row' + (SEL.has(x.id) ? " sel" : "") + '" data-id="' + x.id + '">' +
-      '<input type="checkbox" ' + (SEL.has(x.id) ? "checked" : "") + ' tabindex="-1"><span class="ic">' + IC[x.kind] + '</span>' +
+      '<input type="checkbox" ' + (SEL.has(x.id) ? "checked" : "") + ' tabindex="-1"><span class="ic' + (x.kind === "image" ? " thumb" : "") + '" ' + (x.kind === "image" ? 'data-thumb="' + x.id + '"' : "") + '>' + IC[x.kind] + '</span>' +
       '<div class="name"><b title="' + esc(x.name) + '">' + esc(x.title || x.name) + '</b><span class="muted">' + esc(x.name) + ' · ' + size(x.size || 0) + ' · ' + esc((x.added || "").slice(0, 10)) + '</span></div>' +
-      '<button class="ibtn" title="נגן" data-play="' + x.id + '">' + IC.play + '</button></div>').join("")
+      '<button class="ibtn" title="' + (x.kind === "image" ? "הצג" : "נגן") + '" data-' + (x.kind === "image" ? "view" : "play") + '="' + x.id + '">' + (x.kind === "image" ? IC.image : IC.play) + '</button></div>').join("")
       : '<div class="empty">' + (ITEMS.length ? "אין תוצאות" : "הכספת ריקה — קבצים חדשים ייכנסו אליה אוטומטית") + '</div>') + '</div></div>';
   const all = $("all"); if (all) all.indeterminate = some && !allOn;
   if (focus) { const q = $("q"); q.focus(); q.setSelectionRange(q.value.length, q.value.length); }
+  setTimeout(loadThumbs, 0);
 }
 function selAll(on) { shown().forEach((x) => on ? SEL.add(x.id) : SEL.delete(x.id)); render(); }
 function invert() { shown().forEach((x) => SEL.has(x.id) ? SEL.delete(x.id) : SEL.add(x.id)); render(); }
 document.addEventListener("click", (e) => {
+  const big = e.target.closest("#lightbox"); if (big) { big.remove(); return; }
+  const vb = e.target.closest("[data-view]"); if (vb) { viewImage(vb.dataset.view); return; }
   const pb = e.target.closest("[data-play]"); if (pb) { play(pb.dataset.play); return; }
   const row = e.target.closest(".row[data-id]"); if (!row) return;
   const id = row.dataset.id, list = shown().map((x) => x.id);
@@ -468,7 +487,8 @@ document.addEventListener("click", (e) => {
   } else SEL.has(id) ? SEL.delete(id) : SEL.add(id);
   LAST = id; render();
 });
-document.addEventListener("dblclick", (e) => { const row = e.target.closest(".row[data-id]"); if (row) play(row.dataset.id); });
+document.addEventListener("dblclick", (e) => { const row = e.target.closest(".row[data-id]"); if (!row) return;
+  const x = ITEMS.find((i) => i.id === row.dataset.id); x && x.kind === "image" ? viewImage(x.id) : play(row.dataset.id); });
 document.addEventListener("keydown", (e) => {
   if (e.ctrlKey && (e.key === "a" || e.key === "A") && document.activeElement.tagName !== "INPUT" && ITEMS.length) { e.preventDefault(); selAll(true); }
   if (e.key === "Escape" && $("phone").style.display !== "grid" && SEL.size) { SEL.clear(); render(); }
@@ -503,6 +523,26 @@ function endOp(msg) {
 }
 
 async function play(id) { toast("פותח…"); try { toast("נפתח: " + await api().play(id)); } catch (e) { toast("שגיאה: " + e); } }
+async function viewImage(id) {
+  toast("מפענח…");
+  try {
+    const src = await api().image(id);
+    const d = document.createElement("div"); d.id = "lightbox"; d.innerHTML = '<img src="' + src + '">';
+    document.body.appendChild(d); toast("", 1);
+  } catch (e) { toast("שגיאה: " + e); }
+}
+// Thumbnails are decrypted on demand, a few at a time, only while the vault is open.
+let THUMBQ = [];
+async function loadThumbs() {
+  document.querySelectorAll(".thumb[data-thumb]").forEach((el) => { if (!el.dataset.done) THUMBQ.push(el); });
+  if (loadThumbs.running) return; loadThumbs.running = true;
+  while (THUMBQ.length) {
+    const el = THUMBQ.shift(); if (!el.isConnected || el.dataset.done) continue;
+    el.dataset.done = "1";
+    try { el.innerHTML = '<img src="' + await api().image(el.dataset.thumb) + '">'; } catch (e) {}
+  }
+  loadThumbs.running = false;
+}
 async function exportSel() {
   const ids = [...SEL], t = setTimeout(() => watchOp("מייצא לתיקייה"), 600);   // after the folder is chosen
   try { const d = await api().export(ids); clearTimeout(t); if (d) endOp("יוצא אל " + d); else { clearTimeout(t); $("opanel").classList.add("hidden"); clearInterval(OPT); toast("בוטל"); } }

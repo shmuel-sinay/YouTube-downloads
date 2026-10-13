@@ -999,7 +999,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       }
       if (b.op === "add") {
         const key = String(b.key || "").trim();
-        if (!/^[\w-]{20,80}$/.test(key)) return json({ error: "זה לא נראה כמו מפתח (AIza…)" }, 400);
+        if (key.length < 10 || key.length > 200 || /\s/.test(key)) return json({ error: "מפתח לא תקין (ריק או עם רווחים)" }, 400);
         if (ks.keys.some((k) => k.key === key) || key === rootEnv.GEMINI_API_KEY) return json({ error: "המפתח כבר ברשימה" }, 400);
         ks.keys.push({ key, label: String(b.label || "").trim().slice(0, 40) || "מפתח " + (ks.keys.length + 1), added: new Date().toISOString() });
       } else if (b.op === "del" && ks.keys[i]) ks.keys.splice(i, 1);
@@ -2007,8 +2007,10 @@ function b64(buf) { let s = ""; const a = new Uint8Array(buf); for (let i = 0; i
 async function loadImages() {
   if (!(APP() && APP().img_list)) return;
   const list = await APP().img_list();
+  const hasVault = APP().img_to_vault && S.profile && S.profile.vault;
   $("imgGrid").innerHTML = list.length ? list.map((m) => '<div class="imgcard"><img data-img="' + esc(m.id) + '" alt="">' +
     '<div class="cap"><span title="' + esc(m.prompt) + '">' + esc(m.prompt) + '</span>' +
+    (hasVault ? btn("imgvault", m.id, "lock", "העבר לכספת") : "") +
     btn("imgsave", m.id, "download", "שמור כקובץ תמונה") + btn("imgdel", m.id, "trash", "מחק", "danger") + '</div></div>').join("")
     : '<div class="empty">' + icon("image") + '<div>עוד אין תמונות</div></div>';
   for (const el of document.querySelectorAll("img[data-img]")) {
@@ -2040,6 +2042,7 @@ document.addEventListener("click", async (e) => {
   const b = e.target.closest("button[data-act]"); if (!b) return;
   if (b.dataset.act === "imgsave") { const f = await APP().img_export(b.dataset.id); if (f) toast("נשמר: " + f, 6000); }
   if (b.dataset.act === "imgdel" && confirm("למחוק את התמונה?")) { await APP().img_delete(b.dataset.id); loadImages(); }
+  if (b.dataset.act === "imgvault") { try { await APP().img_to_vault(b.dataset.id); toast("הועבר לכספת"); loadImages(); } catch (x) { toast("שגיאה: " + x, 6000); } }
 });
 
 // ---------- Gemini keys (admin) ----------

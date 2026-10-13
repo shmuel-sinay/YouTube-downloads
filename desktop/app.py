@@ -1105,6 +1105,25 @@ class Api:
         self._gallery().delete(str(iid))
         return True
 
+    def img_to_vault(self, iid: str) -> str:
+        """Move a picture from the gallery into this profile's encrypted vault.
+        The vault's public key encrypts it, so no password is needed to put it
+        in; viewing it later needs the code. Then it's removed from the gallery."""
+        dl = self._dl()
+        if not dl.cfg.get("vault_dir"):
+            raise PermissionError("אין כספת לפרופיל הזה")
+        from vault import Vault
+        g = self._gallery()
+        tmp = Path(tempfile.mkdtemp(prefix="yt-img-"))
+        try:
+            src = g.export(str(iid), tmp)                      # a real image file, briefly
+            prompt = next((m.get("prompt", "") for m in g.list() if m["id"] == str(iid)), "")
+            Vault(dl.cfg["vault_dir"]).add(src, {"title": prompt[:120]}, remove_src=True)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        g.delete(str(iid))
+        return "ok"
+
     def open_folder(self) -> None:
         dl = self._dl()
         if dl.cfg.get("vault_dir"):

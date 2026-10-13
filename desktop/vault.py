@@ -206,5 +206,32 @@ class Vault:
             raise
         return out_path
 
+    def read_bytes(self, eid: str, limit: int | None = None) -> tuple[bytes, dict]:
+        """Decrypt one entry into memory (no file on disk). For small files
+        like images, shown in the vault without leaving a decrypted copy.
+        Raises if the file is larger than `limit` bytes."""
+        f, aes, h = self._open(self.dir / (eid + ".ytv"))
+        if limit and h.get("size", 0) > limit:
+            f.close()
+            raise ValueError("גדול מדי לתצוגה בכספת")
+        buf = bytearray()
+        with f:
+            n = 1
+            while True:
+                raw = f.read(4)
+                if len(raw) < 4:
+                    raise ValueError("הקובץ קטוע")
+                (ln,) = struct.unpack(">I", raw)
+                blob = f.read(ln)
+                try:
+                    data, last = aes.decrypt(_nonce(n), blob, b""), False
+                except Exception:
+                    data, last = aes.decrypt(_nonce(n), blob, b"end"), True
+                buf += data
+                if last:
+                    break
+                n += 1
+        return bytes(buf), h
+
     def delete(self, eid: str) -> None:
         (self.dir / (eid + ".ytv")).unlink(missing_ok=True)
