@@ -282,23 +282,43 @@ function decode(s) {
           .replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 }
 
-async function readFeed(channelId) {
-  const r = await fetch("https://www.youtube.com/feeds/videos.xml?channel_id=" + channelId);
+// The channel's feed, plus its "uploads" playlist feed (UU…): YouTube's
+// channel feed sometimes lags or misses new uploads; together they don't.
+// Never cached, and an answer that isn't a feed is an error, not "nothing new".
+async function fetchFeed(q) {
+  const r = await fetch("https://www.youtube.com/feeds/videos.xml?" + q, {
+    cf: { cacheTtl: 0, cacheEverything: false },
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+               "Accept": "application/atom+xml,application/xml;q=0.9,*/*;q=0.8" },
+  });
   if (!r.ok) throw new Error("RSS " + r.status);
   const xml = await r.text();
-  const name = decode((xml.match(/<title>([^<]*)<\/title>/) || [])[1] || channelId);
-  const entries = [];
-  for (const block of xml.split("<entry>").slice(1)) {
-    const id = (block.match(/<yt:videoId>([^<]+)<\/yt:videoId>/) || [])[1];
-    if (!id) continue;
-    entries.push({
-      videoId: id,
-      title: decode((block.match(/<title>([^<]*)<\/title>/) || [])[1] || id),
-      published: (block.match(/<published>([^<]+)<\/published>/) || [])[1] || "",
-      // Shorts are linked as youtube.com/shorts/<id> in the feed.
-      isShort: /youtube\.com\/shorts\//.test(block),
-    });
+  if (!/<feed[\s>]/.test(xml)) throw new Error("RSS: התקבל דף במקום פיד (" + xml.length + "b)");
+  return xml;
+}
+
+async function readFeed(channelId) {
+  const tries = [fetchFeed("channel_id=" + channelId)];
+  if (/^UC/.test(channelId)) tries.push(fetchFeed("playlist_id=UU" + channelId.slice(2)));
+  const got = await Promise.allSettled(tries);
+  const xmls = got.filter((g) => g.status === "fulfilled").map((g) => g.value);
+  if (!xmls.length) throw got[0].reason;
+  const name = decode((xmls[0].match(/<title>([^<]*)<\/title>/) || [])[1] || channelId);
+  const byId = new Map();
+  for (const xml of xmls) {
+    for (const block of xml.split("<entry>").slice(1)) {
+      const id = (block.match(/<yt:videoId>([^<]+)<\/yt:videoId>/) || [])[1];
+      if (!id || byId.has(id)) continue;
+      byId.set(id, {
+        videoId: id,
+        title: decode((block.match(/<title>([^<]*)<\/title>/) || [])[1] || id),
+        published: (block.match(/<published>([^<]+)<\/published>/) || [])[1] || "",
+        // Shorts are linked as youtube.com/shorts/<id> in the feed.
+        isShort: /youtube\.com\/shorts\//.test(block),
+      });
+    }
   }
+  const entries = [...byId.values()].sort((x, y) => (y.published || "").localeCompare(x.published || ""));
   return { name, entries };
 }
 
@@ -311,9 +331,11 @@ function jobFor(ch, e) {
   };
 }
 
-async function checkChannel(env, ch) {
+async function checkChannel(env, ch, notes) {
   const seen = await getJSON(env, "seen:" + ch.id, []);
   const { entries } = await readFeed(ch.id);
+  const top = entries[0];
+  if (notes) notes.push(ch.name + ": " + (top ? "האחרון ביוטיוב " + (top.published || "").slice(0, 10) : "הפיד ריק"));
   const fresh = entries.filter((e) => !seen.includes(e.videoId));
   const jobs = fresh.filter((e) => !(ch.skipShorts && e.isShort)).map((e) => jobFor(ch, e));
   await addJobs(env, jobs);
@@ -326,14 +348,14 @@ async function checkChannel(env, ch) {
 async function checkAllChannels(env) {
   const channels = await getChannels(env);
   let added = 0;
-  const errors = [];
+  const errors = [], notes = [];
   for (const ch of channels) {
-    try { added += await checkChannel(env, ch); }
+    try { added += await checkChannel(env, ch, notes); }
     catch (e) { errors.push(ch.name + ": " + e.message); }
   }
   await putJSON(env, "lastCheck", { at: new Date().toISOString(), added, errors });
   await addLog(env, "worker", `בדיקת ערוצים: ${channels.length} ערוצים, נוספו ${added} לתור` +
-    (errors.length ? ` · שגיאות: ${errors.join(" | ")}` : ""));
+    (notes.length ? ` · ${notes.join(" | ")}` : "") + (errors.length ? ` · שגיאות: ${errors.join(" | ")}` : ""));
   return { added, errors };
 }
 
