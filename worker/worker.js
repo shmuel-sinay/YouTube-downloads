@@ -1264,7 +1264,13 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .stat .v{font-size:2rem;font-weight:600;margin-top:6px;font-variant-numeric:tabular-nums}
 .stat .s{color:var(--muted);font-size:.78rem;margin-top:2px}
 .dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}.dgrid .card{margin:0}
-.imggrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;margin-top:14px}
+#imgPrompt{min-height:76px;resize:vertical}
+.imgbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px}
+.spin{width:16px;height:16px;border:2px solid #fff6;border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;display:inline-block}
+@keyframes spin{to{transform:rotate(360deg)}}
+.imgcard.wait .ph{aspect-ratio:1;display:grid;place-items:center;color:var(--muted);background:linear-gradient(110deg,var(--panel2) 30%,var(--line) 50%,var(--panel2) 70%);background-size:300% 100%;animation:shim 1.6s linear infinite}
+@keyframes shim{to{background-position:-150% 0}}
+.imggrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;margin-top:14px}
 .imgcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}
 .imgcard img{width:100%;aspect-ratio:1;object-fit:cover;display:block;background:var(--panel2);cursor:zoom-in}
 .imgcard .cap{padding:8px 10px;font-size:.85rem;color:var(--muted);display:flex;gap:6px;align-items:center}
@@ -1326,10 +1332,17 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .login input{margin:16px 0 12px}.login .btn{width:100%;justify-content:center}
 .hidden{display:none!important}
 /* mobile: sidebar becomes a bottom bar */
-@media (max-width:760px){
+@media (min-width:601px) and (max-width:980px){
+  .side{width:68px;padding:14px 8px;align-items:center}
+  .brand{padding:4px 0 14px}.brand span,.nav span:not(.count){display:none}
+  .nav{justify-content:center;padding:11px 0;position:relative}
+  .nav .count{position:absolute;top:2px;inset-inline-end:2px;font-size:.62rem;min-width:16px;padding:0 4px}
+}
+@media (max-width:600px){
   .side{position:fixed;bottom:0;top:auto;height:auto;width:100%;flex-direction:row;padding:6px;border:0;border-top:1px solid var(--line);z-index:20;justify-content:space-around}
   .brand,.side .grow,.side .extra{display:none}
-  .nav{flex-direction:column;gap:3px;font-size:.68rem;padding:6px 4px;width:auto;flex:1;align-items:center}
+  .side{overflow-x:auto;justify-content:flex-start}
+  .nav{flex-direction:column;gap:3px;font-size:.68rem;padding:6px 4px;width:auto;flex:1 0 64px;align-items:center;white-space:nowrap}
   .nav .count{display:none}
   .content{padding:16px 14px 90px}.topbar{padding:12px 14px}
   .thumb{width:84px;height:47px}
@@ -1391,7 +1404,7 @@ async function dashboard(env) {
   const modeOptions = Object.entries(MODES).map(([k, v]) => `<option value="${k}">${v}</option>`).join("");
   return `<div class="app">
 <aside class="side">
-  <div class="brand"><img src="${ICON}" alt="">מעקב ערוצים</div>
+  <div class="brand"><img src="${ICON}" alt=""><span>מעקב ערוצים</span></div>
   <button class="nav on" data-page="dash">${icon("dash")}<span>לוח בקרה</span></button>
   <button class="nav hidden" data-page="global" id="globalNav">${icon("users")}<span>לוח בקרה כללי</span></button>
   <button class="nav" data-page="queue">${icon("queue")}<span>תור הורדות</span><span class="count" id="qCount"></span></button>
@@ -1502,9 +1515,9 @@ async function dashboard(env) {
     <div class="card">
       <h2>${icon("image")}תמונה חדשה עם Gemini</h2>
       <p class="sub">התמונה עוברת מעורבלת ונפתחת רק כאן בתוכנה. באתר עצמו לא נשמרת שום תמונה.</p>
-      <textarea id="imgPrompt" rows="3" style="width:100%;box-sizing:border-box" placeholder="מה לצייר? למשל: נוף הרים בשקיעה, בסגנון ציור שמן"></textarea>
-      <div class="actions-row" style="margin-top:10px"><button class="btn" id="imgMake" type="button">${icon("zap")}<span>צור תמונה</span></button>
-      <span class="sub" id="imgStatus" style="margin:0"></span></div>
+      <textarea id="imgPrompt" rows="3" placeholder="מה לצייר? למשל: נוף הרים בשקיעה, בסגנון ציור שמן"></textarea>
+      <div class="imgbar"><button class="btn" id="imgMake" type="button">${icon("zap")}<span>צור תמונה</span></button>
+      <span class="sub" style="margin:0">Ctrl+Enter ליצירה</span></div>
     </div>
     <div id="imgGrid" class="imggrid"></div>
   </section>
@@ -1600,6 +1613,8 @@ function showPage(name) {
   if (name === "images") setTimeout(loadImages, 0);
 }
 document.querySelectorAll(".nav[data-page]").forEach((n) => n.onclick = () => showPage(n.dataset.page));
+// Names on hover — in a narrow window the side bar shows icons only.
+document.querySelectorAll(".side .nav").forEach((n) => { const t = n.querySelector("span"); if (t) n.title = t.textContent; });
 try { const p = localStorage.getItem("page"); if (p && TITLES[p]) showPage(p); } catch (e) {}
 document.querySelectorAll("#filter button").forEach((b) => b.onclick = () => {
   FILTER = b.dataset.f; document.querySelectorAll("#filter button").forEach((x) => x.classList.toggle("on", x === b)); render(); });
@@ -1902,17 +1917,23 @@ async function loadImages() {
     try { el.src = await APP().img_get(el.dataset.img); } catch (e) {}
   }
 }
+const IMG_BTN = $("imgMake").innerHTML;
+$("imgPrompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("imgMake").click(); });
 $("imgMake").onclick = async () => {
   const prompt = $("imgPrompt").value.trim(); if (!prompt) return toast("כתוב מה לצייר");
-  $("imgMake").disabled = true; $("imgStatus").textContent = "Gemini מצייר… (עד חצי דקה)";
+  if ($("imgMake").disabled) return;
+  $("imgMake").disabled = true; $("imgMake").innerHTML = '<span class="spin"></span><span>מצייר… (עד חצי דקה)</span>';
+  // A placeholder where the picture will appear.
+  const empty = $("imgGrid").querySelector(".empty"); if (empty) empty.remove();
+  $("imgGrid").insertAdjacentHTML("afterbegin", '<div class="imgcard wait" id="imgWait"><div class="ph">' + icon("image") + '</div><div class="cap"><span>' + esc(prompt) + '</span></div></div>');
   try {
     const r = await fetch(B + "/img/make", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }) });
     if ((r.headers.get("content-type") || "").includes("json")) throw new Error((await r.json()).error || "שגיאה");
     if (!r.ok) throw new Error("HTTP " + r.status + " " + (await r.text()).slice(0, 200));
     await APP().img_save(b64(await r.arrayBuffer()), prompt);
-    $("imgStatus").textContent = ""; await loadImages();
-  } catch (e) { $("imgStatus").textContent = ""; toast("שגיאה: " + (e.message || e), 8000); }
-  $("imgMake").disabled = false;
+    $("imgPrompt").value = ""; await loadImages();
+  } catch (e) { toast("שגיאה: " + (e.message || e), 8000); await loadImages(); }
+  $("imgMake").disabled = false; $("imgMake").innerHTML = IMG_BTN;
 };
 document.addEventListener("click", async (e) => {
   const big = e.target.closest(".imgbig"); if (big) return big.remove();
