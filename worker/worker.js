@@ -963,9 +963,16 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (!prompt) return json({ error: "צריך לכתוב מה לצייר" }, 400);
     // Free source: Pollinations returns the image bytes directly, no key.
     if (ib.src === "free") {
-      const u = "https://image.pollinations.ai/prompt/" + encodeURIComponent(prompt) +
-        "?width=1024&height=1024&nologo=true&model=flux&seed=" + Math.floor(Math.random() * 1e9);
-      const pr = await fetch(u);
+      // Pollinations is moving to a key/credit model; keep the endpoint and an
+      // optional token configurable (FREE_IMG_URL, FREE_IMG_TOKEN) so a change
+      // in their policy needs no code change. {prompt} in the URL is replaced.
+      const base = rootEnv.FREE_IMG_URL || "https://image.pollinations.ai/prompt/{prompt}?width=1024&height=1024&nologo=true&model=flux";
+      const u = base.replace("{prompt}", encodeURIComponent(prompt)) +
+        (base.includes("?") ? "&" : "?") + "seed=" + Math.floor(Math.random() * 1e9);
+      const hdr = rootEnv.FREE_IMG_TOKEN ? { Authorization: "Bearer " + rootEnv.FREE_IMG_TOKEN } : {};
+      const pr = await fetch(u, { headers: hdr });
+      if (pr.status === 401 || pr.status === 402 || pr.status === 403)
+        return json({ error: "שירות התמונות החינמי דורש עכשיו מפתח. אפשר להירשם ב-enter.pollinations.ai ולשים אותו ב-Worker כ-FREE_IMG_TOKEN, או להשתמש ב-Gemini." }, 402);
       if (!pr.ok) return json({ error: "שירות התמונות החינמי עמוס כרגע (" + pr.status + ") — נסה שוב בעוד רבע דקה" }, 502);
       const mime = pr.headers.get("content-type") || "image/jpeg";
       if (!/^image\//.test(mime)) return json({ error: "השירות החינמי לא החזיר תמונה — נסה שוב" }, 502);
@@ -2295,6 +2302,13 @@ const GEMINI_HTML = `
             textarea:focus { border-color: var(--primary); }
             .send-btn { background-color: transparent; color: var(--primary); border: none; width: 52px; height: 52px; display: flex; align-items: center; justify-content: center; cursor: pointer; }
             .send-btn svg { width: 28px; height: 28px; fill: var(--primary); }
+            .attach-btn svg { fill: none; stroke: var(--primary); width: 26px; height: 26px; }
+            .chat-img { max-width: 240px; max-height: 240px; border-radius: 12px; display: block; margin-bottom: 8px; cursor: zoom-in; }
+            #attachStrip { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 20px; }
+            #attachStrip:not(:empty) { padding-bottom: 8px; }
+            .attach-item { position: relative; width: 64px; height: 64px; border-radius: 10px; overflow: hidden; border: 1px solid var(--border-color); }
+            .attach-item img { width: 100%; height: 100%; object-fit: cover; }
+            .attach-item button { position: absolute; top: 2px; inset-inline-end: 2px; width: 20px; height: 20px; border-radius: 50%; border: none; background: rgba(0,0,0,.65); color: #fff; cursor: pointer; line-height: 1; }
             
             .typing-indicator { display: none; align-self: flex-end; padding: 14px 18px; }
             .dots { display: flex; gap: 4px; align-items: center; height: 24px;}
@@ -2334,8 +2348,13 @@ const GEMINI_HTML = `
             <div class="typing-indicator" id="loading">
               <div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
             </div>
+            <div id="attachStrip"></div>
             <div class="input-container">
-              <textarea id="userInput" placeholder="הקלד הודעה... (לחץ Enter לשליחה)" rows="1" oninput="autoResize(this)" onkeydown="handleEnter(event)"></textarea>
+              <button class="send-btn attach-btn" onclick="document.getElementById('imgInput').click()" title="צרף תמונה">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+              </button>
+              <input type="file" id="imgInput" accept="image/*" multiple style="display:none" onchange="addImages(this.files); this.value=''">
+              <textarea id="userInput" placeholder="הקלד הודעה, או צרף תמונה ושאל עליה..." rows="1" oninput="autoResize(this)" onkeydown="handleEnter(event)"></textarea>
               <button class="send-btn" onclick="sendMessage()" title="שלח">
                 <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
               </button>
@@ -2345,6 +2364,22 @@ const GEMINI_HTML = `
           <script>
             let savedPassword = "";
             let chatHistory = []; // שמירת ההיסטוריה בדפדפן
+            let pendingImages = []; // תמונות שצורפו לפני שליחה: {mimeType, data(base64)}
+            function addImages(files) {
+              for (const f of files) {
+                if (!f.type.startsWith('image/')) continue;
+                if (f.size > 7 * 1024 * 1024) { alert('התמונה גדולה מדי (עד 7MB)'); continue; }
+                const reader = new FileReader();
+                reader.onload = function(){ pendingImages.push({ mimeType: f.type, data: reader.result.split(',')[1] }); renderAttachStrip(); };
+                reader.readAsDataURL(f);
+              }
+            }
+            function renderAttachStrip() {
+              const strip = document.getElementById('attachStrip');
+              strip.innerHTML = pendingImages.map(function(im, i){
+                return '<span class="attach-item"><img src="data:' + im.mimeType + ';base64,' + im.data + '"><button onclick="pendingImages.splice(' + i + ',1);renderAttachStrip()">×</button></span>';
+              }).join('');
+            }
 
             function enterChat() {
               savedPassword = document.getElementById('passInput').value.trim();
@@ -2384,6 +2419,15 @@ const GEMINI_HTML = `
               return res;
             }
 
+            document.addEventListener('click', function(e){
+              if (e.target.classList && e.target.classList.contains('chat-img')) {
+                const d = document.createElement('div');
+                d.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;z-index:999;cursor:zoom-out';
+                d.innerHTML = '<img src="' + e.target.src + '" style="max-width:94vw;max-height:94vh;border-radius:8px">';
+                d.onclick = function(){ d.remove(); };
+                document.body.appendChild(d);
+              }
+            });
             async function sendMessage() {
               const inputField = document.getElementById('userInput');
               const chatBox = document.getElementById('chat-box');
@@ -2391,23 +2435,31 @@ const GEMINI_HTML = `
               const useHistory = document.getElementById('historyToggle').checked;
               
               const userText = inputField.value.trim();
-              if (!userText) return;
+              if (!userText && !pendingImages.length) return;
 
-              chatBox.innerHTML += '<div class="message user-msg">' + userText.replace(/\\n/g, '<br>') + '</div>';
+              const imgs = pendingImages.slice();
+              let bubble = '';
+              for (const im of imgs) bubble += '<img class="chat-img" src="data:' + im.mimeType + ';base64,' + im.data + '">';
+              if (userText) bubble += '<div>' + userText.replace(/\\n/g, '<br>') + '</div>';
+              chatBox.innerHTML += '<div class="message user-msg">' + bubble + '</div>';
               inputField.value = '';
               inputField.style.height = 'auto';
+              pendingImages = []; renderAttachStrip();
               chatBox.scrollTop = chatBox.scrollHeight;
               
               loading.style.display = 'flex';
               chatBox.scrollTop = chatBox.scrollHeight;
 
+              const userParts = imgs.map(function(im){ return { inlineData: { mimeType: im.mimeType, data: im.data } }; });
+              if (userText) userParts.push({ text: userText });
+
               let contentsPayload = [];
               if (useHistory) {
                   for(let i=0; i<chatHistory.length; i++) {
-                      contentsPayload.push({ role: chatHistory[i].role, parts: [{ text: chatHistory[i].text }] });
+                      contentsPayload.push({ role: chatHistory[i].role, parts: chatHistory[i].parts });
                   }
               }
-              contentsPayload.push({ role: "user", parts: [{ text: userText }] });
+              contentsPayload.push({ role: "user", parts: userParts });
 
               try {
                 const response = await fetch('/', {
@@ -2433,8 +2485,8 @@ const GEMINI_HTML = `
                 } else {
                   chatBox.innerHTML += '<div class="message ai-msg">' + formatAIResponse(aiResponse) + '</div>';
                   
-                  chatHistory.push({ role: "user", text: userText });
-                  chatHistory.push({ role: "model", text: aiResponse });
+                  chatHistory.push({ role: "user", parts: userParts });
+                  chatHistory.push({ role: "model", parts: [{ text: aiResponse }] });
                 }
                 chatBox.scrollTop = chatBox.scrollHeight;
 
