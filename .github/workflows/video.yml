@@ -8,7 +8,9 @@ name: Make video (Gemini Veo)
 #
 # Nothing private is in the inputs or the log (the repository is public):
 # the prompt and the Gemini keys are read from the Worker with AGENT_TOKEN.
-# Repository secrets: TRACKER_URL (https://<worker>/yt), AGENT_TOKEN.
+# Repository secrets: TRACKER_URL (https://<worker>/yt), AGENT_TOKEN,
+# HF_TOKEN (free Hugging Face account: the free videos' daily GPU quota).
+# Optional repository variables: HF_SPACE, HF_API (another free Space).
 run-name: video
 on:
   workflow_dispatch:
@@ -28,12 +30,15 @@ jobs:
       TRACKER_URL: ${{ secrets.TRACKER_URL }}
       AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
       JOB: ${{ inputs.job }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_SPACE: ${{ vars.HF_SPACE }}
+      HF_API: ${{ vars.HF_API }}
     steps:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: .github/scripts
 
-      - run: pip install --quiet cryptography
+      - run: pip install --quiet cryptography gradio_client
 
       - name: Make the video
         run: python3 .github/scripts/make_video.py

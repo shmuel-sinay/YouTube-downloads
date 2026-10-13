@@ -1,7 +1,10 @@
-"""Makes one Gemini (Veo) video for the site's "סרטונים" page.
+"""Makes one video for the site's "סרטונים" page.
 
-Run by .github/workflows/video.yml. Reads the job (prompt, model, the Gemini
-keys to try in order) from the Worker, asks Veo, waits, downloads the video
+Run by .github/workflows/video.yml. Reads the job (prompt, model, the paid
+Gemini key if there is one) from the Worker. With the key: Veo. Without it:
+free, on a Hugging Face ZeroGPU Space (HF_SPACE, default LTX-Video; HF_TOKEN
+gives the account's daily GPU quota instead of the smaller anonymous one).
+Either way it downloads the video
 and writes it scrambled to out/v.yti — "YTI1" + IV + AES-GCM, the same fixed
 key as the Worker's scrambleImage and desktop/images.py. `report` (the last
 step) tells the Worker how it went; out/status.json carries it between steps.
@@ -67,12 +70,47 @@ def scramble(data: bytes, mime: str) -> bytes:
     return b"YTI1" + iv + AESGCM(KEY).encrypt(iv, bytes([len(m)]) + m + data, None)
 
 
+def save(out: dict, video: bytes, mime: str) -> None:
+    with open("out/v.yti", "wb") as f:
+        f.write(scramble(video, mime if mime.startswith("video/") else "video/mp4"))
+    print(f"video: {len(video) // 1024} KB", flush=True)
+    out["status"] = "done"
+
+
+def make_free(out: dict, prompt: str) -> None:
+    """A ZeroGPU Space through gradio_client. The endpoint and its other inputs
+    are the Space's own (defaults are used); HF_API overrides the name."""
+    from gradio_client import Client
+    space = os.environ.get("HF_SPACE") or "Lightricks/ltx-video-distilled"
+    api = os.environ.get("HF_API") or "/text_to_video"
+    print(f"free: {space} {api}", flush=True)
+    try:
+        client = Client(space, hf_token=os.environ.get("HF_TOKEN") or None, verbose=False)
+        res = client.predict(prompt=prompt, api_name=api)
+    except Exception as e:
+        text = str(e)
+        out["error"] = ("נגמרה המכסה היומית החינמית ב-Hugging Face — אפשר לנסות שוב מחר"
+                        if re.search(r"quota|ZeroGPU", text, re.I) else "Hugging Face: " + text[:300])
+        print(f"free: {type(e).__name__}", flush=True)
+        return
+    path = res[0] if isinstance(res, (list, tuple)) else res
+    if isinstance(path, dict):                           # {"video": path, ...}
+        path = path.get("video") or path.get("path")
+    if not path or not os.path.exists(str(path)):
+        out["error"] = "Hugging Face לא החזיר סרטון"
+        return
+    with open(path, "rb") as f:
+        save(out, f.read(), "video/webm" if str(path).endswith(".webm") else "video/mp4")
+
+
 def make(out: dict) -> None:
     job = site("GET")
     for k in job["keys"]:
         print(f"::add-mask::{k['key']}", flush=True)
+    if not job.get("paid"):
+        return make_free(out, job["prompt"])
     if not job["keys"]:
-        out["error"] = "כל מפתחות Gemini מוגבלים כרגע — אפשר להוסיף מפתח בהגדרות"
+        out["error"] = "המפתח בתשלום לסרטונים לא זמין כרגע"
         return
     model = job["model"]
     body = {"instances": [{"prompt": job["prompt"]}], "parameters": {"aspectRatio": "16:9"}}
@@ -120,11 +158,7 @@ def make(out: dict) -> None:
     if st != 200:
         out["error"] = f"הורדת הסרטון מ-Gemini נכשלה: HTTP {st}"
         return
-    mime = (headers.get("Content-Type") or "").split(";")[0]
-    with open("out/v.yti", "wb") as f:
-        f.write(scramble(video, mime if mime.startswith("video/") else "video/mp4"))
-    print(f"video: {len(video) // 1024} KB", flush=True)
-    out["status"] = "done"
+    save(out, video, (headers.get("Content-Type") or "").split(";")[0])
 
 
 def report() -> None:
