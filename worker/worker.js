@@ -398,6 +398,32 @@ async function readFeed(channelId) {
   return { name, entries };
 }
 
+// A "filtered" channel is a slice of a big channel (e.g. one rabbi inside Kol HaLashon): id = "UC…|words", src = the real
+// channel, match = words that must all appear in the title. Its videos come from the channel's RSS plus a search inside the channel.
+const normT = (t) => String(t).toLowerCase().replace(/[֑-ׇ"'׳״]/g, "").replace(/\s+/g, " ").trim();
+const hasWords = (title, kw) => { const t = normT(title); return normT(kw).split(" ").filter(Boolean).every((w) => t.includes(w)); };
+async function searchChannel(src, kw) {
+  const r = await fetch("https://www.youtube.com/channel/" + src + "/search?query=" + encodeURIComponent(kw), {
+    headers: { "User-Agent": "Mozilla/5.0", "Accept-Language": "he,en", Cookie: "CONSENT=YES+1" }, signal: AbortSignal.timeout(15000) });
+  const html = await r.text(), out = [], got = new Set();
+  for (const m of html.matchAll(/"videoRenderer":\{"videoId":"([\w-]{11})"[\s\S]{0,1500}?"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"/g)) {
+    if (got.has(m[1])) continue;
+    got.add(m[1]);
+    let title = m[2]; try { title = JSON.parse('"' + m[2] + '"'); } catch (e) {}
+    out.push({ videoId: m[1], title, published: "", isShort: false });
+  }
+  return out;
+}
+async function feedOf(ch) {
+  if (!ch.match) return readFeed(ch.id);
+  const [rss, srch] = await Promise.allSettled([readFeed(ch.src), searchChannel(ch.src, ch.match)]);
+  const entries = [], have = new Set();
+  if (rss.status === "fulfilled") for (const e of rss.value.entries) if (hasWords(e.title, ch.match)) { entries.push(e); have.add(e.videoId); }
+  if (srch.status === "fulfilled") for (const e of srch.value) if (!have.has(e.videoId)) entries.push(e);
+  if (rss.status === "rejected" && srch.status === "rejected") throw rss.reason;
+  return { name: ch.name, entries };
+}
+
 function jobFor(ch, e) {
   return {
     videoId: e.videoId, channelId: ch.id, channelName: ch.name, title: e.title,
@@ -436,7 +462,7 @@ async function applyFolders(env, channels) {
 async function checkChannel(env, ch, notes) {
   const seenRaw = await getJSON(env, "seen:" + ch.id, null);
   const seen = seenRaw || [];
-  const { entries } = await readFeed(ch.id);
+  const { entries } = await feedOf(ch);
   const top = entries[0];
   // First time this channel is checked (e.g. added by an import): everything already on it counts as seen,
   // otherwise its whole back catalogue would be queued at once.
@@ -921,7 +947,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       let cache = await getJSON(menv, "phonebrowse", null), all = cache && cache.cat === cat && Date.now() - cache.at < 600000 ? cache.all : null;
       if (!all) {
         const feeds = await Promise.allSettled(chs.slice(0, 20).map(async (c) => {
-          const en = (await readFeed(c.id)).entries.filter((e) => !e.isShort).slice(0, 3);
+          const en = (await feedOf(c)).entries.filter((e) => !e.isShort).slice(0, 3);
           return en.map((e) => ({ ch: c, e }));
         }));
         all = feeds.flatMap((f) => (f.status === "fulfilled" ? f.value : []))
@@ -980,7 +1006,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const ch = pick[parseInt(q.get("CH"), 10) - 1];
     if (!ch) return bye("בחירה שגויה");
     let vids = [];
-    try { vids = (await readFeed(ch.id)).entries.filter((e) => !e.isShort).slice(0, 5); } catch (e) {}
+    try { vids = (await feedOf(ch)).entries.filter((e) => !e.isShort).slice(0, 5); } catch (e) {}
     if (!vids.length) return bye("לא נמצאו סרטונים");
     if (!q.get("V")) return T("read=t-" + vids.map((e, i) => "לסרטון " + clean(e.title) + " הקישו " + (i + 1)).join(" ") + "=" + D("V", 1, 1));
     const e = vids[parseInt(q.get("V"), 10) - 1];
@@ -1315,6 +1341,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       "#       auto = העלאה אוטומטית: כל סרטון חדש בערוץ עולה לבד לשלוחה הראשית. רק לערוצים שרוצים לשמוע כל פרק בלי לבקש.",
       "#       both = גם אוטומטי וגם זמין לבקשה.",
       "#       del  = להסיר את הערוץ מהקו. השתמש רק אם המשתמש ביקש להסיר ערוץ.",
+      "#    סינון (לא חובה, שדה חמישי):  קישור | שם | מצב | דקות | מילים.  לערוץ גדול שמעלה שיעורים של הרבה רבנים (כמו קול הלשון: https://www.youtube.com/@Kol-Halashon) כותבים שורה נפרדת לכל רב, עם אותו קישור, ובשדה החמישי מילים שחייבות להופיע בכותרת, למשל: https://www.youtube.com/@Kol-Halashon | הרב משה שפירא | auto | | משה שפירא . השורה נחשבת לערוץ בפני עצמו עם השם שנתת, והאתר משיג רק את השיעורים שהכותרת שלהם מכילה את כל המילים. זה המקרה היחיד שבו מותר לחזור על אותו קישור. אחרי המילים לא כותבים עוד שדות. אם אין דקות משאירים את שדה הדקות ריק (שני קווים אנכיים רצופים).",
       "#    דקות (לא חובה, מספר שלם): אורך מינימלי של פרק מלא, רלוונטי רק ל-auto/both. 0 או ריק = בלי.",
       "# 2א. שלוחות משנה (אופציונלי, בראש הקובץ, לפני הקטגוריות): הקו מתפצל לשלוחות לפי נושא, וערוצי auto של קטגוריה נכנסים לשלוחה שלה ונשמרים שם תמיד.",
       "#    פורמט שורה:  @שלוחה מספר = שם מוקרא | קטגוריה, קטגוריה   (למשל: @שלוחה 1 = ישיבישן | השקפה ישיבתית). הסימן * במקום קטגוריה = כל השאר. אפשר להשאיר בלי שורות כאלה.",
@@ -1331,14 +1358,14 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       "# - אל תשנה את שורת הכותרת הראשונה (YT-LINE v1).",
       ""];
     const body = Object.entries(by).map(([k, v]) => "[" + k + "]\n" + v.map((c) =>
-      "https://www.youtube.com/" + (/^UC/.test(c.id) ? "channel/" : "playlist?list=") + c.id + " | " + c.name.replace(/\|/g, " ") + " | " +
-      (c.yemot && c.req ? "both" : c.req ? "req" : "auto") + (c.minMinutes ? " | " + c.minMinutes : "")).join("\n")).join("\n\n");
+      "https://www.youtube.com/" + (/^UC/.test(c.src || c.id) ? "channel/" : "playlist?list=") + (c.src || c.id) + " | " + c.name.replace(/\|/g, " ") + " | " +
+      (c.yemot && c.req ? "both" : c.req ? "req" : "auto") + (c.minMinutes || c.match ? " | " + (c.minMinutes || "") : "") + (c.match ? " | " + c.match : "")).join("\n")).join("\n\n");
     const cur = subsText((await getJSON(rootEnv, "phonecfg", { subs: [] })).subs);
     const subLines = cur ? cur.split("\n").map((l) => "@שלוחה " + l).join("\n") + "\n\n" : "";
     return new Response(head.join("\n") + subLines + body + "\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Content-Disposition": "attachment; filename=phone-channels.txt" } });
   }
   if (p === "/phone/import" && req.method === "POST" && pid === "main") {
-    const fd = await req.formData(), dry = fd.get("dry") === "1", text = String(fd.get("text") || ""), ids = [], addN = [], delN = [], srchN = [];
+    const fd = await req.formData(), dry = fd.get("dry") === "1", text = String(fd.get("text") || ""), ids = [], addN = [], delN = [], srchN = [], memo = new Map();
     const channels = await getChannels(rootEnv);
     let cat = "", added = 0, upd = 0, bad = 0, dels = 0;
     for (const raw of text.split(/\r?\n/)) {
@@ -1346,8 +1373,10 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (!line || line.startsWith("#")) continue;
       const hd = line.match(/^\[(.+)\]$/);
       if (hd) { cat = hd[1].trim().slice(0, 30); continue; }
-      const [url, nm, mode, mins] = line.split("|").map((x) => x.trim());
-      let id; try { id = await resolveChannelId(url); } catch (e) { bad++; continue; }
+      const [url, nm, mode, mins, flt0] = line.split("|").map((x) => x.trim());
+      let id; try { id = memo.has(url) ? memo.get(url) : await resolveChannelId(url); memo.set(url, id); } catch (e) { bad++; continue; }
+      const flt = String(flt0 || "").replace(/\s+/g, " ").trim().slice(0, 60), src = id;
+      if (flt) id = src + "|" + flt;
       let c = channels.find((x) => x.id === id);
       if (mode === "del") {
         // Removal chosen in the file: off the phone line; a channel that existed only for the phone is deleted.
@@ -1360,9 +1389,16 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       }
       if (!c) {
         const bySearch = /search_query=/.test(url);
-        try { c = { id, name: bySearch ? (await readFeed(id)).name : nm || (await readFeed(id)).name, mode: "m4a", minMinutes: 0, skipShorts: true, added: new Date().toISOString() }; } catch (e) { bad++; continue; }
-        channels.push(c); added++;
-        if (bySearch) srchN.push((nm || "?") + " ← " + c.name); else addN.push(c.name);
+        if (flt) {
+          c = { id, src, match: flt, name: nm || flt, mode: "m4a", minMinutes: 0, skipShorts: true, added: new Date().toISOString() };
+          let n = "?"; try { n = (await feedOf(c)).entries.length; } catch (e) {}
+          channels.push(c); added++;
+          srchN.push(c.name + " ← מסנן \"" + flt + "\" בערוץ " + src + " — נמצאו " + n + " שיעורים");
+        } else {
+          try { c = { id, name: bySearch ? (await readFeed(id)).name : nm || (await readFeed(id)).name, mode: "m4a", minMinutes: 0, skipShorts: true, added: new Date().toISOString() }; } catch (e) { bad++; continue; }
+          channels.push(c); added++;
+          if (bySearch) srchN.push((nm || "?") + " ← " + c.name); else addN.push(c.name);
+        }
       } else upd++;
       ids.push(id);
       const m = mode === "auto" ? "auto" : mode === "both" ? "both" : "req";
@@ -1403,7 +1439,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const ch = (await getChannels(rootEnv)).find((c) => c.id === String(f ? f.get("id") : url.searchParams.get("id")));
     if (!ch) return json({ error: "אין ערוץ כזה" }, 404);
     try {
-      const entries = (await readFeed(ch.id)).entries.filter((e) => !e.isShort);
+      const entries = (await feedOf(ch)).entries.filter((e) => !e.isShort);
       if (!f) return json({ name: ch.name, entries: entries.slice(0, 10).map((e) => ({ videoId: e.videoId, title: e.title, published: e.published })) });
       const e = entries.find((x) => x.videoId === String(f.get("videoId")));
       if (!e) return json({ error: "הסרטון לא נמצא" }, 404);
@@ -2430,7 +2466,7 @@ function render() {
     : '<div class="empty">' + icon("queue") + '<div>' + (FILTER === "all" ? "התור ריק — הוסף סרטון, ערוץ או כמות סרטונים בעמוד \\"הוספה\\"." : "אין פריטים כאן") + '</div></div>';
   const chRow = (c) =>
     '<div class="ch"><div class="avatar">' + esc((c.name || "?").trim().charAt(0)) + '</div><div class="info">' +
-    '<div class="title"><a href="' + (/^UC/.test(c.id) ? "https://www.youtube.com/channel/" + esc(c.id) : "https://www.youtube.com/playlist?list=" + esc(c.id)) + '" target="_blank" rel="noopener">' + esc(c.name) + '</a>' + (c.yemot ? ' <span class="tag">קו טלפון</span>' : '') + (c.req ? ' <span class="tag">לבקשה בטלפון</span>' : '') + '</div>' +
+    '<div class="title"><a href="' + (/^UC/.test(c.src || c.id) ? "https://www.youtube.com/channel/" + esc(c.src || c.id) : "https://www.youtube.com/playlist?list=" + esc(c.src || c.id)) + '" target="_blank" rel="noopener">' + esc(c.name) + '</a>' + (c.yemot ? ' <span class="tag">קו טלפון</span>' : '') + (c.req ? ' <span class="tag">לבקשה בטלפון</span>' : '') + '</div>' +
     '<div class="meta">' + icon(/^video/.test(c.mode || "") ? "video" : "music") + ' ' + esc(MODES[c.mode] || MODES.audio) +
     (c.minMinutes ? '<span class="sep">•</span>' + c.minMinutes + ' דק׳ ומעלה' : '') + (c.skipShorts ? '<span class="sep">•</span>בלי Shorts' : '') + '</div></div>' +
     '<div class="acts">' + btn("batch", c.id, "download", "הורד כמות סרטונים מהערוץ", "primary") + (c.yemot || c.req ? btn("phcat", c.id, "layers", "קטגוריה") + btn("phmode", c.id, "monitor", "שינוי סוג") : "") + btn("remove", c.id, "trash", "הסר ערוץ", "danger") + '</div></div>';
