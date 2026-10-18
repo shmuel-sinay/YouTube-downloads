@@ -415,7 +415,32 @@ async function searchChannel(src, kw) {
   }
   return out;
 }
+// Kol HaLashon (kolhalashon.com): a "rav" source. id = "kh:<rav id>", seed = any lesson id of that rav (its page lists all his lessons).
+const khHeaders = (fid) => ({ "authorization-site-key": "Bearer " + Math.random().toString(36).slice(2, 9), "User-Agent": "Mozilla/5.0", Accept: "application/json",
+  Referer: "https://www.kolhalashon.com/he/regularSite/playShiur/" + fid + "/-1/0/false" });
+async function khInfo(fid) {
+  const r = await fetch("https://www.kolhalashon.com/api/TblShiurimLists/WebSite_GetShiurDetails/" + fid, { headers: khHeaders(fid), signal: AbortSignal.timeout(15000) });
+  if (!r.ok) throw new Error("קול הלשון HTTP " + r.status);
+  const d = await r.json();
+  if (!d.UserId) throw new Error("שיעור לא נמצא");
+  return { rav: d.UserId, name: d.UserNameHebrew || ("רב " + d.UserId) };
+}
+async function khFeed(ch) {
+  const r = await fetch("https://www.kolhalashon.com/api/playlist/playlist_GetAllShiurPlaylists/" + ch.seed + "/50/true", { headers: khHeaders(ch.seed), signal: AbortSignal.timeout(25000) });
+  if (!r.ok) throw new Error("קול הלשון HTTP " + r.status);
+  const j = JSON.parse(await r.text()), rav = +String(ch.id).slice(3);
+  const all = (Array.isArray(j) ? j : []).flatMap((x) => x.content || []).filter((x) => x.UserId === rav && x.HasAudio !== false);
+  const byId = new Map(all.map((x) => [x.FileId, x]));
+  // Newest by upload order (FileId grows with every new lesson); only the newest 60 are tracked.
+  const entries = [...byId.values()].sort((a, b) => b.FileId - a.FileId).slice(0, 60).map((x) => {
+    const [h, m] = String(x.ShiurDuration || "0:0").split(":").map((n) => parseInt(n, 10) || 0);
+    return { videoId: "kh" + x.FileId, title: x.TitleHebrew || String(x.FileId), published: x.RecordDate || "", isShort: false,
+      url: "https://www.kolhalashon.com/he/regularSite/playShiur/" + x.FileId + "/-1/0/false", minutes: h * 60 + m };
+  });
+  return { name: ch.name, entries };
+}
 async function feedOf(ch) {
+  if (ch.kh) return khFeed(ch);
   if (!ch.match) return readFeed(ch.id);
   const [rss, srch] = await Promise.allSettled([readFeed(ch.src), searchChannel(ch.src, ch.match)]);
   const entries = [], have = new Set();
@@ -428,7 +453,7 @@ async function feedOf(ch) {
 function jobFor(ch, e) {
   return {
     videoId: e.videoId, channelId: ch.id, channelName: ch.name, title: e.title,
-    published: e.published, url: "https://www.youtube.com/watch?v=" + e.videoId,
+    published: e.published, url: e.url || "https://www.youtube.com/watch?v=" + e.videoId, ...(e.minutes ? { minutes: e.minutes } : {}),
     mode: ch.yemot ? "m4a" : ch.mode, minMinutes: ch.yemot ? 0 : ch.minMinutes, status: "queued",
     ...(ch.yemot ? { yemot: true } : {}), ...(ch.yemot && ch.folder ? { yemotPath: ch.folder } : {}),
     updated: new Date().toISOString(),
@@ -1358,6 +1383,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       "#       both = גם אוטומטי וגם זמין לבקשה.",
       "#       del  = להסיר את הערוץ מהקו. השתמש רק אם המשתמש ביקש להסיר ערוץ.",
       "#    סינון (לא חובה, שדה חמישי):  קישור | שם | מצב | דקות | מילים.  לערוץ גדול שמעלה שיעורים של הרבה רבנים (כמו קול הלשון: https://www.youtube.com/@Kol-Halashon) כותבים שורה נפרדת לכל רב, עם אותו קישור, ובשדה החמישי מילים שחייבות להופיע בכותרת, למשל: https://www.youtube.com/@Kol-Halashon | הרב משה שפירא | auto | | משה שפירא . השורה נחשבת לערוץ בפני עצמו עם השם שנתת, והאתר משיג רק את השיעורים שהכותרת שלהם מכילה את כל המילים. זה המקרה היחיד שבו מותר לחזור על אותו קישור. אחרי המילים לא כותבים עוד שדות. אם אין דקות משאירים את שדה הדקות ריק (שני קווים אנכיים רצופים).",
+      "#    קול הלשון (kolhalashon.com): במקום קישור יוטיוב כותבים קישור לשיעור כלשהו של הרב באתר, בצורה https://www.kolhalashon.com/he/regularSite/playShiur/מספר/-1/0/false . הקישור מזהה את הרב והאתר יעקוב אחרי כל שיעוריו. הכל מושך מקול הלשון עצמו ולא מיוטיוב. שורה אחת לכל רב.",
       "#    דקות (לא חובה, מספר שלם): אורך מינימלי של פרק מלא, רלוונטי רק ל-auto/both. 0 או ריק = בלי.",
       "# 2א. שלוחות משנה (אופציונלי, בראש הקובץ, לפני הקטגוריות): הקו מתפצל לשלוחות לפי נושא, וערוצי auto של קטגוריה נכנסים לשלוחה שלה ונשמרים שם תמיד.",
       "#    פורמט שורה:  @שלוחה מספר = שם מוקרא | קטגוריה, קטגוריה   (למשל: @שלוחה 1 = ישיבישן | השקפה ישיבתית). הסימן * במקום קטגוריה = כל השאר. אפשר להשאיר בלי שורות כאלה.",
@@ -1374,7 +1400,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       "# - אל תשנה את שורת הכותרת הראשונה (YT-LINE v1).",
       ""];
     const body = Object.entries(by).map(([k, v]) => "[" + k + "]\n" + v.map((c) =>
-      "https://www.youtube.com/" + (/^UC/.test(c.src || c.id) ? "channel/" : "playlist?list=") + (c.src || c.id) + " | " + c.name.replace(/\|/g, " ") + " | " +
+      (c.kh ? c.url : "https://www.youtube.com/" + (/^UC/.test(c.src || c.id) ? "channel/" : "playlist?list=") + (c.src || c.id)) + " | " + c.name.replace(/\|/g, " ") + " | " +
       (c.yemot && c.req ? "both" : c.req ? "req" : "auto") + (c.minMinutes || c.match ? " | " + (c.minMinutes || "") : "") + (c.match ? " | " + c.match : "")).join("\n")).join("\n\n");
     const cur = subsText((await getJSON(rootEnv, "phonecfg", { subs: [] })).subs);
     const subLines = cur ? cur.split("\n").map((l) => "@שלוחה " + l).join("\n") + "\n\n" : "";
@@ -1390,8 +1416,11 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const hd = line.match(/^\[(.+)\]$/);
       if (hd) { cat = hd[1].trim().slice(0, 30); continue; }
       const [url, nm, mode, mins, flt0] = line.split("|").map((x) => x.trim());
-      let id; try { id = memo.has(url) ? memo.get(url) : await resolveChannelId(url); memo.set(url, id); } catch (e) { bad++; continue; }
-      const flt = String(flt0 || "").replace(/\s+/g, " ").trim().slice(0, 60), src = id;
+      const khm = url.match(/kolhalashon\.com\/.*playShiur\/(\d+)/);
+      let id, khd = null;
+      if (khm) { try { khd = await khInfo(khm[1]); id = "kh:" + khd.rav; } catch (e) { bad++; continue; } }
+      else { try { id = memo.has(url) ? memo.get(url) : await resolveChannelId(url); memo.set(url, id); } catch (e) { bad++; continue; } }
+      const flt = khd ? "" : String(flt0 || "").replace(/\s+/g, " ").trim().slice(0, 60), src = id;
       if (flt) id = src + "|" + flt;
       let c = channels.find((x) => x.id === id);
       if (mode === "del") {
@@ -1405,7 +1434,12 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       }
       if (!c) {
         const bySearch = /search_query=/.test(url);
-        if (flt) {
+        if (khd) {
+          c = { id, kh: true, seed: khm[1], url, name: nm || khd.name, mode: "m4a", minMinutes: 0, skipShorts: false, added: new Date().toISOString() };
+          let n = "?"; try { n = (await feedOf(c)).entries.length; } catch (e) {}
+          channels.push(c); added++;
+          srchN.push(c.name + " ← קול הלשון (רב " + khd.rav + ") — נמצאו " + n + " שיעורים אחרונים");
+        } else if (flt) {
           c = { id, src, match: flt, name: nm || flt, mode: "m4a", minMinutes: 0, skipShorts: true, added: new Date().toISOString() };
           let n = "?"; try { n = (await feedOf(c)).entries.length; } catch (e) {}
           channels.push(c); added++;
@@ -2482,7 +2516,7 @@ function render() {
     : '<div class="empty">' + icon("queue") + '<div>' + (FILTER === "all" ? "התור ריק — הוסף סרטון, ערוץ או כמות סרטונים בעמוד \\"הוספה\\"." : "אין פריטים כאן") + '</div></div>';
   const chRow = (c) =>
     '<div class="ch"><div class="avatar">' + esc((c.name || "?").trim().charAt(0)) + '</div><div class="info">' +
-    '<div class="title"><a href="' + (/^UC/.test(c.src || c.id) ? "https://www.youtube.com/channel/" + esc(c.src || c.id) : "https://www.youtube.com/playlist?list=" + esc(c.src || c.id)) + '" target="_blank" rel="noopener">' + esc(c.name) + '</a>' + (c.yemot ? ' <span class="tag">קו טלפון</span>' : '') + (c.req ? ' <span class="tag">לבקשה בטלפון</span>' : '') + '</div>' +
+    '<div class="title"><a href="' + (c.kh ? esc(c.url) : /^UC/.test(c.src || c.id) ? "https://www.youtube.com/channel/" + esc(c.src || c.id) : "https://www.youtube.com/playlist?list=" + esc(c.src || c.id)) + '" target="_blank" rel="noopener">' + esc(c.name) + '</a>' + (c.yemot ? ' <span class="tag">קו טלפון</span>' : '') + (c.req ? ' <span class="tag">לבקשה בטלפון</span>' : '') + '</div>' +
     '<div class="meta">' + icon(/^video/.test(c.mode || "") ? "video" : "music") + ' ' + esc(MODES[c.mode] || MODES.audio) +
     (c.minMinutes ? '<span class="sep">•</span>' + c.minMinutes + ' דק׳ ומעלה' : '') + (c.skipShorts ? '<span class="sep">•</span>בלי Shorts' : '') + '</div></div>' +
     '<div class="acts">' + btn("batch", c.id, "download", "הורד כמות סרטונים מהערוץ", "primary") + (c.yemot || c.req ? btn("phcat", c.id, "layers", "קטגוריה") + btn("phmode", c.id, "monitor", "שינוי סוג") : "") + btn("remove", c.id, "trash", "הסר ערוץ", "danger") + '</div></div>';

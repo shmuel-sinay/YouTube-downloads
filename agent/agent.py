@@ -657,12 +657,83 @@ def _is_adult(url: str) -> bool:
     return bool(_ADULT.search(host) or re.search(r"\b(porn|xxx|hentai)\b", host, re.I))
 
 
+KH_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+
+
+def kh_src(fid: str) -> str:
+    """Kol HaLashon: a signed CDN link to the lesson's mp3 (the site hands one out for playing, no login needed)."""
+    import random
+    import string
+    key = "Bearer " + "".join(random.choices(string.ascii_lowercase + string.digits, k=7))
+    req = urllib.request.Request(
+        f"https://www.kolhalashon.com/api/files/GetPlayToken/{fid}/1",
+        headers={"authorization-site-key": key, "User-Agent": KH_UA, "Accept": "application/json",
+                 "Referer": f"https://www.kolhalashon.com/he/regularSite/playShiur/{fid}/-1/0/false"})
+    return json.loads(urllib.request.urlopen(req, timeout=60).read().decode())["src"]
+
+
+def handle_kh(job: dict) -> None:
+    vid = job["videoId"]
+    m = re.search(r"playShiur/(\d+)", job["url"])
+    log(f"-> מוריד מקול הלשון: {job['title']}")
+    set_progress(vid, stage="start", pct=None, started=time.time(), mode="m4a")
+    OUT.mkdir(parents=True, exist_ok=True)
+    dest = OUT / f"{m.group(1)}[{vid}].mp3"
+    try:
+        src = kh_src(m.group(1))
+        req = urllib.request.Request(src, headers={"User-Agent": KH_UA, "Referer": "https://www.kolhalashon.com/"})
+        with urllib.request.urlopen(req, timeout=120) as r, dest.open("wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            got = 0
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if total:
+                    set_progress(vid, stage="download", pct=got * 100 / total)
+        if dest.stat().st_size < 100_000:
+            raise RuntimeError("הקובץ שהתקבל קטן מדי")
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        api("/api/report", {"videoId": vid, "status": "failed", "error": f"הורדה מקול הלשון נכשלה: {e}"})
+        log(f"   ✗ קול הלשון: {e}")
+        return
+    if job.get("yemot"):
+        set_progress(vid, stage="convert", pct=None)
+        try:
+            msg = yemot_upload(dest, job.get("yemotPath") or "")
+            if job.get("minutes"):
+                msg += f" · {job['minutes']} דק׳"
+            api("/api/report", {"videoId": vid, "status": "done", "fileUrl": "", "error": msg})
+            log(f"   ✓ {msg}")
+        except Exception as e:
+            api("/api/report", {"videoId": vid, "status": "failed", "error": f"העלאה לימות נכשלה: {e}"})
+            log(f"   ✗ העלאה לימות נכשלה: {e}")
+        dest.unlink(missing_ok=True)
+        return
+    f = to_zip(dest, vid)
+    try:
+        url = upload_r2(f) or ""
+    except Exception as e:
+        log(f"   R2 upload failed: {e}")
+        url = ""
+    if not url and PORT and PUBLIC_URL:
+        url = f"{PUBLIC_URL}/files/{urllib.parse.quote(f.name)}?k={urllib.parse.quote(FILE_KEY)}"
+    api("/api/report", {"videoId": vid, "status": "done", "fileUrl": url, "fileName": f.name,
+                        "error": "" if url else f"נשמר בשרת: {f}"})
+    log(f"   ok: {f.name}")
+
+
 def _handle(job: dict) -> None:
     vid = job["videoId"]
     if _is_adult(job.get("url", "")):
         api("/api/report", {"videoId": vid, "status": "failed", "error": "האתר הזה חסום"})
         log(f"   חסום: {job.get('url')}")
         return
+    if "kolhalashon.com" in job.get("url", "") and re.search(r"playShiur/\d+", job.get("url", "")):
+        return handle_kh(job)
     if job.get("kind") == "list":
         return handle_list(job)
     if job.get("kind") == "search":
