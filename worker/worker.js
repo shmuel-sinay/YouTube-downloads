@@ -1084,6 +1084,20 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     return new Response(await scrambleImage(new TextEncoder().encode(b64), mime + ";base64"), {
       headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
   }
+  // --- what is really on the Yemot extension (admin): asks Yemot directly ---
+  // Needs Worker secrets YEMOT_USER (line number) and YEMOT_PASS.
+  if (p === "/yemot/files" && pid === "main") {
+    if (!(rootEnv.YEMOT_USER && rootEnv.YEMOT_PASS)) return json({ error: "חסרים Secrets בשם YEMOT_USER ו-YEMOT_PASS ב-Worker" });
+    const path = rootEnv.YEMOT_PATH || "ivr2:/8";
+    try {
+      const r = await fetch("https://www.call2all.co.il/ym/api/GetIVR2Dir?token=" + encodeURIComponent(rootEnv.YEMOT_USER + ":" + rootEnv.YEMOT_PASS) +
+                            "&path=" + encodeURIComponent(path), { signal: AbortSignal.timeout(20000) });
+      const d = await r.json();
+      if (d.responseStatus && d.responseStatus !== "OK") return json({ error: String(d.message || d.responseStatus).slice(0, 200) });
+      const files = (d.files || []).filter((f) => /\.(wav|mp3)$/i.test(f.name || "")).map((f) => ({ name: f.name, size: f.size || 0, mtime: f.mtime || "" }));
+      return json({ path, count: files.length, files: files.slice(-8).reverse() });
+    } catch (e) { return json({ error: "אין תשובה מימות: " + (e.message || e) }); }
+  }
   // --- the key pool (admin): add, remove, move up, release, test ---
   if (p === "/keys" && pid === "main") {
     const ks = await getJSON(rootEnv, "gemkeys", {});
@@ -1724,6 +1738,8 @@ async function dashboard(env) {
 
   <section data-p="phone" class="hidden">
     <div class="card"><h2>${icon("monitor")}קו הטלפון (ימות)</h2>
+      <div class="setting"><div class="txt"><b>בפועל בקו</b><span id="phoneLine">בודק…</span></div>
+        <button class="btn ghost" type="button" onclick="renderPhone.at=0;renderPhone()">רענן</button></div>
       <div id="phoneInfo"></div></div>
     <div class="card"><h2>${icon("queue")}הפרקים האחרונים</h2>
       <div id="phoneJobs"></div></div>
@@ -2183,6 +2199,13 @@ function renderPhone() {
       (busy ? busy + " בדרך (הורדה/העלאה)" : "אין כרגע פרק בדרך") + " · " +
       (last ? "הועלה לאחרונה " + ago(last.updated) + " — " + esc(last.title) : "עוד לא הועלה פרק") + '</span></div></div>'
     : '<div class="sub" style="margin:0">אין עדיין מעקב מחובר לקו. בעמוד "ערוצים" מוסיפים ערוץ/פלייליסט ומסמנים "העלאה לקו הטלפון".</div>';
+  if (!renderPhone.at || Date.now() - renderPhone.at > 60000) {
+    renderPhone.at = Date.now();
+    fetch(B + "/yemot/files", { cache: "no-store" }).then((r) => r.json()).then((d) => {
+      $("phoneLine").innerHTML = d.error ? '<span class="bad">' + esc(d.error) + "</span>"
+        : "בשלוחה " + esc(d.path) + " יש <b>" + d.count + "</b> קבצים" + (d.files.length ? " · האחרון: " + esc(d.files[0].name) + " " + esc(d.files[0].mtime) : "");
+    }).catch(() => { $("phoneLine").textContent = "לא ניתן לבדוק"; });
+  }
   $("phoneJobs").innerHTML = jobs.length ? jobs.slice(0, 15).map((j) =>
     mini("", j.title, ago(j.updated) + (j.status === "done" ? " · " + esc(j.error || "הועלה") : j.status === "failed" ? ' · <span class="bad">' + esc(j.error || "נכשל") + "</span>" : ""),
          badgeOf(j.status))).join("") : '<div class="sub" style="margin:0">אין עדיין פרקים.</div>';
