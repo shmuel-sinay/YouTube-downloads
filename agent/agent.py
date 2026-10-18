@@ -127,7 +127,7 @@ def hello() -> None:
     """Tell the Worker who we are and what we have — shown on the site."""
     def ver(cmd):
         try:
-            return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip().splitlines()[0]
+            return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30).stdout.strip().splitlines()[0]
         except Exception:
             return "חסר"
     info = {"ytdlp": ver(["yt-dlp", "--version"]), "node": ver(["node", "--version"]),
@@ -338,7 +338,7 @@ def yemot_upload(src: Path) -> str:
         raise RuntimeError("חסרים YEMOT_USER / YEMOT_PASS ב-Render")
     mp3 = src.with_suffix(".yemot.mp3")
     r = subprocess.run(["ffmpeg", "-y", "-i", str(src), "-ac", "1", "-ar", "22050", "-b:a", "48k", str(mp3)],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode or not mp3.exists():
         raise RuntimeError("המרה נכשלה")
     try:
@@ -454,7 +454,7 @@ def run_ytdlp(cmd: list[str], vid: str = "") -> _Result:
                 say(f"   … עדיין עובד ({int((time.time() - start) // 60)} דק׳)")
 
     # Own process group, so cancelling also stops the ffmpeg it starts.
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
                             start_new_session=True)
     _current["proc"] = proc
     pf = prog_file(vid) if vid else None
@@ -565,7 +565,7 @@ def handle_list(job: dict) -> None:
     cookies = cookies_path()
     if cookies:
         cmd += ["--cookies", cookies]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
     items = []
     for line in r.stdout.splitlines():
         parts = line.split("\t", 3)
@@ -612,7 +612,7 @@ def handle_search(job: dict) -> None:
     cookies = cookies_path()
     if cookies:
         cmd += ["--cookies", cookies]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
     # A NetFree-only profile gets several candidates: the desktop app checks
     # them in order and keeps the first one NetFree lets through.
     want = max(1, min(int(job.get("candidates") or 1), 8))
@@ -934,7 +934,7 @@ def youtube_selftest() -> None:
            "--no-warnings", "-q",
            "--extractor-args", "youtube:player_client=visionos"] + net_args()
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
         res = "✓" if r.returncode == 0 else "✗" + (" (not a bot)" if "not a bot" in r.stderr else "")
     except Exception:
         res = "✗ (timeout)"
