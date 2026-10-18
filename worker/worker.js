@@ -849,7 +849,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (!q.get("V")) return T("read=t-" + vids.map((e, i) => "לסרטון " + clean(e.title) + " הקישו " + (i + 1)).join(" ") + "=V,,1,1,Digits,yes");
     const e = vids[parseInt(q.get("V"), 10) - 1];
     if (!e) return bye("בחירה שגויה");
-    await addJobs(menv, [{ ...jobFor(ch, e), mode: "m4a", yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/6", priority: Date.now() }]);
+    await addJobs(menv, [{ ...jobFor(ch, e), mode: "m4a", yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
     wake();
     await addLog(menv, "worker", "בקשה מהטלפון: " + e.title);
     return bye("הבקשה התקבלה הסרטון יהיה מוכן להאזנה בעוד כמה דקות");
