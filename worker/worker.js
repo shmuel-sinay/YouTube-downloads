@@ -1806,7 +1806,11 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .check{display:flex;align-items:center;gap:8px;color:var(--text);font-size:.9rem;cursor:pointer}
 .check input{width:auto}
 .actions-row{display:flex;justify-content:flex-end;margin-top:16px}
-.chcols{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;align-items:start}
+.chcols{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}
+@media(max-width:1100px){.chcols{grid-template-columns:1fr}}
+.chcol .ch{flex-wrap:wrap;gap:8px;padding:10px 0;border-bottom:0;border-top:1px solid var(--line)}
+.chcol .ch .acts{flex-wrap:wrap}
+.chcol .ch .info{min-width:0;flex:1 1 150px}
 .chcol h3{margin:0 0 8px;font-size:1rem}
 .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
 /* segmented filter */
@@ -2040,7 +2044,7 @@ async function dashboard(env) {
   </section>
 
   <section data-p="channels" class="hidden">
-    <div class="list" id="channels"></div>
+    <div id="channels"></div>
     <div class="actions-row" style="justify-content:space-between;align-items:center">
       <span class="sub" id="checkText" style="margin:0"></span>
       <button class="btn ghost" id="checkBtn" type="button">${icon("refresh")}<span>בדוק עכשיו</span></button>
@@ -2389,12 +2393,12 @@ function render() {
   const cols = [["מעקב רגיל", []], ["קו טלפון · העלאה אוטומטית", []], ["קו טלפון · לבקשה בטלפון", []]];
   S.channels.forEach((c) => cols[colOf(c)][1].push(c));
   const colHtml = ([title, list], n) => {
-    if (!list.length) return "";
-    let h = '<div class="chcol"><h3>' + title + ' <span class="tag">' + list.length + '</span></h3>';
+    let h = '<div class="card chcol"><h3>' + title + ' <span class="tag">' + list.length + '</span></h3>';
     if (n === 2) {
       const by = {}; list.forEach((c) => (by[c.cat || "כללי"] = by[c.cat || "כללי"] || []).push(c));
       h += Object.keys(by).map((k) => '<div class="sub" style="margin:10px 0 4px"><b>' + esc(k) + '</b></div>' + by[k].map(chRow).join("")).join("");
     } else h += list.map(chRow).join("");
+    if (!list.length) h += '<div class="sub" style="margin:0">אין ערוצים כאן</div>';
     return h + "</div>";
   };
   $("channels").innerHTML = S.channels.length ? '<div class="chcols">' + cols.map(colHtml).join("") + "</div>"
