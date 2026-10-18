@@ -849,12 +849,17 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (q.get("MD") === "1") {
       // Browse the newest videos of all request channels, one title at a time:
       // 1 = request it, 2 = next, 3 = previous, 0 = exit. Position is replayed from the A0,A1,… answers.
-      const feeds = await Promise.allSettled(await getChannels(menv).then((all) => all.filter((c) => c.req).slice(0, 20).map(async (c) => {
-        const en = (await readFeed(c.id)).entries.filter((e) => !e.isShort).slice(0, 3);
-        return en.map((e) => ({ ch: c, e }));
-      })));
-      const all = feeds.flatMap((f) => (f.status === "fulfilled" ? f.value : []))
-        .sort((x, y) => (y.e.published || "").localeCompare(x.e.published || "")).slice(0, 30);
+      // The list is kept for 10 minutes so paging between titles is fast.
+      let cache = await getJSON(menv, "phonebrowse", null), all = cache && Date.now() - cache.at < 600000 ? cache.all : null;
+      if (!all) {
+        const feeds = await Promise.allSettled(chs.concat((await getChannels(menv)).filter((c) => c.req && !chs.includes(c))).slice(0, 20).map(async (c) => {
+          const en = (await readFeed(c.id)).entries.filter((e) => !e.isShort).slice(0, 3);
+          return en.map((e) => ({ ch: c, e }));
+        }));
+        all = feeds.flatMap((f) => (f.status === "fulfilled" ? f.value : []))
+          .sort((x, y) => (y.e.published || "").localeCompare(x.e.published || "")).slice(0, 30);
+        if (all.length) await putJSON(menv, "phonebrowse", { at: Date.now(), all });
+      }
       if (!all.length) return bye("לא נמצאו סרטונים");
       let pos = 0, k = 0;
       for (; q.has("A" + k); k++) {
@@ -1284,6 +1289,20 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         if (take.length) wake();
       }
       return redirect(BASE + "/");
+    }
+    if (p === "/channels/set" && (env.PROFILE || "main") === "main") {
+      // Phone-line settings of a tracked channel: auto-upload vs request-only, full-episode length.
+      const channels = await getChannels(env), c = channels.find((x) => x.id === String(f.get("id")));
+      if (!c) return new Response("אין ערוץ כזה", { status: 404 });
+      const m = f.get("mode");
+      if (m === "auto") { c.yemot = true; delete c.req; delete c.reqOnly; }
+      else if (m === "req") { c.req = true; c.reqOnly = true; delete c.yemot; }
+      else if (m === "both") { c.yemot = true; c.req = true; delete c.reqOnly; }
+      else if (m === "off") { delete c.yemot; delete c.req; delete c.reqOnly; }
+      if (f.has("minMinutes")) c.minMinutes = Math.max(0, parseInt(f.get("minMinutes"), 10) || 0);
+      await putJSON(env, "channels", channels);
+      await env.DB.delete("phonebrowse");
+      return json({ ok: true });
     }
     if (p === "/channels/remove") {
       const id = String(f.get("id"));
@@ -1895,6 +1914,10 @@ async function dashboard(env) {
           <button class="btn">${icon("add")}<span>הוסף לקו</span></button>
         </div>
       </form></div>
+    <div class="card"><h2>${icon("channels")}ערוצים בקו</h2>
+      <p class="sub">אוטומטי = מעלה לבד לשלוחה 8 · לבקשה = מופיע רק ברשימת הבקשות בטלפון (שלוחה 7).</p>
+      <div id="phoneChans"></div></div>
+    <div class="card"><h2>${icon("queue")}בקשות מהטלפון</h2><div id="phoneReqs"></div></div>
     <div class="card"><h2>${icon("queue")}הפרקים האחרונים</h2>
       <div id="phoneJobs"></div></div>
   </section>
@@ -2245,6 +2268,11 @@ document.addEventListener("click", async (e) => {
       d.append("minMinutes", c.minMinutes || 0); if (c.skipShorts) d.append("skipShorts", "on");
       await post("/jobs/batch", d); toast("נוסף לתור"); showPage("queue"); refresh(); return;
     }
+    if (/^ph(auto|req|both|min)$/.test(act)) {
+      if (act === "phmin") { const n = prompt("אורך פרק מלא בדקות (0 = בלי)", ""); if (n === null) return; d.append("minMinutes", n); }
+      else d.append("mode", act.slice(2));
+      await post("/channels/set", d); toast("עודכן"); refresh(); return;
+    }
     const path = act === "remove" ? "/channels/remove" : act === "retry" ? "/jobs/retry" : "/jobs/" + act;
     await post(path, d); toast(MSG[act] || "בוצע"); refresh();
   } catch (x) { toast("שגיאה: " + x.message, 6000); }
@@ -2345,6 +2373,16 @@ document.addEventListener("click", async (e) => {
 function renderPhone() {
   if (!(S.profile && S.profile.admin)) return;
   const chs = S.channels.filter((c) => c.yemot), jobs = S.jobs.filter((j) => j.yemot);
+  const reqs = jobs.filter((j) => /\\/7\\//.test(j.yemotPath || ""));
+  const pc = S.channels.filter((c) => c.yemot || c.req);
+  const kind = (c) => (c.yemot && c.req ? "אוטומטי + לבקשה" : c.req ? "לבקשה בטלפון בלבד" : "העלאה אוטומטית");
+  $("phoneChans").innerHTML = pc.length ? pc.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>' + kind(c) +
+    (c.minMinutes ? " · פרק מלא " + c.minMinutes + " דק׳+" : "") + '</span></div><span style="display:flex;gap:6px">' +
+    btn("phauto", c.id, "zap", "העלאה אוטומטית") + btn("phreq", c.id, "monitor", "לבקשה בלבד") + btn("phboth", c.id, "layers", "אוטומטי + לבקשה") +
+    btn("phmin", c.id, "clock", "אורך פרק מלא") + btn("remove", c.id, "trash", "הסר", "danger") + '</span></div>').join("")
+    : '<div class="sub" style="margin:0">אין ערוצים מחוברים לקו.</div>';
+  $("phoneReqs").innerHTML = reqs.length ? reqs.slice(0, 15).map((j) => mini("", j.title, ago(j.updated) + (j.status === "failed" ? " · " + esc(j.error || "נכשל") : ""), badgeOf(j.status))).join("")
+    : '<div class="sub" style="margin:0">עוד לא התבקשו סרטונים בטלפון.</div>';
   const last = jobs.find((j) => j.status === "done");
   const busy = jobs.filter((j) => ["queued", "taken"].includes(j.status)).length;
   const fullMin = Math.max(0, ...chs.map((c) => c.minMinutes || 0));
