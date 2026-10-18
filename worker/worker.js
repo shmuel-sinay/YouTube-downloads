@@ -1310,6 +1310,21 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       return json({ path, count: files.length, files: files.slice(-8).reverse() });
     } catch (e) { return json({ error: "אין תשובה מימות: " + (e.message || e) }); }
   }
+  // --- diagnostic (admin): what do YouTube's in-channel search and RSS return for "src" + "q"? ---
+  if (p === "/phone/probe" && pid === "main") {
+    const src = url.searchParams.get("src") || "", q = url.searchParams.get("q") || "";
+    const out = { src, q };
+    try {
+      const r = await fetch("https://www.youtube.com/channel/" + src + "/search?query=" + encodeURIComponent(q), {
+        headers: { "User-Agent": "Mozilla/5.0", "Accept-Language": "he,en", Cookie: "CONSENT=YES+1" }, signal: AbortSignal.timeout(15000) });
+      const html = await r.text();
+      out.search = { status: r.status, length: html.length, hasVideoRenderer: html.includes('"videoRenderer"'), hasConsent: /consent\.youtube|before you continue/i.test(html),
+        titles: (await searchChannel(src, q)).slice(0, 8).map((e) => e.title) };
+    } catch (e) { out.search = { error: String(e.message || e) }; }
+    try { const f = await readFeed(src); out.rss = { name: f.name, count: f.entries.length, titles: f.entries.slice(0, 15).map((e) => e.title) }; }
+    catch (e) { out.rss = { error: String(e.message || e) }; }
+    return json(out);
+  }
   // --- sub-extensions of ext 8 (admin): read / save "N = label | categories", re-aim all auto channels ---
   if (p === "/phone/cfg" && pid === "main") {
     if (req.method === "POST") {
