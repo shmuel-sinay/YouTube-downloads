@@ -1127,6 +1127,24 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (p === "/channels/add") {
       const id = await resolveChannelId(String(f.get("channel") || ""));
       const channels = await getChannels(env);
+      const exist = channels.find((c) => c.id === id);
+      if (exist) {
+        // Already tracked: don't ignore silently — apply the phone-line flag
+        // and the "download the latest now" request to it.
+        const wantY = f.get("yemot") === "on" && (env.PROFILE || "main") === "main";
+        if (wantY && !exist.yemot) { exist.yemot = true; await putJSON(env, "channels", channels); }
+        const bf = Math.max(0, Math.min(15, parseInt(f.get("backfill") || "0", 10) || 0));
+        let n = 0;
+        if (bf) {
+          const { entries } = await readFeed(id);
+          const take = entries.filter((e) => !(exist.skipShorts && e.isShort)).slice(0, bf);
+          await addJobs(env, take.map((e) => jobFor(exist, e)));
+          n = take.length;
+        }
+        await addLog(env, "worker", `הערוץ כבר היה במעקב: ${exist.name}` + (wantY ? " — סומן להעלאה לקו הטלפון" : "") + (n ? ` (${n} סרטונים לתור)` : ""));
+        if (n) wake();
+        return redirect(BASE + "/");
+      }
       if (!channels.some((c) => c.id === id)) {
         const { name, entries } = await readFeed(id);
         const ch = {
