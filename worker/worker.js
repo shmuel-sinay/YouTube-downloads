@@ -45,11 +45,19 @@ export default {
       return new Response("Error: " + (e && e.message || e), { status: 500 });
     }
   },
+  // The Cron Trigger fires every 10 minutes (*/10 * * * *); what runs is
+  // decided here by Israel time (so summer/winter time needs no change):
+  //  - phone-line sources: at the times in PHONE_CHECKS (after the show ends);
+  //  - everything: every 3 hours, on the hour.
   async scheduled(event, env, ctx) {
+    const { h, m } = israelClock();
+    const phone = PHONE_CHECKS.includes(String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0"));
+    const full = h % 3 === 0 && m === 0;
+    if (!phone && !full) return;                       // nothing to do: no database work at all
     ctx.waitUntil((async () => {
       env = await withStore(env);
       await putJSON(env, "autocheck", { at: Date.now() });
-      for (const pid of await profileIds(env)) await checkAllChannels(profileEnv(env, pid));
+      for (const pid of await profileIds(env)) await checkAllChannels(profileEnv(env, pid), full ? null : (c) => c.yemot);
       if (env.DB && env.DB.flush) await env.DB.flush();
       await wakeAgent(env);
     })());
@@ -396,8 +404,17 @@ async function checkChannel(env, ch, notes) {
   return jobs.length;
 }
 
-async function checkAllChannels(env) {
-  const channels = await getChannels(env);
+// Israel local time, minutes rounded down to 10 (the cron runs every 10 minutes).
+const PHONE_CHECKS = ["22:40", "23:00", "23:10", "23:20"];
+function israelClock() {
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit", hour12: false })
+    .formatToParts(new Date());
+  const get = (t) => parseInt((parts.find((x) => x.type === t) || {}).value || "0", 10);
+  return { h: get("hour") % 24, m: Math.floor(get("minute") / 10) * 10 };   // some engines print hour 24 for midnight
+}
+
+async function checkAllChannels(env, only) {
+  const channels = (await getChannels(env)).filter(only || (() => true));
   let added = 0;
   const errors = [], notes = [];
   for (const ch of channels) {
@@ -2231,7 +2248,7 @@ function renderPhone() {
   const fullToday = fullMin && jobs.some((j) => j.status === "done" && new Date(j.updated).toDateString() === today &&
     +((String(j.error || "").match(/(\d+) דק/) || [])[1] || 0) >= fullMin);
   $("phoneInfo").innerHTML = chs.length
-    ? chs.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>נבדק אוטומטית כל 3 שעות · ' + "מעלה את כל מה שעולה" + (c.minMinutes ? " · פרק מלא = " + c.minMinutes + " דקות ומעלה" : "") + ' · לשינוי: מוסיפים שוב עם אורך אחר</span></div>' + btn("remove", c.id, "trash", "הסר מהקו", "danger") + '</div>').join("") +
+    ? chs.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>נבדק ב-22:40, 23:00, 23:10 ו-23:20, וגם כל 3 שעות · ' + "מעלה את כל מה שעולה" + (c.minMinutes ? " · פרק מלא = " + c.minMinutes + " דקות ומעלה" : "") + ' · לשינוי: מוסיפים שוב עם אורך אחר</span></div>' + btn("remove", c.id, "trash", "הסר מהקו", "danger") + '</div>').join("") +
       '<div class="setting"><div class="txt"><b>מצב</b><span>' +
       (busy ? busy + " בדרך (הורדה/העלאה)" : "אין כרגע פרק בדרך") + " · " +
       (last ? "הועלה לאחרונה " + ago(last.updated) + " — " + esc(last.title) : "עוד לא הועלה פרק") + '</span></div></div>' +
