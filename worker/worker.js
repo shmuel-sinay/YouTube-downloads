@@ -2062,7 +2062,6 @@ async function dashboard(env) {
       <p class="sub">אוטומטי = מעלה לבד לשלוחה 8 · לבקשה = מופיע רק ברשימת הבקשות בטלפון (שלוחה 7).</p>
       <div id="phoneChans"></div>
       <div class="cbar" style="margin-top:12px"><a class="btn ghost" href="${BASE}/phone/export" download>ייצוא לקובץ</a>
-        <label class="check" style="margin:0"><input type="checkbox" id="phonePrune">הסר מהקו מה שלא בקובץ</label>
         <label class="btn ghost" style="cursor:pointer">ייבוא מקובץ<input type="file" id="phoneImp" accept=".txt,text/plain" hidden></label></div></div>
     <div class="card hidden" id="askCard"><h2>${icon("queue")}בקשה מהאתר</h2><div id="askList"></div></div>
     <div class="card"><h2>${icon("queue")}בקשות מהטלפון</h2><div id="phoneReqs"></div></div>
@@ -2601,7 +2600,7 @@ $("phoneImp").onchange = async (e) => {
     if (!cur.length || cur.length >= 20 || cur.cat !== cat) { cur = []; cur.cat = cat; chunks.push(cur); }
     cur.push(l);
   }
-  const prune = $("phonePrune").checked;
+  let prune = false, notIn = [];
   let a = 0, u = 0, b = 0, dl = 0, ids = [], addN = [], delN = [];
   const send = async (dry) => {
     a = u = b = dl = 0; ids = []; addN = []; delN = [];
@@ -2611,8 +2610,8 @@ $("phoneImp").onchange = async (e) => {
       const r = await (await post("/phone/import", d)).json();
       a += r.added; u += r.upd; b += r.bad; dl += r.dels; ids.push(...r.ids); addN.push(...r.addN); delN.push(...r.delN);
     }
-    if (prune) { const d = new FormData(); d.append("ids", JSON.stringify(ids)); if (dry) d.append("dry", "1");
-      const r = await (await post("/phone/prune", d)).json(); if (dry) delN.push(...r.names); return r.n; }
+    if (dry || prune) { const d = new FormData(); d.append("ids", JSON.stringify(ids)); if (dry) d.append("dry", "1");
+      const r = await (await post("/phone/prune", d)).json(); if (dry) notIn = r.names; return r.n; }
     return 0;
   };
   try {
@@ -2623,13 +2622,16 @@ $("phoneImp").onchange = async (e) => {
       ov.style.cssText = "position:fixed;inset:0;background:#000a;z-index:99;display:flex;align-items:center;justify-content:center;padding:16px";
       const list = (arr) => arr.length ? '<ul style="margin:6px 0;padding-inline-start:20px;max-height:30vh;overflow:auto">' + arr.map((n) => "<li>" + esc(n) + "</li>").join("") + "</ul>" : "";
       ov.innerHTML = '<div class="card" style="max-width:520px;width:100%;max-height:90vh;overflow:auto"><h2>אישור ייבוא</h2>' +
-        "<p><b class='bad'>ערוצים שיימחקו מהקו (" + delN.length + "):</b></p>" + (delN.length ? list(delN) : "<p class='sub'>אין</p>") +
+        "<p><b class='bad'>ערוצים שיימחקו מהקו לפי הקובץ (" + delN.length + "):</b></p>" + (delN.length ? list(delN) : "<p class='sub'>אין</p>") +
+        '<label class="check"><input type="checkbox" id="impPrune">הסר מהקו גם ערוצים שלא מופיעים בקובץ (' + notIn.length + ")</label>" +
+        '<div id="impNot" class="hidden">' + list(notIn) + "</div>" +
         "<p class='sub'>" + a + " ערוצים חדשים · " + u + " יעודכנו" + (b ? " · " + b + " שורות לא תקינות יידלגו" : "") + "</p>" +
         '<div id="impAdd" class="hidden"><p><b>יתווספו (' + addN.length + "):</b></p>" + (addN.length ? list(addN) : "<p class='sub'>אין</p>") + "</div>" +
         '<div class="cbar"><button class="btn" id="impOk">אשר ייבוא</button><button class="btn ghost" id="impShow">הצג מה יתווסף</button><button class="btn ghost" id="impNo">בטל</button></div></div>';
       document.body.appendChild(ov);
       ov.querySelector("#impShow").onclick = (ev) => { ov.querySelector("#impAdd").classList.toggle("hidden"); ev.target.textContent = ov.querySelector("#impAdd").classList.contains("hidden") ? "הצג מה יתווסף" : "הסתר"; };
-      ov.querySelector("#impOk").onclick = () => { ov.remove(); done(true); };
+      ov.querySelector("#impPrune").onchange = (ev) => ov.querySelector("#impNot").classList.toggle("hidden", !ev.target.checked);
+      ov.querySelector("#impOk").onclick = () => { prune = ov.querySelector("#impPrune").checked; ov.remove(); done(true); };
       ov.querySelector("#impNo").onclick = () => { ov.remove(); done(false); };
     });
     if (!ok) { toast("הייבוא בוטל"); return; }
