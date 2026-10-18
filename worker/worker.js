@@ -376,7 +376,7 @@ function jobFor(ch, e) {
   return {
     videoId: e.videoId, channelId: ch.id, channelName: ch.name, title: e.title,
     published: e.published, url: "https://www.youtube.com/watch?v=" + e.videoId,
-    mode: ch.yemot ? "m4a" : ch.mode, minMinutes: ch.minMinutes, status: "queued",
+    mode: ch.yemot ? "m4a" : ch.mode, minMinutes: ch.yemot ? 0 : ch.minMinutes, status: "queued",
     ...(ch.yemot ? { yemot: true } : {}),
     updated: new Date().toISOString(),
   };
@@ -1769,7 +1769,7 @@ async function dashboard(env) {
         <input type="hidden" name="skipShorts" value="on">
         <div class="cbar">
           <input name="channel" placeholder="קישור לערוץ או פלייליסט להעלאה לקו" required style="flex:1;min-width:200px">
-          <label class="field" style="margin:0">אורך מינימלי (דקות) <input name="minMinutes" type="number" min="0" value="20" style="width:70px"></label>
+          <label class="field" style="margin:0">אורך פרק מלא (דקות) <input name="minMinutes" type="number" min="0" value="40" style="width:70px"></label>
           <label class="field" style="margin:0">להעלות עכשיו את האחרונים <input name="backfill" type="number" min="0" max="15" value="3" style="width:70px"></label>
           <button class="btn">${icon("add")}<span>הוסף לקו</span></button>
         </div>
@@ -2226,11 +2226,17 @@ function renderPhone() {
   const chs = S.channels.filter((c) => c.yemot), jobs = S.jobs.filter((j) => j.yemot);
   const last = jobs.find((j) => j.status === "done");
   const busy = jobs.filter((j) => ["queued", "taken"].includes(j.status)).length;
+  const fullMin = Math.max(0, ...chs.map((c) => c.minMinutes || 0));
+  const today = new Date().toDateString();
+  const fullToday = fullMin && jobs.some((j) => j.status === "done" && new Date(j.updated).toDateString() === today &&
+    +((String(j.error || "").match(/(\d+) דק/) || [])[1] || 0) >= fullMin);
   $("phoneInfo").innerHTML = chs.length
-    ? chs.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>נבדק אוטומטית כל 3 שעות · ' + (c.minMinutes ? "רק פרקים של " + c.minMinutes + " דקות ומעלה (קצרים מדולגים, והבדיקה ממשיכה)" : "כל פרק חדש") + ' · לשינוי: מוסיפים שוב עם אורך אחר</span></div>' + btn("remove", c.id, "trash", "הסר מהקו", "danger") + '</div>').join("") +
+    ? chs.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>נבדק אוטומטית כל 3 שעות · ' + "מעלה את כל מה שעולה" + (c.minMinutes ? " · פרק מלא = " + c.minMinutes + " דקות ומעלה" : "") + ' · לשינוי: מוסיפים שוב עם אורך אחר</span></div>' + btn("remove", c.id, "trash", "הסר מהקו", "danger") + '</div>').join("") +
       '<div class="setting"><div class="txt"><b>מצב</b><span>' +
       (busy ? busy + " בדרך (הורדה/העלאה)" : "אין כרגע פרק בדרך") + " · " +
-      (last ? "הועלה לאחרונה " + ago(last.updated) + " — " + esc(last.title) : "עוד לא הועלה פרק") + '</span></div></div>'
+      (last ? "הועלה לאחרונה " + ago(last.updated) + " — " + esc(last.title) : "עוד לא הועלה פרק") + '</span></div></div>' +
+      (fullMin ? '<div class="setting"><div class="txt"><b>הפרק המלא של היום</b><span>' +
+        (fullToday ? "✓ עלה (" + fullMin + " דקות ומעלה)" : "עדיין לא עלה — הבדיקה ממשיכה כל 3 שעות") + '</span></div></div>' : "")
     : '<div class="sub" style="margin:0">אין עדיין מעקב מחובר לקו. בעמוד "ערוצים" מוסיפים ערוץ/פלייליסט ומסמנים "העלאה לקו הטלפון".</div>';
   if (!renderPhone.at || Date.now() - renderPhone.at > 60000) {
     renderPhone.at = Date.now();

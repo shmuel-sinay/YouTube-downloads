@@ -744,6 +744,9 @@ def _handle(job: dict) -> None:
         set_progress(vid, stage="convert", pct=None)
         try:
             msg = yemot_upload(files[-1])
+            dur = PROGRESS.get(vid, {}).get("duration")
+            if dur:
+                msg += f" · {round(float(dur) / 60)} דק׳"
             api("/api/report", {"videoId": vid, "status": "done", "fileUrl": "", "error": msg})
             log(f"   ✓ {msg}")
         except Exception as e:
