@@ -525,18 +525,23 @@ def handle_list(job: dict) -> None:
     vid, count, min_s = job["videoId"], int(job.get("count") or 10), int(job.get("minMinutes") or 0) * 60
     log(f"-> מחפש {count} סרטונים: {job.get('channelName')}")
     set_progress(vid, stage="start", pct=None, started=time.time(), mode="m4a")
+    is_yt = "youtube.com" in job["url"] or "youtu.be" in job["url"]
     cmd = ["yt-dlp", job["url"], "--flat-playlist", "--no-warnings",
            "--playlist-end", str(min(count * (3 if min_s else 1) + 5, 600)),
-           "--print", "%(id)s\t%(duration)s\t%(title)s",
-           "--js-runtimes", "node", "--impersonate", "chrome"] + net_args()
+           "--print", "%(id)s\t%(duration)s\t%(webpage_url)s\t%(title)s"]
+    if is_yt:
+        cmd += ["--js-runtimes", "node", "--impersonate", "chrome"]
+    cmd += net_args()
     cookies = cookies_path()
     if cookies:
         cmd += ["--cookies", cookies]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     items = []
     for line in r.stdout.splitlines():
-        parts = line.split("\t", 2)
-        if len(parts) < 3 or len(parts[0]) != 11:
+        parts = line.split("\t", 3)
+        if len(parts) < 4 or not parts[0]:
+            continue
+        if is_yt and len(parts[0]) != 11:
             continue
         try:
             dur = float(parts[1])
@@ -544,7 +549,12 @@ def handle_list(job: dict) -> None:
             dur = None                  # unknown here; the real download still filters
         if min_s and dur is not None and dur < min_s:
             continue
-        items.append({"videoId": parts[0], "title": parts[2], "duration": dur})
+        wurl = parts[2] if parts[2].startswith("http") else None
+        item = {"videoId": parts[0] if is_yt else ("tt" + parts[0]), "title": parts[3], "duration": dur}
+        if not is_yt:
+            item["url"] = wurl or job["url"]
+            item["source"] = "tiktok" if "tiktok.com" in job["url"] else ""
+        items.append(item)
         if len(items) >= count:
             break
     if not items:
@@ -622,25 +632,33 @@ def _handle(job: dict) -> None:
     # the video data (the client type needs a token for the stream). Try other
     # routes and client types before giving up, and say in the log which
     # one worked.
-    nc = _without(cmd, "--cookies") if "--cookies" in cmd else cmd
-    # The no-cookie clients don't need Chrome impersonation; without it the
-    # download is plain streaming (less memory on the free server).
-    light = _without(nc, "--impersonate")
-    # Order: visionos first — it gets direct stream links (no signature, no
-    # n-challenge, no PO token → no Node run, nothing to 403 on); then
-    # tv_simply, which got through on Render via WARP.
-    # visionos_old (0.1, the original Vision Pro — our plugin) downloads the
-    # whole file where yt-dlp's visionos 1.02 is sometimes cut off with 403.
-    old_ok = "--plugin-dirs" in light
-    tries = ([("לקוח visionos ישן (בלי עוגיות)", _with_clients(light, "visionos_old"))] if old_ok else []) + [
-             ("לקוח visionos (בלי עוגיות)", _with_clients(light, "visionos")),
-             ("לקוח tv_simply (בלי עוגיות)", _with_clients(light, "tv_simply")),
-             ("לקוח android_vr (בלי עוגיות)", _with_clients(light, "android_vr")),
-             ("", cmd),
-             ("לקוח tv", _with_clients(cmd, "tv")),
-             ("לקוח web_safari", _with_clients(cmd, "web_safari"))]
-    if "--proxy" in cmd:
-        tries.append(("בלי WARP", _without(cmd, "--proxy")))
+    is_yt = "youtube.com" in job["url"] or "youtu.be" in job["url"]
+    if not is_yt:
+        # Non-YouTube (TikTok, etc.): no YouTube client juggling — one plain
+        # attempt, and (if WARP is on) one more without it.
+        tries = [("", cmd)]
+        if "--proxy" in cmd:
+            tries.append(("בלי WARP", _without(cmd, "--proxy")))
+    else:
+        nc = _without(cmd, "--cookies") if "--cookies" in cmd else cmd
+        # The no-cookie clients don't need Chrome impersonation; without it the
+        # download is plain streaming (less memory on the free server).
+        light = _without(nc, "--impersonate")
+        # Order: visionos first — it gets direct stream links (no signature, no
+        # n-challenge, no PO token → no Node run, nothing to 403 on); then
+        # tv_simply, which got through on Render via WARP.
+        # visionos_old (0.1, the original Vision Pro — our plugin) downloads the
+        # whole file where yt-dlp's visionos 1.02 is sometimes cut off with 403.
+        old_ok = "--plugin-dirs" in light
+        tries = ([("לקוח visionos ישן (בלי עוגיות)", _with_clients(light, "visionos_old"))] if old_ok else []) + [
+                 ("לקוח visionos (בלי עוגיות)", _with_clients(light, "visionos")),
+                 ("לקוח tv_simply (בלי עוגיות)", _with_clients(light, "tv_simply")),
+                 ("לקוח android_vr (בלי עוגיות)", _with_clients(light, "android_vr")),
+                 ("", cmd),
+                 ("לקוח tv", _with_clients(cmd, "tv")),
+                 ("לקוח web_safari", _with_clients(cmd, "web_safari"))]
+        if "--proxy" in cmd:
+            tries.append(("בלי WARP", _without(cmd, "--proxy")))
     # Start with whatever worked last time (no wasted attempts once a way is found).
     if _LAST_GOOD["label"] is not None:
         tries.sort(key=lambda t: t[0] != _LAST_GOOD["label"])
@@ -650,7 +668,7 @@ def _handle(job: dict) -> None:
             continue
         seen.add(tuple(c))
         if n:
-            log(f"   יוטיוב סירב ({why}) — מנסה שוב: {label}")
+            log(f"   ההורדה נכשלה ({why}) — מנסה שוב: {label}")
         r = run_ytdlp(c, vid)
         why = _refusal(r)
         out = r.stdout + r.stderr

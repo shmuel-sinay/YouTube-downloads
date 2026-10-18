@@ -205,6 +205,26 @@ const putJSON = (env, key, val) => env.DB.put(key, JSON.stringify(val));
 const getChannels = (env) => getJSON(env, "channels", []);
 const getJobIds = (env) => getJSON(env, "jobs", []);
 
+// Parse a pasted link into a one-off video job. Supports YouTube and TikTok.
+// Returns null for a non-video link (playlist/channel/search handled elsewhere).
+function videoFromUrl(line) {
+  const yt = line.match(/(?:v=|youtu\.be\/|shorts\/|live\/)([\w-]{11})/);
+  if (yt && !/[?&]list=/.test(line)) {
+    return { videoId: yt[1], url: "https://www.youtube.com/watch?v=" + yt[1], source: "youtube" };
+  }
+  if (/tiktok\.com/.test(line)) {
+    const url = (line.match(/https?:\/\/[^\s]+/) || [])[0] || ("https://www.tiktok.com/" + line.replace(/^\/+/, ""));
+    const id = (line.match(/\/video\/(\d+)/) || [])[1];
+    const isShort = /(?:vm\.tiktok\.com|tiktok\.com\/t)\//.test(line);
+    // A single video: /@user/video/123, or a vm./t/ short link. A bare
+    // /@user profile is an account → handled as a list (channel) elsewhere.
+    if (id || isShort) {
+      return { videoId: id ? "tt" + id : "tt-" + Math.random().toString(36).slice(2, 11), url, source: "tiktok" };
+    }
+  }
+  return null;
+}
+
 async function addJobs(env, jobs) {
   if (!jobs.length) return;
   // A NetFree-only profile: videos wait until the desktop app (behind
@@ -699,8 +719,9 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const known = new Set(await getJobIds(env));
       const fresh = (b.items || []).filter((it) => it.videoId && !known.has(it.videoId)).map((it) => ({
         videoId: it.videoId, channelId: b.channelId || "", channelName: b.channelName || "",
-        title: it.title || it.videoId, published: "", url: "https://www.youtube.com/watch?v=" + it.videoId,
-        mode: modeOf(b.mode), minMinutes: b.minMinutes || 0, status: "queued", updated: new Date().toISOString(),
+        title: it.title || it.videoId, published: "", url: it.url || ("https://www.youtube.com/watch?v=" + it.videoId),
+        source: it.source || b.source || "", mode: modeOf(b.mode), minMinutes: b.minMinutes || 0,
+        status: "queued", updated: new Date().toISOString(),
         ...(it.group ? { group: String(it.group), rank: +it.rank || 0 } : {}) }));
       if (b.priority) fresh.forEach((j) => { j.priority = b.priority; });
       await addJobs(env, fresh);
@@ -1147,16 +1168,19 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const minMinutes = Math.max(0, parseInt(f.get("minMinutes") || "0", 10) || 0);
       const lines = String(f.get("lines") || "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#")).slice(0, 300);
       const now = Date.now(), jobs = [];
+      const ttBlocked = (await profileInfo(env, env.PROFILE)).netfree;
       lines.forEach((line, i) => {
         const base = { mode, minMinutes, status: "queued", updated: new Date().toISOString(), priority: now - i };
-        const v = line.match(/(?:v=|youtu\.be\/|shorts\/|live\/)([\w-]{11})/);
+        const v = videoFromUrl(line);
         const pl = line.match(/[?&]list=([\w-]+)/);
         if (v && !pl) {
-          jobs.push({ ...base, videoId: v[1], channelName: "רשימה", title: v[1], url: "https://www.youtube.com/watch?v=" + v[1] });
+          if (v.source === "tiktok" && ttBlocked) return;     // not for NetFree profiles
+          jobs.push({ ...base, videoId: v.videoId, channelName: "רשימה", title: v.videoId, url: v.url, source: v.source });
         } else if (/^https?:\/\//.test(line)) {
+          if (/tiktok\.com/.test(line) && ttBlocked) return;  // TikTok account not for NetFree profiles
           // playlist / channel link: expand it like "N videos from a channel"
           jobs.push({ ...base, kind: "list", videoId: "list-" + (now + i).toString(36), channelName: "רשימה",
-                      title: "כל הסרטונים מ: " + line, url: line, count: 300 });
+                      title: "כל הסרטונים מ: " + line, url: line, count: 300, source: /tiktok\.com/.test(line) ? "tiktok" : "" });
         } else {
           jobs.push({ ...base, kind: "search", videoId: "q-" + (now + i).toString(36), channelName: "חיפוש",
                       title: line, query: line });
@@ -1225,14 +1249,15 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       return redirect(BASE + "/");
     }
     if (p === "/jobs/add") {
-      // Manual one-off: paste a video link.
-      const m = String(f.get("url") || "").match(/(?:v=|youtu\.be\/|shorts\/)([\w-]{11})/);
-      if (m) await addJobs(env, [{
-        videoId: m[1], channelId: "", channelName: "ידני", title: m[1],
-        published: "", url: "https://www.youtube.com/watch?v=" + m[1],
-        mode: modeOf(f.get("mode")), minMinutes: 0,
+      // Manual one-off: paste a video link (YouTube or TikTok).
+      const v = videoFromUrl(String(f.get("url") || ""));
+      if (v && v.source === "tiktok" && (await profileInfo(env, env.PROFILE)).netfree)
+        return new Response("טיקטוק לא זמין בפרופיל הזה", { status: 400 });
+      if (v) await addJobs(env, [{
+        videoId: v.videoId, channelId: "", channelName: "ידני", title: v.videoId, source: v.source,
+        published: "", url: v.url, mode: modeOf(f.get("mode")), minMinutes: 0,
         status: "queued", updated: new Date().toISOString() }]);
-      if (m) wake();
+      if (v) wake();
       return redirect(BASE + "/");
     }
   }
@@ -1617,15 +1642,15 @@ async function dashboard(env) {
   <section data-p="add" class="hidden">
     <div class="cols">
       <form class="card" data-action="/jobs/add">
-        <h2>${icon("download")}סרטון בודד</h2><p class="sub">קישור לסרטון ביוטיוב — יורד מיד.</p>
+        <h2>${icon("download")}סרטון בודד</h2><p class="sub">קישור לסרטון מיוטיוב<span class="ttHint"> או מטיקטוק</span> — יורד מיד.</p>
         <div class="grid">
-          <label class="field wide">קישור<input name="url" placeholder="https://www.youtube.com/watch?v=…" required></label>
+          <label class="field wide">קישור<input name="url" placeholder="https://www.youtube.com/watch?v=…  או  https://www.tiktok.com/@…" required></label>
           <label class="field">סוג<select name="mode">${modeOptions}</select></label>
         </div>
         <div class="actions-row"><button class="btn">${icon("add")}<span>הוסף לתור</span></button></div>
       </form>
       <form class="card" data-action="/jobs/list">
-        <h2>${icon("queue")}רשימת שירים או קישורים</h2><p class="sub">שורה לכל פריט: קישור ליוטיוב, או שם לחיפוש (זמר - שיר).</p>
+        <h2>${icon("queue")}רשימת שירים או קישורים</h2><p class="sub">שורה לכל פריט: קישור ליוטיוב<span class="ttHint"> או לטיקטוק</span>, או שם לחיפוש (זמר - שיר).</p>
         <div class="grid">
           <label class="field wide">הרשימה<textarea name="lines" rows="6" required placeholder="נפתלי קמפה - גרש את העצבות&#10;https://www.youtube.com/watch?v=…&#10;מוטי וייס - רפ״ב"></textarea></label>
           <label class="field">סוג<select name="mode">${modeOptions}</select></label>
@@ -1803,7 +1828,7 @@ function jobRow(j) {
   const thumb = list ? '<div class="thumb">' + icon(j.kind === "search" ? "queue" : "layers") + '</div>'
     : '<img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">';
   const modeIc = /^video/.test(j.mode || "") ? "video" : "music";
-  const meta = [esc(j.channelName || "קישור ידני"), icon(modeIc) + " " + esc(MODES[j.mode] || MODES.audio),
+  const meta = [esc(j.channelName || "קישור ידני"), j.source === "tiktok" ? "TikTok" : "", icon(modeIc) + " " + esc(MODES[j.mode] || MODES.audio),
     j.pcConvert ? icon("zap") + " המרה במחשב" : "", j.pcGot ? icon("monitor") + " במחשב" : "",
     icon("clock") + " " + ago(j.updated)].filter(Boolean).join('<span class="sep">•</span>');
   const a = [];
@@ -1924,6 +1949,7 @@ function render() {
   });
   $("profileName").textContent = (S.profile && S.profile.name) || "";
   $("imgNav").classList.toggle("hidden", !(APP() && APP().img_list && S.profile && !S.profile.netfree));
+  document.querySelectorAll(".ttHint").forEach((e) => e.classList.toggle("hidden", !!(S.profile && S.profile.netfree)));
   $("globalNav").classList.toggle("hidden", !(S.profile && S.profile.admin));
   $("cookieCard").classList.toggle("hidden", !S.cookieExt);
   if (S.cookieExt) {
