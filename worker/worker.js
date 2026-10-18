@@ -2132,38 +2132,65 @@ async function dashboard(env) {
   </section>
 
   <section data-p="phone" class="hidden">
-    <div class="card"><h2>${icon("monitor")}קו הטלפון (ימות)</h2>
-      <div class="setting"><div class="txt"><b>בפועל בקו</b><span id="phoneLine">בודק…</span></div>
-        <button class="btn ghost" type="button" onclick="renderPhone.at=0;renderPhone()">רענן</button></div>
-      <div id="phoneInfo"></div>
-      <form data-action="/channels/add" style="margin-top:14px">
-        <input type="hidden" name="yemot" value="on"><input type="hidden" name="mode" value="m4a">
-        <input type="hidden" name="skipShorts" value="on">
-        <div class="cbar">
-          <input name="channel" placeholder="קישור לערוץ או פלייליסט להעלאה לקו" required style="flex:1;min-width:200px">
-          <label class="check" style="margin:0"><input type="checkbox" name="req">לבקשה בטלפון בלבד (לא מעלה לבד)</label>
-          <label class="field" style="margin:0">אורך פרק מלא (דקות) <input name="minMinutes" type="number" min="0" value="40" style="width:70px"></label>
-          <label class="field" style="margin:0">להעלות עכשיו את האחרונים <input name="backfill" type="number" min="0" max="15" value="3" style="width:70px"></label>
-          <button class="btn">${icon("add")}<span>הוסף לקו</span></button>
+    <div class="seg" id="phSeg">
+      <button type="button" data-pt="ov" class="on">סקירה</button><button type="button" data-pt="ch">ערוצים</button><button type="button" data-pt="fl">קבצים בקו</button><button type="button" data-pt="rq">בקשות</button><button type="button" data-pt="cf">הגדרות</button>
+    </div>
+
+    <div data-pp="ov">
+      <div class="cols" id="phTiles"></div>
+      <div class="card"><h2>${icon("queue")}פעילות אחרונה בקו</h2><div id="phoneJobs"></div></div>
+    </div>
+
+    <div data-pp="ch" class="hidden">
+      <div class="card"><h2>${icon("add")}הוספת ערוץ או פלייליסט לקו</h2>
+        <form data-action="/channels/add">
+          <input type="hidden" name="yemot" value="on"><input type="hidden" name="mode" value="m4a"><input type="hidden" name="skipShorts" value="on">
+          <div class="cbar">
+            <input name="channel" placeholder="קישור לערוץ או לפלייליסט" required style="flex:1;min-width:220px">
+            <label class="check" style="margin:0"><input type="checkbox" name="req">לבקשה בטלפון בלבד</label>
+            <label class="field" style="margin:0">פרק מלא (דק׳) <input name="minMinutes" type="number" min="0" value="40" style="width:70px"></label>
+            <label class="field" style="margin:0">להעלות עכשיו <input name="backfill" type="number" min="0" max="15" value="3" style="width:70px"></label>
+            <button class="btn">${icon("add")}<span>הוסף</span></button>
+          </div>
+        </form>
+        <div class="cbar" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line)">
+          <a class="btn ghost" href="${BASE}/phone/export" download>ייצוא לקובץ</a>
+          <label class="btn ghost" style="cursor:pointer">ייבוא מקובץ<input type="file" id="phoneImp" accept=".txt,text/plain" hidden></label>
+          <span class="sub" style="margin:0">הקובץ נערך ב-Gemini לפי ההסבר שבראשו, ומוחזר לכאן.</span>
         </div>
-      </form></div>
-    <div class="card"><h2>${icon("channels")}ערוצים בקו</h2>
-      <p class="sub">אוטומטי = מעלה לבד לשלוחה 8 · לבקשה = מופיע רק ברשימת הבקשות בטלפון (שלוחה 7).</p>
-      <div id="phoneChans"></div>
-      <div class="cbar" style="margin-top:12px"><a class="btn ghost" href="${BASE}/phone/export" download>ייצוא לקובץ</a>
-        <label class="btn ghost" style="cursor:pointer">ייבוא מקובץ<input type="file" id="phoneImp" accept=".txt,text/plain" hidden></label></div></div>
-    <div class="card"><h2>${icon("layers")}שלוחות משנה של שלוחה 8</h2>
-      <p class="sub">שורה לכל שלוחה: <b>מספר = שם מוקרא | קטגוריות</b> (למשל <code>1 = ישיבישן | השקפה ישיבתית</code>). הסימן * = כל השאר, <code>#ידני</code> = מה שמעלים ידנית מלשונית ההוספה. ערוצי "אוטומטי" נכנסים לשלוחה של הקטגוריה שלהם. בלי שורות = שלוחה אחת כמו היום.</p>
-      <textarea id="subsText" rows="4" style="width:100%;direction:rtl" placeholder="1 = ישיבישן | השקפה ישיבתית&#10;2 = הפטריוטים | *&#10;3 = הועלה ידנית | #ידני"></textarea>
-      <div class="cbar" style="margin-top:8px"><button class="btn" id="subsSave" type="button">שמור</button><span class="sub" id="subsMsg" style="margin:0"></span></div></div>
-    <div class="card hidden" id="askCard"><h2>${icon("queue")}בקשה מהאתר</h2><div id="askList"></div></div>
-    <div class="card"><h2>${icon("queue")}בקשות מהטלפון</h2><div id="phoneReqs"></div></div>
-    <div class="card"><h2>${icon("trash")}קבצים בקו</h2>
-      <div class="setting"><div class="txt"><b>מה שמועלה לשלוחות 8 ו-7/2</b><span id="lineFilesInfo">לחצו טען</span></div>
-        <button class="btn ghost" type="button" id="lineFilesLoad">טען</button></div>
-      <div id="lineFiles"></div></div>
-    <div class="card"><h2>${icon("queue")}הפרקים האחרונים</h2>
-      <div id="phoneJobs"></div></div>
+      </div>
+      <div class="card"><h2>${icon("channels")}הערוצים בקו <span class="tag" id="phCount"></span></h2>
+        <div class="cbar" style="margin-bottom:8px"><input id="phFilter" placeholder="חיפוש ערוץ…" style="flex:1;min-width:160px">
+          <select id="phKind"><option value="">הכול</option><option value="auto">אוטומטי</option><option value="req">לבקשה</option></select></div>
+        <div id="phoneChans"></div></div>
+    </div>
+
+    <div data-pp="fl" class="hidden">
+      <div class="card"><h2>${icon("trash")}קבצים בקו</h2>
+        <div class="cbar" style="margin-bottom:8px"><select id="lfDir"><option value="">כל השלוחות</option></select>
+          <button class="btn ghost" type="button" id="lineFilesLoad">רענן</button><span class="sub" id="lineFilesInfo" style="margin:0">לחצו רענן</span></div>
+        <div id="lineFiles"></div></div>
+    </div>
+
+    <div data-pp="rq" class="hidden">
+      <div class="card"><h2>${icon("queue")}בקשה מהאתר</h2>
+        <div class="cbar"><select id="askSel" style="flex:1;min-width:180px"></select><button class="btn" type="button" id="askGo">הצג סרטונים אחרונים</button></div>
+        <div id="askList" style="margin-top:8px"></div></div>
+      <div class="card"><h2>${icon("queue")}בקשות שהתקבלו</h2><p class="sub">מהטלפון ומהאתר. מגיעות לשלוחה 7/2.</p><div id="phoneReqs"></div></div>
+    </div>
+
+    <div data-pp="cf" class="hidden">
+      <div class="card"><h2>${icon("layers")}שלוחות משנה של שלוחה 8</h2>
+        <p class="sub">שורה לכל שלוחה: <b>מספר = שם מוקרא | קטגוריות</b>. <code>*</code> = כל השאר, <code>#ידני</code> = מה שמעלים ידנית מלשונית ההוספה. ערוצי "אוטומטי" נכנסים לשלוחה של הקטגוריה שלהם. בלי שורות = שלוחה אחת.</p>
+        <textarea id="subsText" rows="4" style="width:100%;direction:rtl" placeholder="1 = ישיבישן | השקפה ישיבתית&#10;2 = הפטריוטים | *&#10;3 = הועלה ידנית | #ידני"></textarea>
+        <div class="cbar" style="margin-top:8px"><button class="btn" id="subsSave" type="button">שמור</button><span class="sub" id="subsMsg" style="margin:0"></span></div></div>
+      <div class="card"><h2>${icon("clock")}איך הקו עובד</h2>
+        <div class="setting"><div class="txt"><b>העלאה אוטומטית</b><span>בדיקה ב-22:40, 23:00, 23:10 ו-23:20 (שעון ישראל) וגם כל 3 שעות. ערוץ חדש: הבדיקה הראשונה רק קובעת נקודת התחלה.</span></div></div>
+        <div class="setting"><div class="txt"><b>בטלפון</b><span>שלוחה 8: תפריט שלוחות המשנה · בזמן השמעה: 1 = בקשה (שלוחה 7), 2 = האזנה לבקשות (7/2).</span></div></div>
+        <div class="setting"><div class="txt"><b>בקשה בטלפון</b><span>קוד גישה → "האחרונים מכל הערוצים" (1 מבקש, 2 הבא, 3 הקודם, 0 יציאה) · בחירת ערוץ · חיפוש בדיבור. אם יש כמה קטגוריות, קודם בוחרים קטגוריה.</span></div></div>
+        <div class="setting"><div class="txt"><b>Secrets נדרשים ב-Cloudflare</b><span>YEMOT_PIN (קוד גישה), YEMOT_USER ו-YEMOT_PASS (לרשימת הקבצים ולמחיקה). ב-Render: YEMOT_USER, YEMOT_PASS, YEMOT_PATH.</span></div></div>
+      </div>
+    </div>
   </section>
 
   <section data-p="logs" class="hidden">
@@ -2526,15 +2553,7 @@ document.addEventListener("click", async (e) => {
       d.append("minMinutes", c.minMinutes || 0); if (c.skipShorts) d.append("skipShorts", "on");
       await post("/jobs/batch", d); toast("נוסף לתור"); showPage("queue"); refresh(); return;
     }
-    if (act === "phask") {
-      $("askCard").classList.remove("hidden"); $("askList").textContent = "טוען…";
-      const r = await (await fetch(B + "/yemot/feed?id=" + encodeURIComponent(id), { cache: "no-store" })).json();
-      if (r.error) { $("askList").textContent = r.error; return; }
-      $("askList").innerHTML = '<div class="sub">' + esc(r.name) + " — הסרטונים האחרונים. הבקשה עולה לשלוחה 7/2</div>" +
-        r.entries.map((v) => '<div class="setting"><div class="txt"><b>' + esc(v.title) + '</b><span>' + esc((v.published || "").slice(0, 10)) +
-          '</span></div><button class="btn ghost" type="button" data-ask="' + esc(v.videoId) + '" data-ch="' + esc(id) + '">בקש לקו</button></div>').join("");
-      $("askCard").scrollIntoView({ behavior: "smooth" }); return;
-    }
+    if (act === "phask") { await askFor(id); return; }
     if (act === "phmode") {
       const m = prompt("סוג הערוץ בקו: 1 = העלאה אוטומטית, 2 = לבקשה בטלפון בלבד, 3 = שניהם", "2"); if (!m) return;
       const mode = { 1: "auto", 2: "req", 3: "both" }[m.trim()]; if (!mode) return;
@@ -2644,65 +2663,127 @@ document.addEventListener("click", async (e) => {
 });
 
 // ---------- phone line (Yemot) ----------
+function phTab(t) {
+  document.querySelectorAll("#phSeg button").forEach((b) => b.classList.toggle("on", b.dataset.pt === t));
+  document.querySelectorAll("[data-pp]").forEach((d) => d.classList.toggle("hidden", d.dataset.pp !== t));
+  try { localStorage.setItem("phtab", t); } catch (e) {}
+  if (t === "fl" && !phTab.files) { phTab.files = 1; loadLineFiles(); }
+}
+document.querySelectorAll("#phSeg button").forEach((b) => b.onclick = () => phTab(b.dataset.pt));
+try { const t = localStorage.getItem("phtab"); if (t) phTab(t); } catch (e) {}
+function nextCheck() {
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date());
+  const g = (t) => parseInt((parts.find((x) => x.type === t) || {}).value || "0", 10);
+  const now = (g("hour") % 24) * 60 + g("minute");
+  const slots = [22 * 60 + 40, 23 * 60, 23 * 60 + 10, 23 * 60 + 20];
+  const nx = slots.find((m) => m > now);
+  return nx ? "היום ב-" + String(Math.floor(nx / 60)).padStart(2, "0") + ":" + String(nx % 60).padStart(2, "0") : "מחר ב-22:40";
+}
 function renderPhone() {
   if (!(S.profile && S.profile.admin)) return;
   if (!renderPhone.subs) { renderPhone.subs = 1; loadSubs(); }
-  const chs = S.channels.filter((c) => c.yemot), jobs = S.jobs.filter((j) => j.yemot);
-  const reqs = jobs.filter((j) => /\\/7\\//.test(j.yemotPath || ""));
-  const pc = S.channels.filter((c) => c.yemot || c.req);
-  const kind = (c) => (c.yemot && c.req ? "אוטומטי + לבקשה" : c.req ? "לבקשה בטלפון בלבד" : "העלאה אוטומטית");
-  $("phoneChans").innerHTML = pc.length ? pc.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>' + kind(c) +
-    (c.cat ? " · " + esc(c.cat) : "") + (c.minMinutes ? " · פרק מלא " + c.minMinutes + " דק׳+" : "") + '</span></div><span style="display:flex;gap:6px">' +
-    btn("phauto", c.id, "zap", "העלאה אוטומטית") + btn("phreq", c.id, "monitor", "לבקשה בלבד") + btn("phboth", c.id, "layers", "אוטומטי + לבקשה") +
-    btn("phcat", c.id, "layers", "קטגוריה") + btn("phask", c.id, "queue", "בקש סרטון לקו") + btn("phmin", c.id, "clock", "אורך פרק מלא") + btn("remove", c.id, "trash", "הסר", "danger") + '</span></div>').join("")
-    : '<div class="sub" style="margin:0">אין ערוצים מחוברים לקו.</div>';
-  $("phoneReqs").innerHTML = reqs.length ? reqs.slice(0, 15).map((j) => mini("", j.title, ago(j.updated) + (j.status === "failed" ? " · " + esc(j.error || "נכשל") : ""), badgeOf(j.status))).join("")
-    : '<div class="sub" style="margin:0">עוד לא התבקשו סרטונים בטלפון.</div>';
+  const all = S.channels.filter((c) => c.yemot || c.req), jobs = S.jobs.filter((j) => j.yemot);
+  const auto = all.filter((c) => c.yemot), reqCh = all.filter((c) => c.req);
+  const reqs = jobs.filter((j) => (j.yemotPath || "").indexOf("/7/") >= 0);
   const last = jobs.find((j) => j.status === "done");
   const busy = jobs.filter((j) => ["queued", "taken"].includes(j.status)).length;
-  const fullMin = Math.max(0, ...chs.map((c) => c.minMinutes || 0));
+  const failed = jobs.filter((j) => j.status === "failed").length;
+  const fullMin = Math.max(0, ...auto.map((c) => c.minMinutes || 0));
   const today = new Date().toDateString();
   const fullToday = fullMin && jobs.some((j) => j.status === "done" && new Date(j.updated).toDateString() === today &&
-    +((String(j.error || "").match(/(\d+) דק/) || [])[1] || 0) >= fullMin);
-  $("phoneInfo").innerHTML = chs.length
-    ? chs.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>נבדק ב-22:40, 23:00, 23:10 ו-23:20, וגם כל 3 שעות · ' + "מעלה את כל מה שעולה" + (c.minMinutes ? " · פרק מלא = " + c.minMinutes + " דקות ומעלה" : "") + ' · לשינוי: מוסיפים שוב עם אורך אחר</span></div>' + btn("remove", c.id, "trash", "הסר מהקו", "danger") + '</div>').join("") +
-      '<div class="setting"><div class="txt"><b>מצב</b><span>' +
-      (busy ? busy + " בדרך (הורדה/העלאה)" : "אין כרגע פרק בדרך") + " · " +
-      (last ? "הועלה לאחרונה " + ago(last.updated) + " — " + esc(last.title) : "עוד לא הועלה פרק") + '</span></div></div>' +
-      (fullMin ? '<div class="setting"><div class="txt"><b>הפרק המלא של היום</b><span>' +
-        (fullToday ? "✓ עלה (" + fullMin + " דקות ומעלה)" : "עדיין לא עלה — הבדיקה ממשיכה כל 3 שעות") + '</span></div></div>' : "")
-    : '<div class="sub" style="margin:0">אין עדיין מעקב מחובר לקו. בעמוד "ערוצים" מוסיפים ערוץ/פלייליסט ומסמנים "העלאה לקו הטלפון".</div>';
+    +((String(j.error || "").match(/(\\d+) דק/) || [])[1] || 0) >= fullMin);
+  const tile = (t, v, sub) => '<div class="card"><div class="sub" style="margin:0 0 4px">' + t + '</div><div style="font-size:1.05rem;font-weight:600">' + v + '</div><div class="sub" style="margin:4px 0 0">' + sub + "</div></div>";
+  $("phTiles").innerHTML =
+    tile("בקו עכשיו", '<span id="phoneLine">' + (renderPhone.line || "בודק…") + "</span>", '<a href="#" id="phRefresh" style="color:var(--primary)">רענן</a> · <a href="#" id="phFiles" style="color:var(--primary)">ניהול קבצים</a>') +
+    tile("מצב", busy ? busy + " בדרך" : "אין פרק בדרך", (last ? "הועלה לאחרונה " + ago(last.updated) + " — " + esc(last.title) : "עוד לא הועלה פרק") + (failed ? ' · <span class="bad">' + failed + " נכשלו</span>" : "")) +
+    tile("הבדיקה האוטומטית הבאה", nextCheck(), auto.length + " ערוצי אוטומטי · " + reqCh.length + " ערוצי בקשה") +
+    tile("הפרק המלא של היום", fullMin ? (fullToday ? "✓ עלה" : "עדיין לא") : "לא מוגדר", fullMin ? "פרק מלא = " + fullMin + " דק׳ ומעלה · הבדיקה ממשיכה כל 3 שעות" : "אין ערוץ עם אורך פרק מלא") +
+    tile("בקשות", reqs.length + " אחרונות", "מהטלפון ומהאתר · בשלוחה 7/2");
+  $("phRefresh").onclick = (e) => { e.preventDefault(); renderPhone.at = 0; renderPhone(); };
+  $("phFiles").onclick = (e) => { e.preventDefault(); phTab("fl"); };
+
+  // Channels: grouped by category, filtered by search and kind.
+  const q = ($("phFilter").value || "").trim().toLowerCase(), kf = $("phKind").value;
+  const kind = (c) => (c.yemot && c.req ? "אוטומטי + לבקשה" : c.req ? "לבקשה" : "אוטומטי");
+  const shown = all.filter((c) => (!q || (c.name || "").toLowerCase().indexOf(q) >= 0) && (!kf || (kf === "auto" ? c.yemot : c.req)));
+  $("phCount").textContent = shown.length + (shown.length !== all.length ? " מתוך " + all.length : "");
+  const by = {}; shown.forEach((c) => (by[c.cat || "כללי"] = by[c.cat || "כללי"] || []).push(c));
+  const row = (c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>' + kind(c) +
+    (c.folder ? " · שלוחה " + esc(c.folder.split("/").pop()) + (renderPhone.labels && renderPhone.labels[c.folder.split("/").pop()] ? " (" + esc(renderPhone.labels[c.folder.split("/").pop()]) + ")" : "") : "") +
+    (c.minMinutes && c.yemot ? " · פרק מלא " + c.minMinutes + " דק׳+" : "") + '</span></div><span style="display:flex;gap:6px;flex-wrap:wrap">' +
+    btn("phauto", c.id, "zap", "העלאה אוטומטית") + btn("phreq", c.id, "monitor", "לבקשה בלבד") + btn("phboth", c.id, "layers", "אוטומטי + לבקשה") +
+    btn("phcat", c.id, "layers", "קטגוריה") + btn("phask", c.id, "queue", "בקש סרטון לקו") + btn("phmin", c.id, "clock", "אורך פרק מלא") + btn("remove", c.id, "trash", "הסר", "danger") + "</span></div>";
+  $("phoneChans").innerHTML = shown.length ? Object.keys(by).map((k) => '<div class="sub" style="margin:12px 0 2px"><b>' + esc(k) + '</b> <span class="tag">' + by[k].length + "</span></div>" + by[k].map(row).join("")).join("")
+    : '<div class="sub" style="margin:0">' + (all.length ? "אין ערוצים שמתאימים לחיפוש." : "אין עדיין ערוצים בקו. מוסיפים למעלה או מייבאים קובץ.") + "</div>";
+
+  $("phoneReqs").innerHTML = reqs.length ? reqs.slice(0, 20).map((j) => mini("", j.title, ago(j.updated) + (j.status === "failed" ? " · " + esc(j.error || "נכשל") : ""), badgeOf(j.status))).join("")
+    : '<div class="sub" style="margin:0">עוד לא התבקשו סרטונים.</div>';
+  const sel = $("askSel"), cur = sel.value;
+  sel.innerHTML = reqCh.map((c) => '<option value="' + esc(c.id) + '">' + esc(c.name) + "</option>").join("") || '<option value="">אין ערוצי בקשה</option>';
+  if (cur) sel.value = cur;
+  $("phoneJobs").innerHTML = jobs.length ? jobs.slice(0, 15).map((j) =>
+    mini("", j.title, ago(j.updated) + (j.status === "done" ? " · " + esc(j.error || "הועלה") : j.status === "failed" ? ' · <span class="bad">' + esc(j.error || "נכשל") + "</span>" : ""),
+         badgeOf(j.status))).join("") : '<div class="sub" style="margin:0">אין עדיין פעילות.</div>';
+
   if (!renderPhone.at || Date.now() - renderPhone.at > 60000) {
     renderPhone.at = Date.now();
     fetch(B + "/yemot/files", { cache: "no-store" }).then((r) => r.json()).then((d) => {
-      $("phoneLine").innerHTML = d.error ? '<span class="bad">' + esc(d.error) + "</span>"
-        : "בשלוחה " + esc(d.path) + " יש <b>" + d.count + "</b> קבצים" + (d.files.length ? " · האחרון: " + esc(d.files[0].name) + " " + esc(d.files[0].mtime) : "");
-    }).catch(() => { $("phoneLine").textContent = "לא ניתן לבדוק"; });
+      renderPhone.line = d.error ? '<span class="bad">' + esc(d.error) + "</span>"
+        : "<b>" + d.count + "</b> קבצים בשלוחה " + esc(d.path) + (d.files.length ? " · האחרון " + esc(d.files[0].mtime) : "");
+      if ($("phoneLine")) $("phoneLine").innerHTML = renderPhone.line;
+    }).catch(() => { if ($("phoneLine")) $("phoneLine").textContent = "לא ניתן לבדוק"; });
   }
-  $("phoneJobs").innerHTML = jobs.length ? jobs.slice(0, 15).map((j) =>
-    mini("", j.title, ago(j.updated) + (j.status === "done" ? " · " + esc(j.error || "הועלה") : j.status === "failed" ? ' · <span class="bad">' + esc(j.error || "נכשל") + "</span>" : ""),
-         badgeOf(j.status))).join("") : '<div class="sub" style="margin:0">אין עדיין פרקים.</div>';
 }
+$("phFilter").oninput = () => renderPhone();
+$("phKind").onchange = () => renderPhone();
+async function askFor(id) {
+  if (!id) return;
+  phTab("rq"); $("askList").textContent = "טוען…";
+  const r = await (await fetch(B + "/yemot/feed?id=" + encodeURIComponent(id), { cache: "no-store" })).json();
+  if (r.error) { $("askList").textContent = r.error; return; }
+  $("askList").innerHTML = '<div class="sub">' + esc(r.name) + " — הסרטונים האחרונים. הבקשה עולה לשלוחה 7/2</div>" +
+    r.entries.map((v) => '<div class="setting"><div class="txt"><b>' + esc(v.title) + '</b><span>' + esc((v.published || "").slice(0, 10)) +
+      '</span></div><button class="btn ghost" type="button" data-ask="' + esc(v.videoId) + '" data-ch="' + esc(id) + '">בקש לקו</button></div>').join("");
+}
+$("askGo").onclick = () => askFor($("askSel").value);
 
 async function loadLineFiles() {
   $("lineFilesInfo").textContent = "טוען…";
   try {
     const d = await (await fetch(B + "/yemot/ls", { cache: "no-store" })).json();
     if (d.error) { $("lineFilesInfo").innerHTML = '<span class="bad">' + esc(d.error) + "</span>"; return; }
-    $("lineFilesInfo").textContent = d.files.length + " קבצים";
-    // The line only knows numbered names (001.wav); the real titles come from the jobs that uploaded them.
-    const titles = {};
-    S.jobs.filter((j) => j.yemot && j.status === "done").forEach((j) => {
-      const m = String(j.error || "").match(/ivr2?[:/]*\\/?([\\d/]+?)\\/(\\d+\\.\\w+)/);
-      if (m && !titles[m[1] + "/" + m[2]]) titles[m[1] + "/" + m[2]] = j.title;
-    });
-    const real = (f) => titles[String(f.dir).replace(/^ivr2?[:/]*\\/?/, "") + "/" + f.name];
-    $("lineFiles").innerHTML = d.files.map((f) => '<div class="setting"><div class="txt"><b>' + esc(real(f) || f.name) + '</b><span>' + (real(f) ? esc(f.name) + " · " : "") + esc(f.dir) + " · " +
-      Math.round(f.size / 1024) + " KB · " + esc(f.mtime) + '</span></div><button class="ibtn danger" data-lf="' + esc(f.name) + '" data-dir="' + esc(f.dir) + '" title="מחק">' + icon("trash") + "</button></div>").join("");
+    loadLineFiles.data = d;
+    const sel = $("lfDir"), cur = sel.value;
+    sel.innerHTML = '<option value="">כל השלוחות (' + d.files.length + ")</option>" + d.dirs.map((x) => '<option value="' + esc(x) + '">' + esc(x) + " (" + d.files.filter((f) => f.dir === x).length + ")</option>").join("");
+    sel.value = cur;
+    showLineFiles();
   } catch (e) { $("lineFilesInfo").textContent = "שגיאה: " + e; }
 }
+function showLineFiles() {
+  const d = loadLineFiles.data; if (!d) return;
+  const dir = $("lfDir").value, files = d.files.filter((f) => !dir || f.dir === dir);
+  $("lineFilesInfo").textContent = files.length + " קבצים";
+  // The line only knows numbered names (001.wav); the real titles come from the jobs that uploaded them.
+  const titles = {};
+  S.jobs.filter((j) => j.yemot && j.status === "done").forEach((j) => {
+    const m = String(j.error || "").match(/ivr2?[:/]*\\/?([\\d/]+?)\\/(\\d+\\.\\w+)/);
+    if (m && !titles[m[1] + "/" + m[2]]) titles[m[1] + "/" + m[2]] = j.title;
+  });
+  const real = (f) => titles[String(f.dir).replace(/^ivr2?[:/]*\\/?/, "") + "/" + f.name];
+  $("lineFiles").innerHTML = files.length ? files.map((f) => '<div class="setting"><div class="txt"><b>' + esc(real(f) || f.name) + '</b><span>' + (real(f) ? esc(f.name) + " · " : "") + esc(f.dir) + " · " +
+    Math.round(f.size / 1024) + " KB · " + esc(f.mtime) + '</span></div><button class="ibtn danger" data-lf="' + esc(f.name) + '" data-dir="' + esc(f.dir) + '" title="מחק">' + icon("trash") + "</button></div>").join("")
+    : '<div class="sub" style="margin:0">אין קבצים.</div>';
+}
+$("lfDir").onchange = showLineFiles;
 $("lineFilesLoad").onclick = loadLineFiles;
-async function loadSubs() { try { $("subsText").value = (await (await fetch(B + "/phone/cfg", { cache: "no-store" })).json()).text || ""; } catch (e) {} }
+async function loadSubs() {
+  try {
+    const t = (await (await fetch(B + "/phone/cfg", { cache: "no-store" })).json()).text || "";
+    $("subsText").value = t; renderPhone.labels = {};
+    t.split("\\n").forEach((l) => { const m = l.match(/^(\\d+)\\s*=\\s*([^|]+)/); if (m) renderPhone.labels[m[1]] = m[2].trim(); });
+    if (S.channels) renderPhone();
+  } catch (e) {}
+}
 $("subsSave").onclick = async () => {
   const d = new FormData(); d.append("text", $("subsText").value);
   try { const r = await (await post("/phone/cfg", d)).json(); $("subsText").value = r.text; $("subsMsg").textContent = "נשמר ✓ — ערוצי האוטומטי הופנו מחדש"; refresh(); }
