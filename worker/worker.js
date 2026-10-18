@@ -232,6 +232,9 @@ function videoFromUrl(line) {
   }
   return null;
 }
+// "Upload to the phone line" on a one-off add: admin only; fetched as fast audio.
+const wantsYemot = (f, env) => f.get("yemot") === "on" && (env.PROFILE || "main") === "main";
+
 // A link is YouTube (the only source allowed for NetFree-restricted profiles).
 function isYouTubeUrl(u) { return /youtube\.com|youtu\.be/.test(u || ""); }
 // Adult/porn sites are blocked for everyone, before a link enters the queue.
@@ -751,7 +754,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const fresh = (b.items || []).filter((it) => it.videoId && !known.has(it.videoId)).map((it) => ({
         videoId: it.videoId, channelId: b.channelId || "", channelName: b.channelName || "",
         title: it.title || it.videoId, published: "", url: it.url || ("https://www.youtube.com/watch?v=" + it.videoId),
-        source: it.source || b.source || "", mode: modeOf(b.mode), minMinutes: b.minMinutes || 0,
+        source: it.source || b.source || "", mode: b.yemot ? "m4a" : modeOf(b.mode), minMinutes: b.minMinutes || 0,
+        ...(b.yemot ? { yemot: true } : {}),
         status: "queued", updated: new Date().toISOString(),
         ...(it.group ? { group: String(it.group), rank: +it.rank || 0 } : {}) }));
       if (b.priority) fresh.forEach((j) => { j.priority = b.priority; });
@@ -1225,7 +1229,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         title: `${count} סרטונים אחרונים מ-${name}`,
         // the "videos" tab has no Shorts; the uploads playlist (UU…) has everything
         url: skipShorts ? `https://www.youtube.com/channel/${id}/videos` : `https://www.youtube.com/playlist?list=UU${id.slice(2)}`,
-        count, mode: modeOf(f.get("mode")), minMinutes: Math.max(0, parseInt(f.get("minMinutes") || "0", 10) || 0),
+        count, mode: wantsYemot(f, env) ? "m4a" : modeOf(f.get("mode")), minMinutes: Math.max(0, parseInt(f.get("minMinutes") || "0", 10) || 0),
+        ...(wantsYemot(f, env) ? { yemot: true } : {}),
         status: "queued", priority: Date.now(), updated: new Date().toISOString() }]);
       await addLog(env, "worker", `בקשה: ${count} סרטונים מ-${name}`);
       wake();
@@ -1239,8 +1244,10 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const lines = String(f.get("lines") || "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#")).slice(0, 300);
       const now = Date.now(), jobs = [];
       const ttBlocked = (await profileInfo(env, env.PROFILE)).netfree;
+      const ym = wantsYemot(f, env);
       lines.forEach((line, i) => {
-        const base = { mode, minMinutes, status: "queued", updated: new Date().toISOString(), priority: now - i };
+        const base = { mode: ym ? "m4a" : mode, minMinutes, status: "queued", updated: new Date().toISOString(), priority: now - i,
+                       ...(ym ? { yemot: true } : {}) };
         if (/^https?:\/\//.test(line) && adultBlocked(line)) return;   // adult sites blocked for everyone
         const v = videoFromUrl(line);
         const pl = line.match(/[?&]list=([\w-]+)/);
@@ -1332,7 +1339,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (v) {
         await addJobs(env, [{
           videoId: v.videoId, channelId: "", channelName: "ידני", title: v.videoId, source: v.source,
-          published: "", url: v.url, mode: modeOf(f.get("mode")), minMinutes: 0,
+          published: "", url: v.url, mode: wantsYemot(f, env) ? "m4a" : modeOf(f.get("mode")), minMinutes: 0,
+          ...(wantsYemot(f, env) ? { yemot: true } : {}),
           status: "queued", updated: new Date().toISOString() }]);
         wake();
       }
@@ -1725,6 +1733,7 @@ async function dashboard(env) {
         <div class="grid">
           <label class="field wide">קישור<input name="url" placeholder="קישור מיוטיוב, טיקטוק, אינסטגרם, X, וימאו ועוד…" required></label>
           <label class="field">סוג<select name="mode">${modeOptions}</select></label>
+          <label class="check ymtOnly hidden" style="padding:6px 0"><input type="checkbox" name="yemot">העלאה לקו הטלפון (ימות)</label>
         </div>
         <div class="actions-row"><button class="btn">${icon("add")}<span>הוסף לתור</span></button></div>
       </form>
@@ -1734,6 +1743,7 @@ async function dashboard(env) {
           <label class="field wide">הרשימה<textarea name="lines" rows="6" required placeholder="נפתלי קמפה - גרש את העצבות&#10;https://www.youtube.com/watch?v=…&#10;מוטי וייס - רפ״ב"></textarea></label>
           <label class="field">סוג<select name="mode">${modeOptions}</select></label>
           <label class="field">אורך מינימלי (דקות)<input name="minMinutes" type="number" min="0" value="0"></label>
+          <label class="check ymtOnly hidden" style="align-self:end;padding-bottom:10px"><input type="checkbox" name="yemot">העלאה לקו הטלפון (ימות)</label>
         </div>
         <div class="actions-row"><button class="btn">${icon("download")}<span>הורד את הרשימה</span></button></div>
       </form>
@@ -1745,6 +1755,7 @@ async function dashboard(env) {
           <label class="field">סוג<select name="mode">${modeOptions}</select></label>
           <label class="field">אורך מינימלי (דקות)<input name="minMinutes" type="number" min="0" value="0"></label>
           <label class="check" style="align-self:end;padding-bottom:10px"><input type="checkbox" name="skipShorts" checked>בלי Shorts</label>
+          <label class="check ymtOnly hidden" style="align-self:end;padding-bottom:10px"><input type="checkbox" name="yemot">העלאה לקו הטלפון (ימות)</label>
         </div>
         <div class="actions-row"><button class="btn">${icon("download")}<span>הורד</span></button></div>
       </form>
