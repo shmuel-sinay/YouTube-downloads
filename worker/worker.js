@@ -389,9 +389,34 @@ function jobFor(ch, e) {
     videoId: e.videoId, channelId: ch.id, channelName: ch.name, title: e.title,
     published: e.published, url: "https://www.youtube.com/watch?v=" + e.videoId,
     mode: ch.yemot ? "m4a" : ch.mode, minMinutes: ch.yemot ? 0 : ch.minMinutes, status: "queued",
-    ...(ch.yemot ? { yemot: true } : {}),
+    ...(ch.yemot ? { yemot: true } : {}), ...(ch.yemot && ch.folder ? { yemotPath: ch.folder } : {}),
     updated: new Date().toISOString(),
   };
+}
+
+// Phone line sub-extensions of ext 8: "N = spoken label | category, category" ("*" = everything else).
+function parseSubs(text) {
+  const subs = [];
+  for (const raw of String(text).split(/\r?\n/)) {
+    const m = raw.trim().match(/^@?(?:שלוחה\s*)?(\d{1,2})\s*=\s*([^|]+?)\s*(?:\|\s*(.*))?$/);
+    if (!m) continue;
+    const cats = (m[3] || "").split(",").map((x) => x.trim()).filter(Boolean);
+    subs.push({ n: m[1], label: m[2].trim().slice(0, 30), cats: cats.filter((x) => x !== "*"), rest: cats.includes("*") });
+  }
+  return subs;
+}
+const subsText = (subs) => (subs || []).map((x) => x.n + " = " + x.label + " | " + (x.cats.concat(x.rest ? ["*"] : [])).join(", ")).join("\n");
+// Where a channel's automatic uploads go: its category's sub-extension, else the "rest" one, else the base folder.
+function folderFor(base, subs, cat) {
+  const sub = (subs || []).find((x) => cat && x.cats.includes(cat)) || (subs || []).find((x) => x.rest);
+  return sub ? base + "/" + sub.n : "";
+}
+async function applyFolders(env, channels) {
+  const cfg = await getJSON(env, "phonecfg", { subs: [] }), base = env.YEMOT_PATH || "ivr2:/8";
+  for (const c of channels) {
+    const f = c.yemot ? folderFor(base, cfg.subs, c.cat) : "";
+    if (f) c.folder = f; else delete c.folder;
+  }
 }
 
 async function checkChannel(env, ch, notes) {
@@ -830,6 +855,15 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   // Dialog: access code → channel → video; then the video is queued for the
   // phone line. Answers are plain text in Yemot's grammar ("read=…", "id_list_message=…").
   // Needs the Worker secret YEMOT_PIN. Each call returns one step.
+  // Extension 8 (type=api): spoken menu of the sub-extensions, then straight into the chosen one.
+  if (p === "/yemot/menu8") {
+    const q = url.searchParams, T = (t) => new Response(t, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    const subs = (await getJSON(profileEnv(env, "main"), "phonecfg", { subs: [] })).subs || [];
+    if (!subs.length) return T("id_list_message=t-השירות לא מוגדר&go_to_folder=hangup");
+    if (!q.has("M8")) return T("read=t-" + subs.map((x) => "ל" + x.label.replace(/[^\w\u0590-\u05FF ]/g, " ") + " הקישו " + x.n).join(" ") + "=M8,,1,1,7,Digits,yes,no,,,,,,,no");
+    const sub = subs.find((x) => x.n === q.get("M8"));
+    return T(sub ? "go_to_folder=/8/" + sub.n : "id_list_message=t-בחירה שגויה&go_to_folder=hangup");
+  }
   if (p === "/yemot/req") {
     const q = url.searchParams;
     const T = (t) => new Response(t, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
@@ -1228,6 +1262,18 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       return json({ path, count: files.length, files: files.slice(-8).reverse() });
     } catch (e) { return json({ error: "אין תשובה מימות: " + (e.message || e) }); }
   }
+  // --- sub-extensions of ext 8 (admin): read / save "N = label | categories", re-aim all auto channels ---
+  if (p === "/phone/cfg" && pid === "main") {
+    if (req.method === "POST") {
+      const subs = parseSubs((await req.formData()).get("text") || "");
+      await putJSON(rootEnv, "phonecfg", { subs });
+      const chs = await getChannels(rootEnv);
+      await applyFolders(rootEnv, chs);
+      await putJSON(rootEnv, "channels", chs);
+      await addLog(rootEnv, "worker", "שלוחות משנה של 8 עודכנו: " + subs.map((x) => x.n + "=" + x.label).join(", "));
+    }
+    return json({ text: subsText((await getJSON(rootEnv, "phonecfg", { subs: [] })).subs) });
+  }
   // --- export / import of the phone channel list as a text file (to be edited by Gemini or by hand) ---
   if (p === "/phone/export" && pid === "main") {
     const chs = (await getChannels(rootEnv)).filter((c) => c.yemot || c.req), by = {};
@@ -1248,6 +1294,9 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       "#       both = גם אוטומטי וגם זמין לבקשה.",
       "#       del  = להסיר את הערוץ מהקו. השתמש רק אם המשתמש ביקש להסיר ערוץ.",
       "#    דקות (לא חובה, מספר שלם): אורך מינימלי של פרק מלא, רלוונטי רק ל-auto/both. 0 או ריק = בלי.",
+      "# 2א. שלוחות משנה (אופציונלי, בראש הקובץ, לפני הקטגוריות): הקו מתפצל לשלוחות לפי נושא, וערוצי auto של קטגוריה נכנסים לשלוחה שלה ונשמרים שם תמיד.",
+      "#    פורמט שורה:  @שלוחה מספר = שם מוקרא | קטגוריה, קטגוריה   (למשל: @שלוחה 1 = ישיבישן | השקפה ישיבתית). הסימן * במקום קטגוריה = כל השאר. אפשר להשאיר בלי שורות כאלה.",
+      "#    רק קטגוריות שנכתבו או * מקבלות שלוחה משלהן. מספרים 1-9 ללא כפילות. הקטגוריה בשורת @שלוחה חייבת להיות זהה לשם בסוגריים המרובעים.",
       "# 3. שורה שמתחילה ב-# היא הערה ומתעלמים ממנה. שורות ריקות מותרות.",
       "#",
       "# כללים והגבלות:",
@@ -1260,7 +1309,9 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const body = Object.entries(by).map(([k, v]) => "[" + k + "]\n" + v.map((c) =>
       "https://www.youtube.com/" + (/^UC/.test(c.id) ? "channel/" : "playlist?list=") + c.id + " | " + c.name.replace(/\|/g, " ") + " | " +
       (c.yemot && c.req ? "both" : c.req ? "req" : "auto") + (c.minMinutes ? " | " + c.minMinutes : "")).join("\n")).join("\n\n");
-    return new Response(head.join("\n") + body + "\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Content-Disposition": "attachment; filename=phone-channels.txt" } });
+    const cur = subsText((await getJSON(rootEnv, "phonecfg", { subs: [] })).subs);
+    const subLines = cur ? cur.split("\n").map((l) => "@שלוחה " + l).join("\n") + "\n\n" : "";
+    return new Response(head.join("\n") + subLines + body + "\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Content-Disposition": "attachment; filename=phone-channels.txt" } });
   }
   if (p === "/phone/import" && req.method === "POST" && pid === "main") {
     const fd = await req.formData(), dry = fd.get("dry") === "1", text = String(fd.get("text") || ""), ids = [], addN = [], delN = [];
@@ -1296,6 +1347,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (cat && cat !== "כללי") c.cat = cat; else delete c.cat;
     }
     if (dry) return json({ added, upd, bad, dels, ids, addN, delN });
+    await applyFolders(rootEnv, channels);
     await putJSON(rootEnv, "channels", channels);
     await rootEnv.DB.delete("phonebrowse");
     await addLog(rootEnv, "worker", `ייבוא ערוצים לקו: ${added} חדשים, ${upd} עודכנו` + (bad ? `, ${bad} לא תקינים` : ""));
@@ -1338,7 +1390,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   // --- manage what is already on the phone line (admin): list / delete files of the two folders ---
   if ((p === "/yemot/ls" || p === "/yemot/rm") && pid === "main") {
     if (!(rootEnv.YEMOT_USER && rootEnv.YEMOT_PASS)) return json({ error: "חסרים Secrets בשם YEMOT_USER ו-YEMOT_PASS ב-Worker" });
-    const dirs = [rootEnv.YEMOT_PATH || "ivr2:/8", rootEnv.YEMOT_REQ_PATH || "ivr2:/7/2"];
+    const base = rootEnv.YEMOT_PATH || "ivr2:/8", subs = (await getJSON(rootEnv, "phonecfg", { subs: [] })).subs || [];
+    const dirs = [base, ...subs.map((x) => base + "/" + x.n), rootEnv.YEMOT_REQ_PATH || "ivr2:/7/2"];
     const tok = encodeURIComponent(rootEnv.YEMOT_USER + ":" + rootEnv.YEMOT_PASS);
     const call = async (api, qs) => (await fetch("https://www.call2all.co.il/ym/api/" + api + "?token=" + tok + "&" + qs, { signal: AbortSignal.timeout(20000) })).json();
     try {
@@ -1396,6 +1449,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         const mm = f.get("minMinutes");
         if (wantY && (!exist.yemot || (mm !== null && mm !== "" && +mm !== exist.minMinutes))) {
           exist.yemot = true;
+          await applyFolders(env, channels);
           if (mm !== null && mm !== "") exist.minMinutes = Math.max(0, parseInt(mm, 10) || 0);
           await putJSON(env, "channels", channels);
         }
@@ -1422,6 +1476,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         if (f.get("yemot") === "on" && (env.PROFILE || "main") === "main") ch.yemot = true;
         if (f.get("req") === "on" && (env.PROFILE || "main") === "main") { ch.req = true; ch.reqOnly = true; delete ch.yemot; }
         channels.push(ch);
+        await applyFolders(env, channels);
         await putJSON(env, "channels", channels);
         // Everything already on the channel counts as "seen" — except the
         // newest N, which are queued now if the user asked for a backfill.
@@ -1445,6 +1500,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       else if (m === "off") { delete c.yemot; delete c.req; delete c.reqOnly; }
       if (f.has("minMinutes")) c.minMinutes = Math.max(0, parseInt(f.get("minMinutes"), 10) || 0);
       if (f.has("cat")) { const v = String(f.get("cat")).trim().slice(0, 30); if (v) c.cat = v; else delete c.cat; }
+      await applyFolders(env, channels);
       await putJSON(env, "channels", channels);
       await env.DB.delete("phonebrowse");
       return json({ ok: true });
@@ -2066,6 +2122,10 @@ async function dashboard(env) {
       <div id="phoneChans"></div>
       <div class="cbar" style="margin-top:12px"><a class="btn ghost" href="${BASE}/phone/export" download>ייצוא לקובץ</a>
         <label class="btn ghost" style="cursor:pointer">ייבוא מקובץ<input type="file" id="phoneImp" accept=".txt,text/plain" hidden></label></div></div>
+    <div class="card"><h2>${icon("layers")}שלוחות משנה של שלוחה 8</h2>
+      <p class="sub">שורה לכל שלוחה: <b>מספר = שם מוקרא | קטגוריות</b> (למשל <code>1 = ישיבישן | השקפה ישיבתית</code>). הסימן * = כל השאר. ערוצי "אוטומטי" נכנסים לשלוחה של הקטגוריה שלהם. בלי שורות = שלוחה אחת כמו היום.</p>
+      <textarea id="subsText" rows="4" style="width:100%;direction:rtl" placeholder="1 = ישיבישן | השקפה ישיבתית&#10;2 = הפטריוטים | *"></textarea>
+      <div class="cbar" style="margin-top:8px"><button class="btn" id="subsSave" type="button">שמור</button><span class="sub" id="subsMsg" style="margin:0"></span></div></div>
     <div class="card hidden" id="askCard"><h2>${icon("queue")}בקשה מהאתר</h2><div id="askList"></div></div>
     <div class="card"><h2>${icon("queue")}בקשות מהטלפון</h2><div id="phoneReqs"></div></div>
     <div class="card"><h2>${icon("trash")}קבצים בקו</h2>
@@ -2556,6 +2616,7 @@ document.addEventListener("click", async (e) => {
 // ---------- phone line (Yemot) ----------
 function renderPhone() {
   if (!(S.profile && S.profile.admin)) return;
+  if (!renderPhone.subs) { renderPhone.subs = 1; loadSubs(); }
   const chs = S.channels.filter((c) => c.yemot), jobs = S.jobs.filter((j) => j.yemot);
   const reqs = jobs.filter((j) => /\\/7\\//.test(j.yemotPath || ""));
   const pc = S.channels.filter((c) => c.yemot || c.req);
@@ -2611,13 +2672,20 @@ async function loadLineFiles() {
   } catch (e) { $("lineFilesInfo").textContent = "שגיאה: " + e; }
 }
 $("lineFilesLoad").onclick = loadLineFiles;
+async function loadSubs() { try { $("subsText").value = (await (await fetch(B + "/phone/cfg", { cache: "no-store" })).json()).text || ""; } catch (e) {} }
+$("subsSave").onclick = async () => {
+  const d = new FormData(); d.append("text", $("subsText").value);
+  try { const r = await (await post("/phone/cfg", d)).json(); $("subsText").value = r.text; $("subsMsg").textContent = "נשמר ✓ — ערוצי האוטומטי הופנו מחדש"; refresh(); }
+  catch (x) { toast("שגיאה: " + x.message, 6000); }
+};
 $("phoneImp").onchange = async (e) => {
   const file = e.target.files[0]; if (!file) return;
   const lines = (await file.text()).split(/\\r?\\n/); e.target.value = "";
   // Sent in chunks of 20 channels (Worker limit per request) — so any number of channels works.
-  const chunks = []; let cat = "", cur = [];
+  const chunks = [], cfgLines = []; let cat = "", cur = [];
   for (const raw of lines) {
     const l = raw.trim(); if (!l || l[0] === "#") continue;
+    if (l[0] === "@") { cfgLines.push(l); continue; }
     if (/^\\[.+\\]$/.test(l)) { cat = l; continue; }
     if (!cur.length || cur.length >= 20 || cur.cat !== cat) { cur = []; cur.cat = cat; chunks.push(cur); }
     cur.push(l);
@@ -2647,7 +2715,7 @@ $("phoneImp").onchange = async (e) => {
         "<p><b class='bad'>ערוצים שיימחקו מהקו לפי הקובץ (" + delN.length + "):</b></p>" + (delN.length ? list(delN) : "<p class='sub'>אין</p>") +
         '<label class="check"><input type="checkbox" id="impPrune">הסר מהקו גם ערוצים שלא מופיעים בקובץ (' + notIn.length + ")</label>" +
         '<div id="impNot" class="hidden">' + list(notIn) + "</div>" +
-        "<p class='sub'>" + a + " ערוצים חדשים · " + u + " יעודכנו" + (b ? " · " + b + " שורות לא תקינות יידלגו" : "") + "</p>" +
+        (cfgLines.length ? "<p class='sub'><b>שלוחות משנה בקובץ:</b><br>" + cfgLines.map(esc).join("<br>") + "</p>" : "") + "<p class='sub'>" + a + " ערוצים חדשים · " + u + " יעודכנו" + (b ? " · " + b + " שורות לא תקינות יידלגו" : "") + "</p>" +
         '<div id="impAdd" class="hidden"><p><b>יתווספו (' + addN.length + "):</b></p>" + (addN.length ? list(addN) : "<p class='sub'>אין</p>") + "</div>" +
         '<div class="cbar"><button class="btn" id="impOk">אשר ייבוא</button><button class="btn ghost" id="impShow">הצג מה יתווסף</button><button class="btn ghost" id="impNo">בטל</button></div></div>';
       document.body.appendChild(ov);
@@ -2658,6 +2726,7 @@ $("phoneImp").onchange = async (e) => {
     });
     if (!ok) { toast("הייבוא בוטל"); return; }
     const rm = await send(false);
+    if (cfgLines.length) { const d = new FormData(); d.append("text", cfgLines.join("\\n")); await post("/phone/cfg", d); }
     toast("יובא: " + a + " חדשים, " + u + " עודכנו" + (b ? ", " + b + " לא תקינים" : "") + (dl ? ", " + dl + " הוסרו לפי הקובץ" : "") + (prune ? ", " + rm + " הוסרו" : ""), 9000); refresh();
   } catch (x) { toast("שגיאה: " + x.message, 8000); }
 };
