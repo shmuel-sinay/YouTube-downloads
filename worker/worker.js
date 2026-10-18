@@ -1215,6 +1215,22 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       return json({ path, count: files.length, files: files.slice(-8).reverse() });
     } catch (e) { return json({ error: "אין תשובה מימות: " + (e.message || e) }); }
   }
+  // --- request from the site: latest videos of a phone channel, and queue one for the request folder ---
+  if ((p === "/yemot/feed" || p === "/yemot/ask") && pid === "main") {
+    const f = p === "/yemot/ask" ? await req.formData() : null;
+    const ch = (await getChannels(rootEnv)).find((c) => c.id === String(f ? f.get("id") : url.searchParams.get("id")));
+    if (!ch) return json({ error: "אין ערוץ כזה" }, 404);
+    try {
+      const entries = (await readFeed(ch.id)).entries.filter((e) => !e.isShort);
+      if (!f) return json({ name: ch.name, entries: entries.slice(0, 10).map((e) => ({ videoId: e.videoId, title: e.title, published: e.published })) });
+      const e = entries.find((x) => x.videoId === String(f.get("videoId")));
+      if (!e) return json({ error: "הסרטון לא נמצא" }, 404);
+      await addJobs(rootEnv, [{ ...jobFor(ch, e), mode: "m4a", yemot: true, yemotPath: rootEnv.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
+      wake();
+      await addLog(rootEnv, "worker", "בקשה מהאתר לקו: " + e.title);
+      return json({ ok: true });
+    } catch (x) { return json({ error: String(x.message || x) }, 400); }
+  }
   // --- manage what is already on the phone line (admin): list / delete files of the two folders ---
   if ((p === "/yemot/ls" || p === "/yemot/rm") && pid === "main") {
     if (!(rootEnv.YEMOT_USER && rootEnv.YEMOT_PASS)) return json({ error: "חסרים Secrets בשם YEMOT_USER ו-YEMOT_PASS ב-Worker" });
@@ -1941,6 +1957,7 @@ async function dashboard(env) {
     <div class="card"><h2>${icon("channels")}ערוצים בקו</h2>
       <p class="sub">אוטומטי = מעלה לבד לשלוחה 8 · לבקשה = מופיע רק ברשימת הבקשות בטלפון (שלוחה 7).</p>
       <div id="phoneChans"></div></div>
+    <div class="card hidden" id="askCard"><h2>${icon("queue")}בקשה מהאתר</h2><div id="askList"></div></div>
     <div class="card"><h2>${icon("queue")}בקשות מהטלפון</h2><div id="phoneReqs"></div></div>
     <div class="card"><h2>${icon("trash")}קבצים בקו</h2>
       <div class="setting"><div class="txt"><b>מה שמועלה לשלוחות 8 ו-7/2</b><span id="lineFilesInfo">לחצו טען</span></div>
@@ -2296,6 +2313,15 @@ document.addEventListener("click", async (e) => {
       d.append("minMinutes", c.minMinutes || 0); if (c.skipShorts) d.append("skipShorts", "on");
       await post("/jobs/batch", d); toast("נוסף לתור"); showPage("queue"); refresh(); return;
     }
+    if (act === "phask") {
+      $("askCard").classList.remove("hidden"); $("askList").textContent = "טוען…";
+      const r = await (await fetch(B + "/yemot/feed?id=" + encodeURIComponent(id), { cache: "no-store" })).json();
+      if (r.error) { $("askList").textContent = r.error; return; }
+      $("askList").innerHTML = '<div class="sub">' + esc(r.name) + " — הסרטונים האחרונים. הבקשה עולה לשלוחה 7/2</div>" +
+        r.entries.map((v) => '<div class="setting"><div class="txt"><b>' + esc(v.title) + '</b><span>' + esc((v.published || "").slice(0, 10)) +
+          '</span></div><button class="btn ghost" type="button" data-ask="' + esc(v.videoId) + '" data-ch="' + esc(id) + '">בקש לקו</button></div>').join("");
+      $("askCard").scrollIntoView({ behavior: "smooth" }); return;
+    }
     if (/^ph(auto|req|both|min)$/.test(act)) {
       if (act === "phmin") { const n = prompt("אורך פרק מלא בדקות (0 = בלי)", ""); if (n === null) return; d.append("minMinutes", n); }
       else d.append("mode", act.slice(2));
@@ -2407,7 +2433,7 @@ function renderPhone() {
   $("phoneChans").innerHTML = pc.length ? pc.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>' + kind(c) +
     (c.minMinutes ? " · פרק מלא " + c.minMinutes + " דק׳+" : "") + '</span></div><span style="display:flex;gap:6px">' +
     btn("phauto", c.id, "zap", "העלאה אוטומטית") + btn("phreq", c.id, "monitor", "לבקשה בלבד") + btn("phboth", c.id, "layers", "אוטומטי + לבקשה") +
-    btn("phmin", c.id, "clock", "אורך פרק מלא") + btn("remove", c.id, "trash", "הסר", "danger") + '</span></div>').join("")
+    btn("phask", c.id, "queue", "בקש סרטון לקו") + btn("phmin", c.id, "clock", "אורך פרק מלא") + btn("remove", c.id, "trash", "הסר", "danger") + '</span></div>').join("")
     : '<div class="sub" style="margin:0">אין ערוצים מחוברים לקו.</div>';
   $("phoneReqs").innerHTML = reqs.length ? reqs.slice(0, 15).map((j) => mini("", j.title, ago(j.updated) + (j.status === "failed" ? " · " + esc(j.error || "נכשל") : ""), badgeOf(j.status))).join("")
     : '<div class="sub" style="margin:0">עוד לא התבקשו סרטונים בטלפון.</div>';
@@ -2455,6 +2481,12 @@ async function loadLineFiles() {
   } catch (e) { $("lineFilesInfo").textContent = "שגיאה: " + e; }
 }
 $("lineFilesLoad").onclick = loadLineFiles;
+$("askList").onclick = async (e) => {
+  const b = e.target.closest("[data-ask]"); if (!b) return;
+  const d = new FormData(); d.append("id", b.dataset.ch); d.append("videoId", b.dataset.ask);
+  b.disabled = true;
+  try { await post("/yemot/ask", d); b.textContent = "נשלח ✓"; refresh(); } catch (x) { b.disabled = false; toast("שגיאה: " + x.message, 6000); }
+};
 $("lineFiles").onclick = async (e) => {
   const b = e.target.closest("[data-lf]"); if (!b || !confirm("למחוק את " + b.dataset.lf + " מהקו?")) return;
   const d = new FormData(); d.append("dir", b.dataset.dir); d.append("name", b.dataset.lf);
