@@ -1609,6 +1609,7 @@ async function dashboard(env) {
   <button class="nav" data-page="logs">${icon("logs")}<span>לוגים</span></button>
   <button class="nav" data-page="settings">${icon("settings")}<span>הגדרות</span></button>
   <button class="nav hidden" id="vaultNav" type="button">${icon("lock")}<span>כספת</span></button>
+  <button class="nav hidden" data-page="phone" id="phoneNav">${icon("monitor")}<span>קו טלפון</span></button>
   <button class="nav hidden" data-page="images" id="imgNav">${icon("image")}<span>תמונות</span></button>
   <div class="grow"></div>
   <a class="nav extra" href="/">${icon("chat")}<span>Gemini</span></a>
@@ -1721,6 +1722,13 @@ async function dashboard(env) {
     <div id="imgGrid" class="imggrid"></div>
   </section>
 
+  <section data-p="phone" class="hidden">
+    <div class="card"><h2>${icon("monitor")}קו הטלפון (ימות)</h2>
+      <div id="phoneInfo"></div></div>
+    <div class="card"><h2>${icon("queue")}הפרקים האחרונים</h2>
+      <div id="phoneJobs"></div></div>
+  </section>
+
   <section data-p="logs" class="hidden">
     <div class="actions-row" style="margin:0 0 12px;gap:8px;justify-content:space-between;align-items:center">
       <span class="sub" style="margin:0">worker = Cloudflare · render = שרת ההורדות · pc = התוכנה במחשב</span>
@@ -1810,7 +1818,7 @@ function toast(msg, ms) { const t = $("toast"); t.textContent = msg; t.style.dis
 const APP = () => window.pywebview && window.pywebview.api;   // running inside the desktop app?
 
 // ---------- pages ----------
-const TITLES = { dash: "לוח בקרה", global: "לוח בקרה כללי", queue: "תור הורדות", channels: "ערוצים", add: "הוספה", logs: "לוגים", settings: "הגדרות", images: "תמונות" };
+const TITLES = { dash: "לוח בקרה", global: "לוח בקרה כללי", queue: "תור הורדות", channels: "ערוצים", add: "הוספה", logs: "לוגים", settings: "הגדרות", phone: "קו טלפון", images: "תמונות" };
 function showPage(name) {
   if (name === "global" && !(S.profile && S.profile.admin)) name = "dash";
   document.querySelectorAll(".nav[data-page]").forEach((n) => n.classList.toggle("on", n.dataset.page === name));
@@ -1974,6 +1982,8 @@ function render() {
     if (!mp3ok && o.selected) o.parentNode.value = "video";
   });
   $("profileName").textContent = (S.profile && S.profile.name) || "";
+  $("phoneNav").classList.toggle("hidden", !(S.profile && S.profile.admin));
+  renderPhone();
   $("imgNav").classList.toggle("hidden", !(APP() && APP().img_list && S.profile && !S.profile.netfree));
   document.querySelectorAll(".ttHint").forEach((e) => e.classList.toggle("hidden", !!(S.profile && S.profile.netfree)));
   document.querySelectorAll(".ymtOnly").forEach((e) => e.classList.toggle("hidden", !(S.profile && S.profile.admin)));
@@ -2160,6 +2170,23 @@ document.addEventListener("click", async (e) => {
   if (b.dataset.act === "imgdel" && confirm("למחוק את התמונה?")) { await APP().img_delete(b.dataset.id); loadImages(); }
   if (b.dataset.act === "imgvault") { try { await APP().img_to_vault(b.dataset.id); toast("הועבר לכספת"); loadImages(); } catch (x) { toast("שגיאה: " + x, 6000); } }
 });
+
+// ---------- phone line (Yemot) ----------
+function renderPhone() {
+  if (!(S.profile && S.profile.admin)) return;
+  const chs = S.channels.filter((c) => c.yemot), jobs = S.jobs.filter((j) => j.yemot);
+  const last = jobs.find((j) => j.status === "done");
+  const busy = jobs.filter((j) => ["queued", "taken"].includes(j.status)).length;
+  $("phoneInfo").innerHTML = chs.length
+    ? chs.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>נבדק אוטומטית כל 3 שעות · כל פרק חדש מועלה לשלוחה</span></div></div>').join("") +
+      '<div class="setting"><div class="txt"><b>מצב</b><span>' +
+      (busy ? busy + " בדרך (הורדה/העלאה)" : "אין כרגע פרק בדרך") + " · " +
+      (last ? "הועלה לאחרונה " + ago(last.updated) + " — " + esc(last.title) : "עוד לא הועלה פרק") + '</span></div></div>'
+    : '<div class="sub" style="margin:0">אין עדיין מעקב מחובר לקו. בעמוד "ערוצים" מוסיפים ערוץ/פלייליסט ומסמנים "העלאה לקו הטלפון".</div>';
+  $("phoneJobs").innerHTML = jobs.length ? jobs.slice(0, 15).map((j) =>
+    mini("", j.title, ago(j.updated) + (j.status === "done" ? " · " + esc(j.error || "הועלה") : j.status === "failed" ? ' · <span class="bad">' + esc(j.error || "נכשל") + "</span>" : ""),
+         badgeOf(j.status))).join("") : '<div class="sub" style="margin:0">אין עדיין פרקים.</div>';
+}
 
 // ---------- Gemini keys (admin) ----------
 async function keysOp(body) {
