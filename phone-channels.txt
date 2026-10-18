@@ -1,0 +1,32 @@
+# YT-LINE v1
+@שלוחה 1 = ישיבישן | השקפה ישיבתית
+@שלוחה 2 = הפטריוטים | *
+
+[פאנלים ואקטואליה]
+https://www.youtube.com/playlist?list=PL8E54R76rowCcCOn_HQf36o1RF3_oD3z4 | הפטריוטים | auto | 40
+https://www.youtube.com/channel/UCKEImtWikw9usC1pl_9m1nQ | C14 | req
+https://www.youtube.com/playlist?list=PLqsnGzdsslQgrlnxKqAzHBMrWcSBoL1OA | פתחי וזמרי בעם יותם זמרי - נעם פתחי | auto | 40
+https://www.youtube.com/channel/UC97tNnAqlsE3D6y-GUVhULg | רדיו גלי ישראל | auto | 40
+https://www.youtube.com/@tovnews | ערוץ TOV אקטואליה יהודית | req
+
+[פודקאסטים ופרשנות]
+https://www.youtube.com/channel/UC1rREwCkxnNerva93iAmrdQ | גדי טאוב: שומר סף | req
+https://www.youtube.com/channel/UCJq9XMrpxZbVxet6BXfbW1g | ד"ר גיא בכור Dr. Guy Bechor | req
+https://www.youtube.com/channel/UCYTuhQta56TImmjtO9s5K3g | פודקאסט על המשמעות - תמיר דורטל | req
+https://www.youtube.com/@akibigman | אידיוטים שימושיים - עקיבא ביגמן | req
+https://www.youtube.com/@KoheletForum | פורום קהלת | req
+https://www.youtube.com/@TikvahFund | קרן תקוה | req
+
+[ארץ ישראל והתיישבות]
+https://www.youtube.com/@HakolHayehudi | הקול היהודי | req
+https://www.youtube.com/@T_Nachala | תנועת נחלה | req
+https://www.youtube.com/@RegavimIL | תנועת רגבים | req
+https://www.youtube.com/@adkanorg | עד כאן | req
+https://www.youtube.com/channel/UCYfch0B9XpvUAuOQZptRYEQ | ארגון חוננו | req
+https://www.youtube.com/@YeshaCouncil | מועצת ישע | req
+https://www.youtube.com/channel/UCh09CI7FtBLhFhNqqbjrMKw | ישיבת הר ברכה | req
+
+[השקפה ישיבתית]
+https://www.youtube.com/@RavOuryCherki | הרב אורי שרקי | auto
+https://www.youtube.com/channel/UCcozVJcaq1HStJSDhSQVA0Q | הרב מרדכי נויגרשל - יהדות מזווית שונה | auto
+https://www.youtube.com/@haravbenporat | הרב יוסף בן פורת | auto
