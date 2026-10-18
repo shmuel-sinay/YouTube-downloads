@@ -320,6 +320,7 @@ async function listJobs(env) {
 // Accepts: UC… id, /channel/UC…, /@handle, or any channel URL.
 async function resolveChannelId(input) {
   input = input.trim();
+  if (/youtube\.com\/results|search_query|suspicious/i.test(input)) throw new Error("קישור חיפוש ולא ערוץ");
   // A playlist (…list=PLxxxx, or a bare PL id): tracked like a channel.
   const pl = input.match(/[?&]list=((?:PL|UU|OL|LL|FL)[\w-]{10,})/) || input.match(/^((?:PL|OL)[\w-]{10,})$/);
   if (pl) return pl[1];
