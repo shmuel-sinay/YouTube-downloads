@@ -1262,7 +1262,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     return new Response(head.join("\n") + body + "\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Content-Disposition": "attachment; filename=phone-channels.txt" } });
   }
   if (p === "/phone/import" && req.method === "POST" && pid === "main") {
-    const text = String((await req.formData()).get("text") || ""), ids = [];
+    const fd = await req.formData(), dry = fd.get("dry") === "1", text = String(fd.get("text") || ""), ids = [], addN = [], delN = [];
     const channels = await getChannels(rootEnv);
     let cat = "", added = 0, upd = 0, bad = 0, dels = 0;
     for (const raw of text.split(/\r?\n/)) {
@@ -1278,13 +1278,13 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         if (c) {
           delete c.yemot; delete c.req; delete c.cat;
           if (c.reqOnly) channels.splice(channels.indexOf(c), 1);
-          dels++;
+          dels++; delN.push(c.name);
         }
         continue;
       }
       if (!c) {
         try { c = { id, name: nm || (await readFeed(id)).name, mode: "m4a", minMinutes: 0, skipShorts: true, added: new Date().toISOString() }; } catch (e) { bad++; continue; }
-        channels.push(c); added++;
+        channels.push(c); added++; addN.push(c.name);
       } else upd++;
       ids.push(id);
       const m = mode === "auto" ? "auto" : mode === "both" ? "both" : "req";
@@ -1294,20 +1294,25 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (mins) c.minMinutes = Math.max(0, parseInt(mins, 10) || 0);
       if (cat && cat !== "כללי") c.cat = cat; else delete c.cat;
     }
+    if (dry) return json({ added, upd, bad, dels, ids, addN, delN });
     await putJSON(rootEnv, "channels", channels);
     await rootEnv.DB.delete("phonebrowse");
     await addLog(rootEnv, "worker", `ייבוא ערוצים לקו: ${added} חדשים, ${upd} עודכנו` + (bad ? `, ${bad} לא תקינים` : ""));
-    return json({ added, upd, bad, dels, ids });
+    return json({ added, upd, bad, dels, ids, addN, delN });
   }
   // After an import with "remove what is not in the file": take everything else off the phone line.
   if (p === "/phone/prune" && req.method === "POST" && pid === "main") {
-    const keep = new Set(JSON.parse(String((await req.formData()).get("ids") || "[]")));
+    const fd = await req.formData(), keep = new Set(JSON.parse(String(fd.get("ids") || "[]")));
     let chs = await getChannels(rootEnv), n = 0;
+    const names = [];
     chs = chs.filter((c) => {
       if (!(c.yemot || c.req) || keep.has(c.id)) return true;
-      n++; delete c.yemot; delete c.req; delete c.cat;
+      n++; names.push(c.name);
+      if (fd.get("dry") === "1") return true;
+      delete c.yemot; delete c.req; delete c.cat;
       return !c.reqOnly;
     });
+    if (fd.get("dry") === "1") return json({ n, names });
     await putJSON(rootEnv, "channels", chs);
     await rootEnv.DB.delete("phonebrowse");
     await addLog(rootEnv, "worker", `הוסרו מהקו ${n} ערוצים שלא היו בקובץ`);
@@ -2597,17 +2602,38 @@ $("phoneImp").onchange = async (e) => {
     cur.push(l);
   }
   const prune = $("phonePrune").checked;
-  if (prune && !confirm("ערוצים בקו שלא מופיעים בקובץ יוסרו מהקו. להמשיך?")) return;
-  let a = 0, u = 0, b = 0, dl = 0; const ids = [];
-  try {
+  let a = 0, u = 0, b = 0, dl = 0, ids = [], addN = [], delN = [];
+  const send = async (dry) => {
+    a = u = b = dl = 0; ids = []; addN = []; delN = [];
     for (let i = 0; i < chunks.length; i++) {
-      toast("מייבא… " + (i + 1) + "/" + chunks.length, 30000);
-      const d = new FormData(); d.append("text", (chunks[i].cat ? chunks[i].cat + "\n" : "") + chunks[i].join("\n"));
+      toast((dry ? "בודק… " : "מייבא… ") + (i + 1) + "/" + chunks.length, 30000);
+      const d = new FormData(); d.append("text", (chunks[i].cat ? chunks[i].cat + "\n" : "") + chunks[i].join("\n")); if (dry) d.append("dry", "1");
       const r = await (await post("/phone/import", d)).json();
-      a += r.added; u += r.upd; b += r.bad; dl += r.dels; ids.push(...r.ids);
+      a += r.added; u += r.upd; b += r.bad; dl += r.dels; ids.push(...r.ids); addN.push(...r.addN); delN.push(...r.delN);
     }
-    let rm = 0;
-    if (prune) { const d = new FormData(); d.append("ids", JSON.stringify(ids)); rm = (await (await post("/phone/prune", d)).json()).n; }
+    if (prune) { const d = new FormData(); d.append("ids", JSON.stringify(ids)); if (dry) d.append("dry", "1");
+      const r = await (await post("/phone/prune", d)).json(); if (dry) delN.push(...r.names); return r.n; }
+    return 0;
+  };
+  try {
+    await send(true);
+    // Summary before anything changes: what will be removed (red), with the option to also see what is added.
+    const ok = await new Promise((done) => {
+      const ov = document.createElement("div");
+      ov.style.cssText = "position:fixed;inset:0;background:#000a;z-index:99;display:flex;align-items:center;justify-content:center;padding:16px";
+      const list = (arr) => arr.length ? '<ul style="margin:6px 0;padding-inline-start:20px;max-height:30vh;overflow:auto">' + arr.map((n) => "<li>" + esc(n) + "</li>").join("") + "</ul>" : "";
+      ov.innerHTML = '<div class="card" style="max-width:520px;width:100%;max-height:90vh;overflow:auto"><h2>אישור ייבוא</h2>' +
+        "<p><b class='bad'>ערוצים שיימחקו מהקו (" + delN.length + "):</b></p>" + (delN.length ? list(delN) : "<p class='sub'>אין</p>") +
+        "<p class='sub'>" + a + " ערוצים חדשים · " + u + " יעודכנו" + (b ? " · " + b + " שורות לא תקינות יידלגו" : "") + "</p>" +
+        '<div id="impAdd" class="hidden"><p><b>יתווספו (' + addN.length + "):</b></p>" + (addN.length ? list(addN) : "<p class='sub'>אין</p>") + "</div>" +
+        '<div class="cbar"><button class="btn" id="impOk">אשר ייבוא</button><button class="btn ghost" id="impShow">הצג מה יתווסף</button><button class="btn ghost" id="impNo">בטל</button></div></div>';
+      document.body.appendChild(ov);
+      ov.querySelector("#impShow").onclick = (ev) => { ov.querySelector("#impAdd").classList.toggle("hidden"); ev.target.textContent = ov.querySelector("#impAdd").classList.contains("hidden") ? "הצג מה יתווסף" : "הסתר"; };
+      ov.querySelector("#impOk").onclick = () => { ov.remove(); done(true); };
+      ov.querySelector("#impNo").onclick = () => { ov.remove(); done(false); };
+    });
+    if (!ok) { toast("הייבוא בוטל"); return; }
+    const rm = await send(false);
     toast("יובא: " + a + " חדשים, " + u + " עודכנו" + (b ? ", " + b + " לא תקינים" : "") + (dl ? ", " + dl + " הוסרו לפי הקובץ" : "") + (prune ? ", " + rm + " הוסרו" : ""), 9000); refresh();
   } catch (x) { toast("שגיאה: " + x.message, 8000); }
 };
