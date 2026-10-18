@@ -226,6 +226,13 @@ function videoFromUrl(line) {
 }
 // A link is YouTube (the only source allowed for NetFree-restricted profiles).
 function isYouTubeUrl(u) { return /youtube\.com|youtu\.be/.test(u || ""); }
+// Adult/porn sites are blocked for everyone, before a link enters the queue.
+// Matched on the host (a word in the domain), so it can't be dodged by a path.
+const ADULT_RE = /(?:^|\.)(?:pornbox|pornhub|xvideos|xnxx|xhamster|redtube|youporn|youjizz|spankbang|brazzers|onlyfans|chaturbate|stripchat|cam4|bongacams|myfreecams|tnaflix|eporner|motherless|rule34|e-hentai|nhentai|hanime|hentaihaven|txxx|beeg|tube8|porntrex|hclips|drtuber|sunporno|pornbox)\./i;
+function adultBlocked(u) {
+  try { const h = new URL(u).hostname; return ADULT_RE.test(h) || /\b(porn|xxx|hentai|sex|nude|camgirl|escort)\b/i.test(h); }
+  catch (e) { return ADULT_RE.test(u || "") || /\b(porn|xxx|hentai)\b/i.test(u || ""); }
+}
 
 async function addJobs(env, jobs) {
   if (!jobs.length) return;
@@ -1173,6 +1180,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const ttBlocked = (await profileInfo(env, env.PROFILE)).netfree;
       lines.forEach((line, i) => {
         const base = { mode, minMinutes, status: "queued", updated: new Date().toISOString(), priority: now - i };
+        if (/^https?:\/\//.test(line) && adultBlocked(line)) return;   // adult sites blocked for everyone
         const v = videoFromUrl(line);
         const pl = line.match(/[?&]list=([\w-]+)/);
         if (v && !pl) {
@@ -1256,6 +1264,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       // yt-dlp supports). A NetFree-restricted profile may only use YouTube.
       const raw = String(f.get("url") || "").trim();
       const u = (raw.match(/https?:\/\/[^\s]+/) || [])[0];
+      if (u && adultBlocked(u)) return new Response("האתר הזה חסום", { status: 400 });
       const v = videoFromUrl(raw) || (u ? { videoId: "x-" + Math.random().toString(36).slice(2, 11), url: u, source: "other" } : null);
       if (v && v.source !== "youtube" && (await profileInfo(env, env.PROFILE)).netfree)
         return new Response("בפרופיל הזה אפשר להוריד רק מיוטיוב", { status: 400 });

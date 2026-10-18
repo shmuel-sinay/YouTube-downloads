@@ -616,8 +616,21 @@ def handle_search(job: dict) -> None:
     log(f"   נמצא: {found['title']}" + (f" (+{len(matches) - 1} חלופות לבדיקת נטפרי)" if want > 1 else ""))
 
 
+_ADULT = re.compile(r"(?:^|\.)(?:pornbox|pornhub|xvideos|xnxx|xhamster|redtube|youporn|youjizz|spankbang|brazzers|onlyfans|chaturbate|stripchat|cam4|bongacams|myfreecams|tnaflix|eporner|motherless|rule34|e-hentai|nhentai|hanime|hentaihaven|txxx|beeg|tube8|porntrex|hclips|drtuber|sunporno)\.", re.I)
+def _is_adult(url: str) -> bool:
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except Exception:
+        host = url or ""
+    return bool(_ADULT.search(host) or re.search(r"\b(porn|xxx|hentai)\b", host, re.I))
+
+
 def _handle(job: dict) -> None:
     vid = job["videoId"]
+    if _is_adult(job.get("url", "")):
+        api("/api/report", {"videoId": vid, "status": "failed", "error": "האתר הזה חסום"})
+        log(f"   חסום: {job.get('url')}")
+        return
     if job.get("kind") == "list":
         return handle_list(job)
     if job.get("kind") == "search":
