@@ -464,7 +464,7 @@ function jobFor(ch, e) {
 function parseSubs(text) {
   const subs = [];
   for (const raw of String(text).split(/\r?\n/)) {
-    const m = raw.trim().match(/^@?(?:שלוחה\s*)?(\d{1,2})\s*=\s*([^|]+?)\s*(?:\|\s*(.*))?$/);
+    const m = raw.trim().match(/^@?(?:שלוחה\s*)?([1-6])\s*=\s*([^|]+?)\s*(?:\|\s*(.*))?$/);
     if (!m) continue;
     const cats = (m[3] || "").split(",").map((x) => x.trim()).filter(Boolean);
     subs.push({ n: m[1], label: m[2].trim().slice(0, 30), cats: cats.filter((x) => x !== "*"), rest: cats.includes("*") });
@@ -929,13 +929,18 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   // Dialog: access code → channel → video; then the video is queued for the
   // phone line. Answers are plain text in Yemot's grammar ("read=…", "id_list_message=…").
   // Needs the Worker secret YEMOT_PIN. Each call returns one step.
-  // Extension 8 (type=api): spoken menu of the sub-extensions, then straight into the chosen one.
+  // Extension 8 (type=api) is the line's main menu: the sub-extensions, then "request" (7) and "listen to requests" (7/2).
   if (p === "/yemot/menu8") {
     const q = url.searchParams, T = (t) => new Response(t, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
     const subs = (await getJSON(profileEnv(env, "main"), "phonecfg", { subs: [] })).subs || [];
     if (!subs.length) return T("id_list_message=t-השירות לא מוגדר&go_to_folder=hangup");
-    if (!q.has("M8")) return T("read=t-" + subs.map((x) => "ל" + x.label.replace(/[^\w\u0590-\u05FF ]/g, " ") + " הקישו " + x.n).join(" ") + "=M8,,1,1,7,Digits,yes,no,,,,,,,no");
-    const sub = subs.find((x) => x.n === q.get("M8"));
+    const say = (t) => String(t).replace(/[^\w\u0590-\u05FF ]/g, " ").replace(/\s+/g, " ").trim();
+    if (!q.has("M8")) return T("read=t-" + ["ברוכים הבאים לקו השיעורים"].concat(subs.map((x) => "ל" + say(x.label) + " הקישו " + x.n),
+      ["לבקשת שיעור או סרטון הקישו 7", "להאזנה לשיעורים שביקשתם הקישו 8"]).join(". ") + "=M8,,1,1,7,Digits,yes,no,,,,,,,no");
+    const m = q.get("M8");
+    if (m === "7") return T("go_to_folder=/7");
+    if (m === "8") return T("go_to_folder=/7/2");
+    const sub = subs.find((x) => x.n === m);
     return T(sub ? "go_to_folder=/8/" + sub.n : "id_list_message=t-בחירה שגויה&go_to_folder=hangup");
   }
   if (p === "/yemot/req") {
@@ -945,15 +950,14 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const D = (name, max, min) => name + ",," + max + "," + min + ",7,Digits,yes,no,,,,,,,no";
     const bye = (m) => T("id_list_message=t-" + m + "&go_to_folder=hangup");
     if (!env.YEMOT_PIN) return bye("השירות לא מוגדר");
-    // The menu itself (extension 7 is an API extension): 1 = request, 2 = listen.
-    if (!q.has("M")) return T("read=t-הקישו 1 לבקשת סרטון 2 להאזנה לסרטונים שהתבקשו=" + D("M", 1, 1));
-    if (q.get("M") === "2") return T("go_to_folder=/7/2");
-    if (q.get("M") !== "1") return bye("בחירה שגויה");
-    if (!q.get("PIN")) return T("read=t-הקישו קוד גישה=" + D("PIN", 8, 4));
+    // Extension 7 starts straight at the access code; the menu (request / listen) is extension 8's.
+    // Yemot keeps the answers of one call across steps, so after a finished request the call ends (a second request starts a new call).
+    const back = (m) => bye(m);
+    if (!q.get("PIN")) return T("read=t-הקישו את קוד הגישה ובסיומו סולמית=" + D("PIN", 8, 4));
     if (q.get("PIN") !== String(env.YEMOT_PIN)) return bye("קוד שגוי");
     const menv = profileEnv(env, "main");
     const allReq = (await getChannels(menv)).filter((c) => c.req);
-    if (!allReq.length) return bye("אין ערוצים זמינים לבקשה");
+    if (!allReq.length) return back("אין כרגע ערוצים זמינים לבקשה");
     let chs = allReq, cat = "";
     if (!q.get("MD")) return T("read=t-לשמיעת הסרטונים האחרונים מכל הערוצים הקישו 1 לבחירת ערוץ הקישו 2 לחיפוש לפי דיבור הקישו 3=" + D("MD", 1, 1));
     // Channels are grouped by category (action / podcasts / lessons…): pick one first when there are several.
@@ -962,7 +966,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (cats.length > 1) {
         if (!q.get("CT")) return T("read=t-" + cats.map((c, i) => "ל" + clean(c) + " הקישו " + (i + 1)).join(" ") + "=" + D("CT", 1, 1));
         cat = cats[parseInt(q.get("CT"), 10) - 1];
-        if (!cat) return bye("בחירה שגויה");
+        if (!cat) return back("בחירה שגויה");
         chs = allReq.filter((c) => cn(c) === cat);
       }
     }
@@ -980,7 +984,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
           .sort((x, y) => (y.e.published || "").localeCompare(x.e.published || "")).slice(0, 30);
         if (all.length) await putJSON(menv, "phonebrowse", { at: Date.now(), cat, all });
       }
-      if (!all.length) return bye("לא נמצאו סרטונים");
+      if (!all.length) return back("לא נמצאו כרגע סרטונים");
       let pos = 0, k = 0;
       for (; q.has("A" + k); k++) {
         const a = q.get("A" + k);
@@ -989,17 +993,17 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
           await addJobs(menv, [{ ...jobFor(it.ch, it.e), mode: "m4a", minMinutes: 0, yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
           wake();
           await addLog(menv, "worker", "בקשה מהטלפון: " + it.e.title);
-          return bye("הבקשה התקבלה הסרטון יהיה מוכן להאזנה בעוד כמה דקות");
+          return back("הבקשה התקבלה. השיעור יהיה מוכן להאזנה בעוד כמה דקות. להתראות");
         }
         if (a === "2") pos = Math.min(all.length - 1, pos + 1);
         else if (a === "3") pos = Math.max(0, pos - 1);
-        else return bye("תודה ולהתראות");
+        else return back("להתראות");
       }
       const it = all[pos];
       return T("read=t-" + clean(it.ch.name) + " " + clean(it.e.title) + " לבקשה הקישו 1 לבא 2 לקודם 3 ליציאה 0=" + D("A" + k, 1, 1));
     }
     if (q.get("MD") === "3") q.set("CH", "0");
-    else if (q.get("MD") !== "2") return bye("בחירה שגויה");
+    else if (q.get("MD") !== "2") return back("בחירה שגויה");
     const pick = chs.slice(0, 9);
     if (!q.get("CH")) return T("read=t-" + pick.map((c, i) => "לערוץ " + clean(c.name) + " הקישו " + (i + 1)).join(" ") + " לחיפוש לפי דיבור הקישו אפס=" + D("CH", 1, 1));
     if (q.get("CH") === "0") {
@@ -1016,7 +1020,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       else {
         if (!q.has("K1")) return T("read=t-הקלידו במקלדת את מה שתרצו לחפש=K1,,80,1,30,HebrewKeyboard,no,no,,,,,,,no");
         const k1 = clean(g("K1")).slice(0, 80);
-        if (!k1) return bye("לא התקבל חיפוש");
+        if (!k1) return back("לא התקבל חיפוש");
         text = k1;
       }
       if (!q.has("ML")) return T("read=t-אורך מינימלי בדקות אפס לכל אורך=" + D("ML", 3, 1));
@@ -1027,20 +1031,20 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         status: "queued", priority: Date.now(), updated: new Date().toISOString() }]);
       wake();
       await addLog(menv, "worker", `חיפוש בטלפון: ${text} (${n} סרטונים` + (ml ? `, מ-${ml} דקות` : "") + ")");
-      return bye("החיפוש התקבל הסרטונים יהיו מוכנים להאזנה בעוד כמה דקות");
+      return back("החיפוש התקבל. התוצאות יהיו מוכנות להאזנה בעוד כמה דקות. להתראות");
     }
     const ch = pick[parseInt(q.get("CH"), 10) - 1];
-    if (!ch) return bye("בחירה שגויה");
+    if (!ch) return back("בחירה שגויה");
     let vids = [];
     try { vids = (await feedOf(ch)).entries.filter((e) => !e.isShort).slice(0, 5); } catch (e) {}
-    if (!vids.length) return bye("לא נמצאו סרטונים");
+    if (!vids.length) return back("לא נמצאו כרגע סרטונים");
     if (!q.get("V")) return T("read=t-" + vids.map((e, i) => "לסרטון " + clean(e.title) + " הקישו " + (i + 1)).join(" ") + "=" + D("V", 1, 1));
     const e = vids[parseInt(q.get("V"), 10) - 1];
-    if (!e) return bye("בחירה שגויה");
+    if (!e) return back("בחירה שגויה");
     await addJobs(menv, [{ ...jobFor(ch, e), mode: "m4a", minMinutes: 0, yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
     wake();
     await addLog(menv, "worker", "בקשה מהטלפון: " + e.title);
-    return bye("הבקשה התקבלה הסרטון יהיה מוכן להאזנה בעוד כמה דקות");
+    return back("הבקשה התקבלה. השיעור יהיה מוכן להאזנה בעוד כמה דקות. להתראות");
   }
   const pid = await whoIs(req, env);
   if (!pid) {
