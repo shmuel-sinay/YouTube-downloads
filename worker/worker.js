@@ -843,22 +843,33 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (!q.get("PIN")) return T("read=t-הקישו קוד גישה=" + D("PIN", 8, 4));
     if (q.get("PIN") !== String(env.YEMOT_PIN)) return bye("קוד שגוי");
     const menv = profileEnv(env, "main");
-    const chs = (await getChannels(menv)).filter((c) => c.req).slice(0, 9);
-    if (!chs.length) return bye("אין ערוצים זמינים לבקשה");
+    const allReq = (await getChannels(menv)).filter((c) => c.req);
+    if (!allReq.length) return bye("אין ערוצים זמינים לבקשה");
+    let chs = allReq, cat = "";
     if (!q.get("MD")) return T("read=t-לשמיעת הסרטונים האחרונים מכל הערוצים הקישו 1 לבחירת ערוץ הקישו 2 לחיפוש לפי דיבור הקישו 3=" + D("MD", 1, 1));
+    // Channels are grouped by category (action / podcasts / lessons…): pick one first when there are several.
+    if (q.get("MD") !== "3") {
+      const cn = (c) => c.cat || "כללי", cats = [...new Set(allReq.map(cn))].slice(0, 9);
+      if (cats.length > 1) {
+        if (!q.get("CT")) return T("read=t-" + cats.map((c, i) => "ל" + clean(c) + " הקישו " + (i + 1)).join(" ") + "=" + D("CT", 1, 1));
+        cat = cats[parseInt(q.get("CT"), 10) - 1];
+        if (!cat) return bye("בחירה שגויה");
+        chs = allReq.filter((c) => cn(c) === cat);
+      }
+    }
     if (q.get("MD") === "1") {
       // Browse the newest videos of all request channels, one title at a time:
       // 1 = request it, 2 = next, 3 = previous, 0 = exit. Position is replayed from the A0,A1,… answers.
       // The list is kept for 10 minutes so paging between titles is fast.
-      let cache = await getJSON(menv, "phonebrowse", null), all = cache && Date.now() - cache.at < 600000 ? cache.all : null;
+      let cache = await getJSON(menv, "phonebrowse", null), all = cache && cache.cat === cat && Date.now() - cache.at < 600000 ? cache.all : null;
       if (!all) {
-        const feeds = await Promise.allSettled(chs.concat((await getChannels(menv)).filter((c) => c.req && !chs.includes(c))).slice(0, 20).map(async (c) => {
+        const feeds = await Promise.allSettled(chs.slice(0, 20).map(async (c) => {
           const en = (await readFeed(c.id)).entries.filter((e) => !e.isShort).slice(0, 3);
           return en.map((e) => ({ ch: c, e }));
         }));
         all = feeds.flatMap((f) => (f.status === "fulfilled" ? f.value : []))
           .sort((x, y) => (y.e.published || "").localeCompare(x.e.published || "")).slice(0, 30);
-        if (all.length) await putJSON(menv, "phonebrowse", { at: Date.now(), all });
+        if (all.length) await putJSON(menv, "phonebrowse", { at: Date.now(), cat, all });
       }
       if (!all.length) return bye("לא נמצאו סרטונים");
       let pos = 0, k = 0;
@@ -880,7 +891,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     }
     if (q.get("MD") === "3") q.set("CH", "0");
     else if (q.get("MD") !== "2") return bye("בחירה שגויה");
-    if (!q.get("CH")) return T("read=t-" + chs.map((c, i) => "לערוץ " + clean(c.name) + " הקישו " + (i + 1)).join(" ") + " לחיפוש לפי דיבור הקישו אפס=" + D("CH", 1, 1));
+    const pick = chs.slice(0, 9);
+    if (!q.get("CH")) return T("read=t-" + pick.map((c, i) => "לערוץ " + clean(c.name) + " הקישו " + (i + 1)).join(" ") + " לחיפוש לפי דיבור הקישו אפס=" + D("CH", 1, 1));
     if (q.get("CH") === "0") {
       // Search by speech; the recognized words are played back for approval;
       // if recognition fails or is rejected, typing on the Hebrew keyboard;
@@ -908,7 +920,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       await addLog(menv, "worker", `חיפוש בטלפון: ${text} (${n} סרטונים` + (ml ? `, מ-${ml} דקות` : "") + ")");
       return bye("החיפוש התקבל הסרטונים יהיו מוכנים להאזנה בעוד כמה דקות");
     }
-    const ch = chs[parseInt(q.get("CH"), 10) - 1];
+    const ch = pick[parseInt(q.get("CH"), 10) - 1];
     if (!ch) return bye("בחירה שגויה");
     let vids = [];
     try { vids = (await readFeed(ch.id)).entries.filter((e) => !e.isShort).slice(0, 5); } catch (e) {}
@@ -1215,6 +1227,53 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       return json({ path, count: files.length, files: files.slice(-8).reverse() });
     } catch (e) { return json({ error: "אין תשובה מימות: " + (e.message || e) }); }
   }
+  // --- export / import of the phone channel list as a text file (to be edited by Gemini or by hand) ---
+  if (p === "/phone/export" && pid === "main") {
+    const chs = (await getChannels(rootEnv)).filter((c) => c.yemot || c.req), by = {};
+    chs.forEach((c) => (by[c.cat || "כללי"] = by[c.cat || "כללי"] || []).push(c));
+    const head = ["# YT-LINE v1 — רשימת ערוצים לקו הטלפון",
+      "# מבנה הקובץ (לשמירה על המבנה בעריכה, גם ב-Gemini):",
+      "# 1. כל קטגוריה מתחילה בשורה לבד בסוגריים מרובעים, למשל: [אקשן] או [פודקאסטים] או [שיעורים]",
+      "# 2. מתחת לקטגוריה: ערוץ אחד בכל שורה, בצורה:  קישור | שם | מצב | דקות",
+      "#    קישור = קישור לערוץ או לפלייליסט ביוטיוב (חובה) · שם = לתצוגה בלבד (לא חובה)",
+      "#    מצב: req = לבקשה בטלפון בלבד (ברירת מחדל) · auto = מעלה לבד לשלוחה 8 · both = שניהם",
+      "#    דקות = אורך מינימלי לפרק מלא, רק ל-auto (לא חובה)",
+      "# 3. שורות שמתחילות ב-# הן הערות. אפשר להעביר ערוצים בין קטגוריות, למחוק שורות או להוסיף שורות חדשות.",
+      "# 4. ערוץ שנמחק מהקובץ לא יימחק מהאתר, והקובץ רק מוסיף ומעדכן.", ""];
+    const body = Object.entries(by).map(([k, v]) => "[" + k + "]\n" + v.map((c) =>
+      "https://www.youtube.com/" + (/^UC/.test(c.id) ? "channel/" : "playlist?list=") + c.id + " | " + c.name.replace(/\|/g, " ") + " | " +
+      (c.yemot && c.req ? "both" : c.req ? "req" : "auto") + (c.minMinutes ? " | " + c.minMinutes : "")).join("\n")).join("\n\n");
+    return new Response(head.join("\n") + body + "\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Content-Disposition": "attachment; filename=phone-channels.txt" } });
+  }
+  if (p === "/phone/import" && req.method === "POST" && pid === "main") {
+    const text = String((await req.formData()).get("text") || "");
+    const channels = await getChannels(rootEnv);
+    let cat = "", added = 0, upd = 0, bad = 0, left = 0, fetches = 0;
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      const hd = line.match(/^\[(.+)\]$/);
+      if (hd) { cat = hd[1].trim().slice(0, 30); continue; }
+      const [url, , mode, mins] = line.split("|").map((x) => x.trim());
+      let id; try { id = await resolveChannelId(url); } catch (e) { bad++; continue; }
+      let c = channels.find((x) => x.id === id);
+      if (!c) {
+        if (++fetches > 25) { left++; continue; }       // Worker subrequest limit: import the rest in a second run
+        try { c = { id, name: (await readFeed(id)).name, mode: "m4a", minMinutes: 0, skipShorts: true, added: new Date().toISOString() }; } catch (e) { bad++; continue; }
+        channels.push(c); added++;
+      } else upd++;
+      const m = mode === "auto" ? "auto" : mode === "both" ? "both" : "req";
+      if (m === "auto") { c.yemot = true; delete c.req; delete c.reqOnly; }
+      else if (m === "both") { c.yemot = true; c.req = true; delete c.reqOnly; }
+      else { c.req = true; c.reqOnly = true; delete c.yemot; }
+      if (mins) c.minMinutes = Math.max(0, parseInt(mins, 10) || 0);
+      if (cat && cat !== "כללי") c.cat = cat; else delete c.cat;
+    }
+    await putJSON(rootEnv, "channels", channels);
+    await rootEnv.DB.delete("phonebrowse");
+    await addLog(rootEnv, "worker", `ייבוא ערוצים לקו: ${added} חדשים, ${upd} עודכנו` + (bad ? `, ${bad} לא תקינים` : "") + (left ? `, ${left} נשארו (הרץ שוב)` : ""));
+    return json({ added, upd, bad, left });
+  }
   // --- request from the site: latest videos of a phone channel, and queue one for the request folder ---
   if ((p === "/yemot/feed" || p === "/yemot/ask") && pid === "main") {
     const f = p === "/yemot/ask" ? await req.formData() : null;
@@ -1340,6 +1399,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       else if (m === "both") { c.yemot = true; c.req = true; delete c.reqOnly; }
       else if (m === "off") { delete c.yemot; delete c.req; delete c.reqOnly; }
       if (f.has("minMinutes")) c.minMinutes = Math.max(0, parseInt(f.get("minMinutes"), 10) || 0);
+      if (f.has("cat")) { const v = String(f.get("cat")).trim().slice(0, 30); if (v) c.cat = v; else delete c.cat; }
       await putJSON(env, "channels", channels);
       await env.DB.delete("phonebrowse");
       return json({ ok: true });
@@ -1956,7 +2016,9 @@ async function dashboard(env) {
       </form></div>
     <div class="card"><h2>${icon("channels")}ערוצים בקו</h2>
       <p class="sub">אוטומטי = מעלה לבד לשלוחה 8 · לבקשה = מופיע רק ברשימת הבקשות בטלפון (שלוחה 7).</p>
-      <div id="phoneChans"></div></div>
+      <div id="phoneChans"></div>
+      <div class="cbar" style="margin-top:12px"><a class="btn ghost" href="${BASE}/phone/export" download>ייצוא לקובץ</a>
+        <label class="btn ghost" style="cursor:pointer">ייבוא מקובץ<input type="file" id="phoneImp" accept=".txt,text/plain" hidden></label></div></div>
     <div class="card hidden" id="askCard"><h2>${icon("queue")}בקשה מהאתר</h2><div id="askList"></div></div>
     <div class="card"><h2>${icon("queue")}בקשות מהטלפון</h2><div id="phoneReqs"></div></div>
     <div class="card"><h2>${icon("trash")}קבצים בקו</h2>
@@ -2322,7 +2384,9 @@ document.addEventListener("click", async (e) => {
           '</span></div><button class="btn ghost" type="button" data-ask="' + esc(v.videoId) + '" data-ch="' + esc(id) + '">בקש לקו</button></div>').join("");
       $("askCard").scrollIntoView({ behavior: "smooth" }); return;
     }
-    if (/^ph(auto|req|both|min)$/.test(act)) {
+    if (/^ph(auto|req|both|min|cat)$/.test(act)) {
+      if (act === "phcat") { const n = prompt("קטגוריה (אקשן / פודקאסטים / שיעורים…), ריק = בלי", (S.channels.find((x) => x.id === id) || {}).cat || ""); if (n === null) return; d.append("cat", n); }
+      else
       if (act === "phmin") { const n = prompt("אורך פרק מלא בדקות (0 = בלי)", ""); if (n === null) return; d.append("minMinutes", n); }
       else d.append("mode", act.slice(2));
       await post("/channels/set", d); toast("עודכן"); refresh(); return;
@@ -2431,9 +2495,9 @@ function renderPhone() {
   const pc = S.channels.filter((c) => c.yemot || c.req);
   const kind = (c) => (c.yemot && c.req ? "אוטומטי + לבקשה" : c.req ? "לבקשה בטלפון בלבד" : "העלאה אוטומטית");
   $("phoneChans").innerHTML = pc.length ? pc.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>' + kind(c) +
-    (c.minMinutes ? " · פרק מלא " + c.minMinutes + " דק׳+" : "") + '</span></div><span style="display:flex;gap:6px">' +
+    (c.cat ? " · " + esc(c.cat) : "") + (c.minMinutes ? " · פרק מלא " + c.minMinutes + " דק׳+" : "") + '</span></div><span style="display:flex;gap:6px">' +
     btn("phauto", c.id, "zap", "העלאה אוטומטית") + btn("phreq", c.id, "monitor", "לבקשה בלבד") + btn("phboth", c.id, "layers", "אוטומטי + לבקשה") +
-    btn("phask", c.id, "queue", "בקש סרטון לקו") + btn("phmin", c.id, "clock", "אורך פרק מלא") + btn("remove", c.id, "trash", "הסר", "danger") + '</span></div>').join("")
+    btn("phcat", c.id, "layers", "קטגוריה") + btn("phask", c.id, "queue", "בקש סרטון לקו") + btn("phmin", c.id, "clock", "אורך פרק מלא") + btn("remove", c.id, "trash", "הסר", "danger") + '</span></div>').join("")
     : '<div class="sub" style="margin:0">אין ערוצים מחוברים לקו.</div>';
   $("phoneReqs").innerHTML = reqs.length ? reqs.slice(0, 15).map((j) => mini("", j.title, ago(j.updated) + (j.status === "failed" ? " · " + esc(j.error || "נכשל") : ""), badgeOf(j.status))).join("")
     : '<div class="sub" style="margin:0">עוד לא התבקשו סרטונים בטלפון.</div>';
@@ -2481,6 +2545,12 @@ async function loadLineFiles() {
   } catch (e) { $("lineFilesInfo").textContent = "שגיאה: " + e; }
 }
 $("lineFilesLoad").onclick = loadLineFiles;
+$("phoneImp").onchange = async (e) => {
+  const file = e.target.files[0]; if (!file) return;
+  const d = new FormData(); d.append("text", await file.text()); e.target.value = "";
+  try { const r = await (await post("/phone/import", d)).json(); toast("יובא: " + r.added + " חדשים, " + r.upd + " עודכנו" + (r.bad ? ", " + r.bad + " לא תקינים" : "") + (r.left ? ", " + r.left + " נשארו — ייבא שוב" : ""), 9000); refresh(); }
+  catch (x) { toast("שגיאה: " + x.message, 8000); }
+};
 $("askList").onclick = async (e) => {
   const b = e.target.closest("[data-ask]"); if (!b) return;
   const d = new FormData(); d.append("id", b.dataset.ch); d.append("videoId", b.dataset.ask);
