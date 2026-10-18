@@ -1318,6 +1318,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       "#    דקות (לא חובה, מספר שלם): אורך מינימלי של פרק מלא, רלוונטי רק ל-auto/both. 0 או ריק = בלי.",
       "# 2א. שלוחות משנה (אופציונלי, בראש הקובץ, לפני הקטגוריות): הקו מתפצל לשלוחות לפי נושא, וערוצי auto של קטגוריה נכנסים לשלוחה שלה ונשמרים שם תמיד.",
       "#    פורמט שורה:  @שלוחה מספר = שם מוקרא | קטגוריה, קטגוריה   (למשל: @שלוחה 1 = ישיבישן | השקפה ישיבתית). הסימן * במקום קטגוריה = כל השאר. אפשר להשאיר בלי שורות כאלה.",
+      "#    חיפוש לפי שם: אם אין לך קישור ודאי לערוץ, כתוב כקישור  https://www.youtube.com/results?search_query=שם+הרב  (מילים מחוברות ב-+). פועל רק ברגע ייבוא הקובץ באתר, פעם אחת: האתר לוקח את תוצאת הערוץ הראשונה, שומר אותה לפי מזהה, ומציג אותה למשתמש לאישור. אחרי הייבוא הוא כבר לא מחפש. עדיף תמיד קישור ישיר אמיתי, ואל תמציא קישור.",
       "#    שורה עם #ידני במקום קטגוריה (למשל: @שלוחה 3 = הועלה ידנית | #ידני) = שלוחה לדברים שמעלים ידנית מלשונית ההוספה, ולא מערוץ.",
       "#    רק קטגוריות שנכתבו או * מקבלות שלוחה משלהן. מספרים 1-9 ללא כפילות. הקטגוריה בשורת @שלוחה חייבת להיות זהה לשם בסוגריים המרובעים.",
       "# 3. שורה שמתחילה ב-# היא הערה ומתעלמים ממנה. שורות ריקות מותרות.",
@@ -1337,7 +1338,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     return new Response(head.join("\n") + subLines + body + "\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Content-Disposition": "attachment; filename=phone-channels.txt" } });
   }
   if (p === "/phone/import" && req.method === "POST" && pid === "main") {
-    const fd = await req.formData(), dry = fd.get("dry") === "1", text = String(fd.get("text") || ""), ids = [], addN = [], delN = [];
+    const fd = await req.formData(), dry = fd.get("dry") === "1", text = String(fd.get("text") || ""), ids = [], addN = [], delN = [], srchN = [];
     const channels = await getChannels(rootEnv);
     let cat = "", added = 0, upd = 0, bad = 0, dels = 0;
     for (const raw of text.split(/\r?\n/)) {
@@ -1360,7 +1361,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (!c) {
         const bySearch = /search_query=/.test(url);
         try { c = { id, name: bySearch ? (await readFeed(id)).name : nm || (await readFeed(id)).name, mode: "m4a", minMinutes: 0, skipShorts: true, added: new Date().toISOString() }; } catch (e) { bad++; continue; }
-        channels.push(c); added++; addN.push(c.name + (bySearch && nm && nm !== c.name ? " (חיפשת: " + nm + ")" : ""));
+        channels.push(c); added++;
+        if (bySearch) srchN.push((nm || "?") + " ← " + c.name); else addN.push(c.name);
       } else upd++;
       ids.push(id);
       const m = mode === "auto" ? "auto" : mode === "both" ? "both" : "req";
@@ -1370,12 +1372,12 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (mins) c.minMinutes = Math.max(0, parseInt(mins, 10) || 0);
       if (cat && cat !== "כללי") c.cat = cat; else delete c.cat;
     }
-    if (dry) return json({ added, upd, bad, dels, ids, addN, delN });
+    if (dry) return json({ added, upd, bad, dels, ids, addN, delN, srchN });
     await applyFolders(rootEnv, channels);
     await putJSON(rootEnv, "channels", channels);
     await rootEnv.DB.delete("phonebrowse");
     await addLog(rootEnv, "worker", `ייבוא ערוצים לקו: ${added} חדשים, ${upd} עודכנו` + (bad ? `, ${bad} לא תקינים` : ""));
-    return json({ added, upd, bad, dels, ids, addN, delN });
+    return json({ added, upd, bad, dels, ids, addN, delN, srchN });
   }
   // After an import with "remove what is not in the file": take everything else off the phone line.
   if (p === "/phone/prune" && req.method === "POST" && pid === "main") {
@@ -2719,14 +2721,14 @@ $("phoneImp").onchange = async (e) => {
     cur.push(l);
   }
   let prune = false, notIn = [];
-  let a = 0, u = 0, b = 0, dl = 0, ids = [], addN = [], delN = [];
+  let a = 0, u = 0, b = 0, dl = 0, ids = [], addN = [], delN = [], srchN = [];
   const send = async (dry) => {
-    a = u = b = dl = 0; ids = []; addN = []; delN = [];
+    a = u = b = dl = 0; ids = []; addN = []; delN = []; srchN = [];
     for (let i = 0; i < chunks.length; i++) {
       toast((dry ? "בודק… " : "מייבא… ") + (i + 1) + "/" + chunks.length, 30000);
       const d = new FormData(); d.append("text", (chunks[i].cat ? chunks[i].cat + "\\n" : "") + chunks[i].join("\\n")); if (dry) d.append("dry", "1");
       const r = await (await post("/phone/import", d)).json();
-      a += r.added; u += r.upd; b += r.bad; dl += r.dels; ids.push(...r.ids); addN.push(...r.addN); delN.push(...r.delN);
+      a += r.added; u += r.upd; b += r.bad; dl += r.dels; ids.push(...r.ids); addN.push(...r.addN); delN.push(...r.delN); srchN.push(...(r.srchN || []));
     }
     if (dry || prune) { const d = new FormData(); d.append("ids", JSON.stringify(ids)); if (dry) d.append("dry", "1");
       const r = await (await post("/phone/prune", d)).json(); if (dry) notIn = r.names; return r.n; }
@@ -2744,6 +2746,7 @@ $("phoneImp").onchange = async (e) => {
         '<label class="check"><input type="checkbox" id="impPrune">הסר מהקו גם ערוצים שלא מופיעים בקובץ (' + notIn.length + ")</label>" +
         '<div id="impNot" class="hidden">' + list(notIn) + "</div>" +
         (cfgLines.length ? "<p class='sub'><b>שלוחות משנה בקובץ:</b><br>" + cfgLines.map(esc).join("<br>") + "</p>" : "") + "<p class='sub'>" + a + " ערוצים חדשים · " + u + " יעודכנו" + (b ? " · " + b + " שורות לא תקינות יידלגו" : "") + "</p>" +
+        (srchN.length ? "<p><b>נמצאו בחיפוש לפי שם — כדאי לוודא שזה הערוץ הנכון (" + srchN.length + "):</b></p>" + list(srchN) + "<p class='sub'>אם ערוץ לא נכון: בטל, והחלף את השורה שלו בקובץ בקישור ישיר.</p>" : "") +
         '<div id="impAdd" class="hidden"><p><b>יתווספו (' + addN.length + "):</b></p>" + (addN.length ? list(addN) : "<p class='sub'>אין</p>") + "</div>" +
         '<div class="cbar"><button class="btn" id="impOk">אשר ייבוא</button><button class="btn ghost" id="impShow">הצג מה יתווסף</button><button class="btn ghost" id="impNo">בטל</button></div></div>';
       document.body.appendChild(ov);
