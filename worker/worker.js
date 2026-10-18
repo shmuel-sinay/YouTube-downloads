@@ -434,9 +434,17 @@ async function applyFolders(env, channels) {
 }
 
 async function checkChannel(env, ch, notes) {
-  const seen = await getJSON(env, "seen:" + ch.id, []);
+  const seenRaw = await getJSON(env, "seen:" + ch.id, null);
+  const seen = seenRaw || [];
   const { entries } = await readFeed(ch.id);
   const top = entries[0];
+  // First time this channel is checked (e.g. added by an import): everything already on it counts as seen,
+  // otherwise its whole back catalogue would be queued at once.
+  if (seenRaw === null) {
+    await putJSON(env, "seen:" + ch.id, entries.map((e) => e.videoId));
+    if (notes) notes.push(ch.name + ": נקבע כנקודת התחלה");
+    return 0;
+  }
   if (notes) notes.push(ch.name + ": " + (top ? "האחרון ביוטיוב " + (top.published || "").slice(0, 10) : "הפיד ריק"));
   const fresh = entries.filter((e) => !seen.includes(e.videoId));
   const jobs = fresh.filter((e) => !(ch.skipShorts && e.isShort)).map((e) => jobFor(ch, e));
