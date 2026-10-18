@@ -2805,7 +2805,7 @@ function renderPhone() {
   $("phoneReqs").innerHTML = reqs.length ? reqs.slice(0, 20).map((j) => mini("", j.title, ago(j.updated) + (j.status === "failed" ? " · " + esc(j.error || "נכשל") : ""), badgeOf(j.status))).join("")
     : '<div class="sub" style="margin:0">עוד לא התבקשו סרטונים.</div>';
   const sel = $("askSel"), cur = sel.value;
-  sel.innerHTML = reqCh.map((c) => '<option value="' + esc(c.id) + '">' + esc(c.name) + "</option>").join("") || '<option value="">אין ערוצי בקשה</option>';
+  sel.innerHTML = all.map((c) => '<option value="' + esc(c.id) + '">' + esc(c.name) + (c.req ? "" : " (אוטומטי)") + "</option>").join("") || '<option value="">אין ערוצים בקו</option>';
   if (cur) sel.value = cur;
   $("phoneJobs").innerHTML = jobs.length ? jobs.slice(0, 15).map((j) =>
     mini("", j.title, ago(j.updated) + (j.status === "done" ? " · " + esc(j.error || "הועלה") : j.status === "failed" ? ' · <span class="bad">' + esc(j.error || "נכשל") + "</span>" : ""),
