@@ -309,6 +309,9 @@ async function listJobs(env) {
 // Accepts: UC… id, /channel/UC…, /@handle, or any channel URL.
 async function resolveChannelId(input) {
   input = input.trim();
+  // A playlist (…list=PLxxxx, or a bare PL id): tracked like a channel.
+  const pl = input.match(/[?&]list=((?:PL|UU|OL|LL|FL)[\w-]{10,})/) || input.match(/^((?:PL|OL)[\w-]{10,})$/);
+  if (pl) return pl[1];
   let m = input.match(/(UC[\w-]{22})/);
   if (m) return m[1];
   let url = input;
@@ -344,8 +347,9 @@ async function fetchFeed(q) {
 }
 
 async function readFeed(channelId) {
-  const tries = [fetchFeed("channel_id=" + channelId)];
-  if (/^UC/.test(channelId)) tries.push(fetchFeed("playlist_id=UU" + channelId.slice(2)));
+  const isPlaylist = !/^UC/.test(channelId);
+  const tries = [fetchFeed((isPlaylist ? "playlist_id=" : "channel_id=") + channelId)];
+  if (!isPlaylist) tries.push(fetchFeed("playlist_id=UU" + channelId.slice(2)));
   const got = await Promise.allSettled(tries);
   const xmls = got.filter((g) => g.status === "fulfilled").map((g) => g.value);
   if (!xmls.length) throw got[0].reason;
@@ -372,7 +376,8 @@ function jobFor(ch, e) {
   return {
     videoId: e.videoId, channelId: ch.id, channelName: ch.name, title: e.title,
     published: e.published, url: "https://www.youtube.com/watch?v=" + e.videoId,
-    mode: ch.mode, minMinutes: ch.minMinutes, status: "queued",
+    mode: ch.yemot ? "m4a" : ch.mode, minMinutes: ch.minMinutes, status: "queued",
+    ...(ch.yemot ? { yemot: true } : {}),
     updated: new Date().toISOString(),
   };
 }
@@ -1115,6 +1120,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
           minMinutes: Math.max(0, parseInt(f.get("minMinutes") || "0", 10) || 0),
           skipShorts: f.get("skipShorts") === "on", added: new Date().toISOString(),
         };
+        // "Upload to the phone line (Yemot)" — only the admin's own tracker.
+        if (f.get("yemot") === "on" && (env.PROFILE || "main") === "main") ch.yemot = true;
         channels.push(ch);
         await putJSON(env, "channels", channels);
         // Everything already on the channel counts as "seen" — except the
@@ -1689,11 +1696,12 @@ async function dashboard(env) {
       <form class="card" data-action="/channels/add">
         <h2>${icon("channels")}ערוץ למעקב</h2><p class="sub">כל סרטון חדש שיעלה בערוץ יירד אוטומטית.</p>
         <div class="grid">
-          <label class="field wide">ערוץ<input name="channel" placeholder="קישור לערוץ / ‎@handle / UC…" required></label>
+          <label class="field wide">ערוץ או פלייליסט<input name="channel" placeholder="קישור לערוץ / פלייליסט / ‎@handle / UC…" required></label>
           <label class="field">סוג<select name="mode">${modeOptions}</select></label>
           <label class="field">אורך מינימלי (דקות)<input name="minMinutes" type="number" min="0" value="0"></label>
           <label class="field">להוריד עכשיו את האחרונים<input name="backfill" type="number" min="0" max="15" value="0"></label>
           <label class="check" style="align-self:end;padding-bottom:10px"><input type="checkbox" name="skipShorts" checked>בלי Shorts</label>
+          <label class="check ymtOnly hidden" style="align-self:end;padding-bottom:10px"><input type="checkbox" name="yemot">העלאה לקו הטלפון (ימות)</label>
         </div>
         <div class="actions-row"><button class="btn">${icon("add")}<span>הוסף ערוץ</span></button></div>
       </form>
@@ -1950,7 +1958,7 @@ function render() {
     : '<div class="empty">' + icon("queue") + '<div>' + (FILTER === "all" ? "התור ריק — הוסף סרטון, ערוץ או כמות סרטונים בעמוד \\"הוספה\\"." : "אין פריטים כאן") + '</div></div>';
   $("channels").innerHTML = S.channels.length ? S.channels.map((c) =>
     '<div class="ch"><div class="avatar">' + esc((c.name || "?").trim().charAt(0)) + '</div><div class="info">' +
-    '<div class="title"><a href="https://www.youtube.com/channel/' + esc(c.id) + '" target="_blank" rel="noopener">' + esc(c.name) + '</a></div>' +
+    '<div class="title"><a href="' + (/^UC/.test(c.id) ? "https://www.youtube.com/channel/" + esc(c.id) : "https://www.youtube.com/playlist?list=" + esc(c.id)) + '" target="_blank" rel="noopener">' + esc(c.name) + '</a>' + (c.yemot ? ' <span class="tag">קו טלפון</span>' : '') + '</div>' +
     '<div class="meta">' + icon(/^video/.test(c.mode || "") ? "video" : "music") + ' ' + esc(MODES[c.mode] || MODES.audio) +
     (c.minMinutes ? '<span class="sep">•</span>' + c.minMinutes + ' דק׳ ומעלה' : '') + (c.skipShorts ? '<span class="sep">•</span>בלי Shorts' : '') + '</div></div>' +
     '<div class="acts">' + btn("batch", c.id, "download", "הורד כמות סרטונים מהערוץ", "primary") + btn("remove", c.id, "trash", "הסר ערוץ", "danger") + '</div></div>').join("")
@@ -1968,6 +1976,7 @@ function render() {
   $("profileName").textContent = (S.profile && S.profile.name) || "";
   $("imgNav").classList.toggle("hidden", !(APP() && APP().img_list && S.profile && !S.profile.netfree));
   document.querySelectorAll(".ttHint").forEach((e) => e.classList.toggle("hidden", !!(S.profile && S.profile.netfree)));
+  document.querySelectorAll(".ymtOnly").forEach((e) => e.classList.toggle("hidden", !(S.profile && S.profile.admin)));
   $("globalNav").classList.toggle("hidden", !(S.profile && S.profile.admin));
   $("cookieCard").classList.toggle("hidden", !S.cookieExt);
   if (S.cookieExt) {

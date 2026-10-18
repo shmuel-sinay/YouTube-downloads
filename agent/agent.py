@@ -329,6 +329,36 @@ def _finish_cmd(cmd: list[str], job: dict) -> list[str]:
     return cmd
 
 
+def yemot_upload(src: Path) -> str:
+    """Convert to mono MP3 and upload to the Yemot line (env: YEMOT_USER,
+    YEMOT_PASS, YEMOT_PATH, default ivr2:/1). autoNumbering keeps earlier
+    episodes; the extension plays the newest first."""
+    user, pw = os.environ.get("YEMOT_USER"), os.environ.get("YEMOT_PASS")
+    if not (user and pw):
+        raise RuntimeError("חסרים YEMOT_USER / YEMOT_PASS ב-Render")
+    mp3 = src.with_suffix(".yemot.mp3")
+    r = subprocess.run(["ffmpeg", "-y", "-i", str(src), "-ac", "1", "-ar", "22050", "-b:a", "48k", str(mp3)],
+                       capture_output=True, text=True)
+    if r.returncode or not mp3.exists():
+        raise RuntimeError("המרה נכשלה")
+    try:
+        bd = "----yt" + os.urandom(8).hex()
+        fields = {"token": f"{user}:{pw}", "path": os.environ.get("YEMOT_PATH", "ivr2:/1"),
+                  "convertAudio": "1", "autoNumbering": "true"}
+        body = b"".join(f'--{bd}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+                        for k, v in fields.items())
+        body += (f'--{bd}\r\nContent-Disposition: form-data; name="file"; filename="a.mp3"\r\n'
+                 "Content-Type: audio/mpeg\r\n\r\n").encode() + mp3.read_bytes() + f"\r\n--{bd}--\r\n".encode()
+        req = urllib.request.Request("https://www.call2all.co.il/ym/api/UploadFile", data=body,
+                                     headers={"Content-Type": f"multipart/form-data; boundary={bd}"})
+        res = json.loads(urllib.request.urlopen(req, timeout=300).read().decode())
+    finally:
+        mp3.unlink(missing_ok=True)
+    if res.get("responseStatus") != "OK":
+        raise RuntimeError(str(res.get("message") or res)[:150])
+    return "הועלה לקו הטלפון: " + str(res.get("path") or os.environ.get("YEMOT_PATH", "ivr2:/1"))
+
+
 def to_zip(path: Path, vid: str = "") -> Path:
     """Wrap the media file in a .zip and delete the original. Some filters
     (e.g. NetFree) block audio/video downloads but let zip files through.
@@ -709,6 +739,18 @@ def _handle(job: dict) -> None:
         return
     files = [Path(l.strip()) for l in r.stdout.splitlines()
              if l.strip().startswith(str(OUT)) and Path(l.strip()).is_file()]
+    if files and job.get("yemot"):
+        # Phone line (Yemot): small mono MP3, uploaded to the extension.
+        set_progress(vid, stage="convert", pct=None)
+        try:
+            msg = yemot_upload(files[-1])
+            api("/api/report", {"videoId": vid, "status": "done", "fileUrl": "", "error": msg})
+            log(f"   ✓ {msg}")
+        except Exception as e:
+            api("/api/report", {"videoId": vid, "status": "failed", "error": f"העלאה לימות נכשלה: {e}"})
+            log(f"   ✗ העלאה לימות נכשלה: {e}")
+        files[-1].unlink(missing_ok=True)
+        return
     if files:
         set_progress(vid, stage="zip", pct=None)
         f = to_zip(files[-1], vid)
