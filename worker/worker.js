@@ -1215,6 +1215,30 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       return json({ path, count: files.length, files: files.slice(-8).reverse() });
     } catch (e) { return json({ error: "אין תשובה מימות: " + (e.message || e) }); }
   }
+  // --- manage what is already on the phone line (admin): list / delete files of the two folders ---
+  if ((p === "/yemot/ls" || p === "/yemot/rm") && pid === "main") {
+    if (!(rootEnv.YEMOT_USER && rootEnv.YEMOT_PASS)) return json({ error: "חסרים Secrets בשם YEMOT_USER ו-YEMOT_PASS ב-Worker" });
+    const dirs = [rootEnv.YEMOT_PATH || "ivr2:/8", rootEnv.YEMOT_REQ_PATH || "ivr2:/7/2"];
+    const tok = encodeURIComponent(rootEnv.YEMOT_USER + ":" + rootEnv.YEMOT_PASS);
+    const call = async (api, qs) => (await fetch("https://www.call2all.co.il/ym/api/" + api + "?token=" + tok + "&" + qs, { signal: AbortSignal.timeout(20000) })).json();
+    try {
+      if (p === "/yemot/ls") {
+        const out = [];
+        for (const d of dirs) {
+          const r = await call("GetIVR2Dir", "path=" + encodeURIComponent(d));
+          if (r.responseStatus && r.responseStatus !== "OK") return json({ error: String(r.message || r.responseStatus).slice(0, 200) });
+          for (const f of r.files || []) if (/\.(wav|mp3)$/i.test(f.name || "")) out.push({ dir: d, name: f.name, size: f.size || 0, mtime: f.mtime || "" });
+        }
+        return json({ dirs, files: out.sort((a, b) => String(b.mtime).localeCompare(String(a.mtime))) });
+      }
+      const f = await req.formData(), dir = String(f.get("dir") || ""), name = String(f.get("name") || "");
+      if (!dirs.includes(dir) || !/^[\w.\-]+$/.test(name)) return json({ error: "בקשה לא תקינה" }, 400);
+      const r = await call("FileAction", "action=delete&what=" + encodeURIComponent(dir + "/" + name));
+      if (r.responseStatus && r.responseStatus !== "OK") return json({ error: String(r.message || r.responseStatus).slice(0, 200) }, 400);
+      await addLog(rootEnv, "worker", "נמחק מהקו: " + dir + "/" + name);
+      return json({ ok: true });
+    } catch (e) { return json({ error: "אין תשובה מימות: " + (e.message || e) }); }
+  }
   // --- the key pool (admin): add, remove, move up, release, test ---
   if (p === "/keys" && pid === "main") {
     const ks = await getJSON(rootEnv, "gemkeys", {});
@@ -1918,6 +1942,10 @@ async function dashboard(env) {
       <p class="sub">אוטומטי = מעלה לבד לשלוחה 8 · לבקשה = מופיע רק ברשימת הבקשות בטלפון (שלוחה 7).</p>
       <div id="phoneChans"></div></div>
     <div class="card"><h2>${icon("queue")}בקשות מהטלפון</h2><div id="phoneReqs"></div></div>
+    <div class="card"><h2>${icon("trash")}קבצים בקו</h2>
+      <div class="setting"><div class="txt"><b>מה שמועלה לשלוחות 8 ו-7/2</b><span id="lineFilesInfo">לחצו טען</span></div>
+        <button class="btn ghost" type="button" id="lineFilesLoad">טען</button></div>
+      <div id="lineFiles"></div></div>
     <div class="card"><h2>${icon("queue")}הפרקים האחרונים</h2>
       <div id="phoneJobs"></div></div>
   </section>
@@ -2408,6 +2436,23 @@ function renderPhone() {
     mini("", j.title, ago(j.updated) + (j.status === "done" ? " · " + esc(j.error || "הועלה") : j.status === "failed" ? ' · <span class="bad">' + esc(j.error || "נכשל") + "</span>" : ""),
          badgeOf(j.status))).join("") : '<div class="sub" style="margin:0">אין עדיין פרקים.</div>';
 }
+
+async function loadLineFiles() {
+  $("lineFilesInfo").textContent = "טוען…";
+  try {
+    const d = await (await fetch(B + "/yemot/ls", { cache: "no-store" })).json();
+    if (d.error) { $("lineFilesInfo").innerHTML = '<span class="bad">' + esc(d.error) + "</span>"; return; }
+    $("lineFilesInfo").textContent = d.files.length + " קבצים";
+    $("lineFiles").innerHTML = d.files.map((f) => '<div class="setting"><div class="txt"><b>' + esc(f.name) + '</b><span>' + esc(f.dir) + " · " +
+      Math.round(f.size / 1024) + " KB · " + esc(f.mtime) + '</span></div><button class="ibtn danger" data-lf="' + esc(f.name) + '" data-dir="' + esc(f.dir) + '" title="מחק">' + icon("trash") + "</button></div>").join("");
+  } catch (e) { $("lineFilesInfo").textContent = "שגיאה: " + e; }
+}
+$("lineFilesLoad").onclick = loadLineFiles;
+$("lineFiles").onclick = async (e) => {
+  const b = e.target.closest("[data-lf]"); if (!b || !confirm("למחוק את " + b.dataset.lf + " מהקו?")) return;
+  const d = new FormData(); d.append("dir", b.dataset.dir); d.append("name", b.dataset.lf);
+  try { await post("/yemot/rm", d); toast("נמחק"); loadLineFiles(); } catch (x) { toast("שגיאה: " + x.message, 6000); }
+};
 
 // ---------- Gemini keys (admin) ----------
 async function keysOp(body) {
