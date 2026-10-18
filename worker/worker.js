@@ -1836,7 +1836,7 @@ function jobRow(j) {
   const thumb = list ? '<div class="thumb">' + icon(j.kind === "search" ? "queue" : "layers") + '</div>'
     : '<img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">';
   const modeIc = /^video/.test(j.mode || "") ? "video" : "music";
-  const srcTag = j.source === "tiktok" ? "TikTok" : (j.source === "other" && j.url ? (j.url.match(/https?:\/\/(?:www\.)?([^\/]+)/) || ["", ""])[1] : "");
+  const srcTag = j.source === "tiktok" ? "TikTok" : (j.source === "other" && j.url ? (j.url.split("/")[2] || "").replace(/^www\./, "") : "");
   const meta = [esc(j.channelName || "קישור ידני"), srcTag ? esc(srcTag) : "", icon(modeIc) + " " + esc(MODES[j.mode] || MODES.audio),
     j.pcConvert ? icon("zap") + " המרה במחשב" : "", j.pcGot ? icon("monitor") + " במחשב" : "",
     icon("clock") + " " + ago(j.updated)].filter(Boolean).join('<span class="sep">•</span>');
