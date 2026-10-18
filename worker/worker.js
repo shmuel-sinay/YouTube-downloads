@@ -326,7 +326,15 @@ async function listJobs(env) {
 // Accepts: UC… id, /channel/UC…, /@handle, or any channel URL.
 async function resolveChannelId(input) {
   input = input.trim();
-  if (/youtube\.com\/results|search_query|suspicious/i.test(input)) throw new Error("קישור חיפוש ולא ערוץ");
+  if (/suspicious/i.test(input)) throw new Error("קישור לא תקין");
+  // A YouTube search link (…/results?search_query=name): the first CHANNEL result. Shown in the import preview so it can be checked.
+  const sq = input.match(/[?&]search_query=([^&\s]+)/);
+  if (sq) {
+    const r = await fetch("https://www.youtube.com/results?sp=EgIQAg%253D%253D&search_query=" + sq[1], { headers: { "User-Agent": "Mozilla/5.0", "Accept-Language": "he,en", Cookie: "CONSENT=YES+1" } });
+    const m = (await r.text()).match(/"channelRenderer":\{"channelId":"(UC[\w-]{22})"/);
+    if (m) return m[1];
+    throw new Error("לא נמצא ערוץ לחיפוש");
+  }
   // A playlist (…list=PLxxxx, or a bare PL id): tracked like a channel.
   const pl = input.match(/[?&]list=((?:PL|UU|OL|LL|FL)[\w-]{10,})/) || input.match(/^((?:PL|OL)[\w-]{10,})$/);
   if (pl) return pl[1];
@@ -1342,8 +1350,9 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         continue;
       }
       if (!c) {
-        try { c = { id, name: nm || (await readFeed(id)).name, mode: "m4a", minMinutes: 0, skipShorts: true, added: new Date().toISOString() }; } catch (e) { bad++; continue; }
-        channels.push(c); added++; addN.push(c.name);
+        const bySearch = /search_query=/.test(url);
+        try { c = { id, name: bySearch ? (await readFeed(id)).name : nm || (await readFeed(id)).name, mode: "m4a", minMinutes: 0, skipShorts: true, added: new Date().toISOString() }; } catch (e) { bad++; continue; }
+        channels.push(c); added++; addN.push(c.name + (bySearch && nm && nm !== c.name ? " (חיפשת: " + nm + ")" : ""));
       } else upd++;
       ids.push(id);
       const m = mode === "auto" ? "auto" : mode === "both" ? "both" : "req";
