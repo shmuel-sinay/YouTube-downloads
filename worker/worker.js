@@ -835,29 +835,47 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const clean = (t) => String(t).replace(/[^\w\u0590-\u05FF ]/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
     const bye = (m) => T("id_list_message=t-" + m + "&go_to_folder=hangup");
     if (!env.YEMOT_PIN) return bye("השירות לא מוגדר");
-    if (!q.get("PIN")) return T("read=t-הקישו קוד גישה=PIN,,8,4,Digits,yes");
+    if (!q.get("PIN")) return T("read=t-הקישו קוד גישה=PIN,,8,4,7,Digits,yes");
     if (q.get("PIN") !== String(env.YEMOT_PIN)) return bye("קוד שגוי");
     const menv = profileEnv(env, "main");
     const chs = (await getChannels(menv)).filter((c) => c.req).slice(0, 9);
     if (!chs.length) return bye("אין ערוצים זמינים לבקשה");
-    if (!q.get("CH")) return T("read=t-" + chs.map((c, i) => "לערוץ " + clean(c.name) + " הקישו " + (i + 1)).join(" ") + " לחיפוש לפי דיבור הקישו אפס=CH,,1,1,Digits,yes");
+    if (!q.get("CH")) return T("read=t-" + chs.map((c, i) => "לערוץ " + clean(c.name) + " הקישו " + (i + 1)).join(" ") + " לחיפוש לפי דיבור הקישו אפס=CH,,1,1,7,Digits,yes");
     if (q.get("CH") === "0") {
-      // Search by voice: Yemot recognizes Hebrew speech and sends the text back as Q.
-      if (!q.get("Q")) return T("read=t-אמרו מה לחפש אחרי הצליל=Q,,voice,he-IL");
-      const query = clean(q.get("Q")).slice(0, 80);
-      if (!query) return bye("לא הבנתי נסו שוב");
-      await addJobs(menv, [{ videoId: "q-" + Date.now().toString(36), kind: "search", channelName: "חיפוש בטלפון", title: query, query,
-        mode: "m4a", yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", status: "queued", priority: Date.now(), updated: new Date().toISOString() }]);
+      // Search by speech; the recognized words are played back for approval;
+      // if recognition fails or is rejected, typing on the Hebrew keyboard;
+      // then minimum length (minutes) and how many results to take.
+      const g = (k) => { const v = (q.get(k) || "").trim(); return /^none$/i.test(v) ? "" : v; };
+      const R = (txt, name) => T("read=t-" + txt + "=" + name + ",,1,1,7,Digits,yes");
+      if (!q.has("Q1")) return T("read=t-אמרו מה לחפש אחרי הצליל=Q1,,voice,he-IL");
+      const q1 = clean(g("Q1")).slice(0, 80);
+      let text = "";
+      if (q1 && !q.has("C1")) return R("שמעתי " + q1 + " לאישור הקישו 1 להקלדה במקלדת הקישו 2", "C1");
+      if (q1 && g("C1") === "1") text = q1;
+      else {
+        if (!q.has("K1")) return T("read=t-הקלידו במקלדת את מה שתרצו לחפש=K1,,80,1,30,HebrewKeyboard,no");
+        const k1 = clean(g("K1")).slice(0, 80);
+        if (!k1) return bye("לא התקבל חיפוש");
+        if (!q.has("C2")) return R("הקלדתם " + k1 + " לאישור הקישו 1 לביטול הקישו 2", "C2");
+        if (g("C2") !== "1") return bye("הבקשה בוטלה");
+        text = k1;
+      }
+      if (!q.has("ML")) return T("read=t-אורך מינימלי בדקות אפס לכל אורך=ML,,3,1,7,Digits,yes");
+      if (!q.has("N")) return T("read=t-כמה סרטונים להוריד מהחיפוש ספרה בין אחת לתשע=N,,1,1,7,Digits,yes");
+      const ml = Math.min(999, parseInt(g("ML"), 10) || 0), n = Math.max(1, Math.min(9, parseInt(g("N"), 10) || 1));
+      await addJobs(menv, [{ videoId: "q-" + Date.now().toString(36), kind: "search", channelName: "חיפוש בטלפון", title: text, query: text,
+        mode: "m4a", yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", minMinutes: ml, results: n,
+        status: "queued", priority: Date.now(), updated: new Date().toISOString() }]);
       wake();
-      await addLog(menv, "worker", "חיפוש בטלפון: " + query);
-      return bye("החיפוש התקבל הסרטון יהיה מוכן להאזנה בעוד כמה דקות");
+      await addLog(menv, "worker", `חיפוש בטלפון: ${text} (${n} סרטונים` + (ml ? `, מ-${ml} דקות` : "") + ")");
+      return bye("החיפוש התקבל הסרטונים יהיו מוכנים להאזנה בעוד כמה דקות");
     }
     const ch = chs[parseInt(q.get("CH"), 10) - 1];
     if (!ch) return bye("בחירה שגויה");
     let vids = [];
     try { vids = (await readFeed(ch.id)).entries.filter((e) => !e.isShort).slice(0, 5); } catch (e) {}
     if (!vids.length) return bye("לא נמצאו סרטונים");
-    if (!q.get("V")) return T("read=t-" + vids.map((e, i) => "לסרטון " + clean(e.title) + " הקישו " + (i + 1)).join(" ") + "=V,,1,1,Digits,yes");
+    if (!q.get("V")) return T("read=t-" + vids.map((e, i) => "לסרטון " + clean(e.title) + " הקישו " + (i + 1)).join(" ") + "=V,,1,1,7,Digits,yes");
     const e = vids[parseInt(q.get("V"), 10) - 1];
     if (!e) return bye("בחירה שגויה");
     await addJobs(menv, [{ ...jobFor(ch, e), mode: "m4a", yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);

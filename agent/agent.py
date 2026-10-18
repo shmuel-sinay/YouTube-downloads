@@ -608,7 +608,8 @@ def handle_search(job: dict) -> None:
     vid, q, min_s = job["videoId"], job.get("query") or job["title"], int(job.get("minMinutes") or 0) * 60
     log(f"-> מחפש: {q}")
     set_progress(vid, stage="start", pct=None, started=time.time(), mode="m4a")
-    cmd = ["yt-dlp", f"ytsearch{20 if min_s else 5}:{q}", "--flat-playlist", "--no-warnings",
+    res_n = max(0, min(int(job.get("results") or 0), 9))     # "take N results" (phone requests)
+    cmd = ["yt-dlp", f"ytsearch{(30 if res_n else 20) if min_s else max(5, res_n * 2)}:{q}", "--flat-playlist", "--no-warnings",
            "--print", "%(id)s\t%(duration)s\t%(title)s", "--js-runtimes", "node", "--impersonate", "chrome"] + net_args()
     cookies = cookies_path()
     if cookies:
@@ -616,7 +617,7 @@ def handle_search(job: dict) -> None:
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
     # A NetFree-only profile gets several candidates: the desktop app checks
     # them in order and keeps the first one NetFree lets through.
-    want = max(1, min(int(job.get("candidates") or 1), 8))
+    want = res_n if res_n > 1 else max(1, min(int(job.get("candidates") or 1), 8))
     found, matches = None, []
     for line in r.stdout.splitlines():
         parts = line.split("\t", 2)
@@ -638,7 +639,7 @@ def handle_search(job: dict) -> None:
         api("/api/report", {"videoId": vid, "status": "failed", "error": why})
         log(f"   {why}")
         return
-    if want > 1:
+    if want > 1 and not res_n:
         for rank, m in enumerate(matches):
             m.update(group=vid, rank=rank)
     api("/api/enqueue", {"items": matches if want > 1 else [found], "mode": job.get("mode"), "minMinutes": job.get("minMinutes"),
