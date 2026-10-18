@@ -1742,6 +1742,8 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .check{display:flex;align-items:center;gap:8px;color:var(--text);font-size:.9rem;cursor:pointer}
 .check input{width:auto}
 .actions-row{display:flex;justify-content:flex-end;margin-top:16px}
+.chcols{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;align-items:start}
+.chcol h3{margin:0 0 8px;font-size:1rem}
 .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
 /* segmented filter */
 .seg{display:inline-flex;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:3px;gap:2px;margin-bottom:14px}
@@ -2308,12 +2310,26 @@ function render() {
   const jobs = S.jobs.filter(IN[FILTER]);
   $("jobs").innerHTML = jobs.length ? jobs.map(jobRow).join("")
     : '<div class="empty">' + icon("queue") + '<div>' + (FILTER === "all" ? "התור ריק — הוסף סרטון, ערוץ או כמות סרטונים בעמוד \\"הוספה\\"." : "אין פריטים כאן") + '</div></div>';
-  $("channels").innerHTML = S.channels.length ? S.channels.map((c) =>
+  const chRow = (c) =>
     '<div class="ch"><div class="avatar">' + esc((c.name || "?").trim().charAt(0)) + '</div><div class="info">' +
     '<div class="title"><a href="' + (/^UC/.test(c.id) ? "https://www.youtube.com/channel/" + esc(c.id) : "https://www.youtube.com/playlist?list=" + esc(c.id)) + '" target="_blank" rel="noopener">' + esc(c.name) + '</a>' + (c.yemot ? ' <span class="tag">קו טלפון</span>' : '') + (c.req ? ' <span class="tag">לבקשה בטלפון</span>' : '') + '</div>' +
     '<div class="meta">' + icon(/^video/.test(c.mode || "") ? "video" : "music") + ' ' + esc(MODES[c.mode] || MODES.audio) +
     (c.minMinutes ? '<span class="sep">•</span>' + c.minMinutes + ' דק׳ ומעלה' : '') + (c.skipShorts ? '<span class="sep">•</span>בלי Shorts' : '') + '</div></div>' +
-    '<div class="acts">' + btn("batch", c.id, "download", "הורד כמות סרטונים מהערוץ", "primary") + btn("remove", c.id, "trash", "הסר ערוץ", "danger") + '</div></div>').join("")
+    '<div class="acts">' + btn("batch", c.id, "download", "הורד כמות סרטונים מהערוץ", "primary") + (c.yemot || c.req ? btn("phcat", c.id, "layers", "קטגוריה") + btn("phmode", c.id, "monitor", "שינוי סוג") : "") + btn("remove", c.id, "trash", "הסר ערוץ", "danger") + '</div></div>';
+  // Columns by channel type: regular tracking · phone line, automatic · phone line, request only (grouped by category).
+  const colOf = (c) => (c.req ? 2 : c.yemot ? 1 : 0);
+  const cols = [["מעקב רגיל", []], ["קו טלפון · העלאה אוטומטית", []], ["קו טלפון · לבקשה בטלפון", []]];
+  S.channels.forEach((c) => cols[colOf(c)][1].push(c));
+  const colHtml = ([title, list], n) => {
+    if (!list.length) return "";
+    let h = '<div class="chcol"><h3>' + title + ' <span class="tag">' + list.length + '</span></h3>';
+    if (n === 2) {
+      const by = {}; list.forEach((c) => (by[c.cat || "כללי"] = by[c.cat || "כללי"] || []).push(c));
+      h += Object.keys(by).map((k) => '<div class="sub" style="margin:10px 0 4px"><b>' + esc(k) + '</b></div>' + by[k].map(chRow).join("")).join("");
+    } else h += list.map(chRow).join("");
+    return h + "</div>";
+  };
+  $("channels").innerHTML = S.channels.length ? '<div class="chcols">' + cols.map(colHtml).join("") + "</div>"
     : '<div class="empty">' + icon("channels") + '<div>עוד אין ערוצים במעקב</div></div>';
   const box = $("logs"), atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
   box.innerHTML = S.logs.length ? S.logs.map((l) => '<div class="l"><span class="t">' + hhmm(l.t) + '</span>  <span class="src s-' + esc(l.src) + '">' + esc(l.src) + '</span> ' +
@@ -2427,6 +2443,11 @@ document.addEventListener("click", async (e) => {
         r.entries.map((v) => '<div class="setting"><div class="txt"><b>' + esc(v.title) + '</b><span>' + esc((v.published || "").slice(0, 10)) +
           '</span></div><button class="btn ghost" type="button" data-ask="' + esc(v.videoId) + '" data-ch="' + esc(id) + '">בקש לקו</button></div>').join("");
       $("askCard").scrollIntoView({ behavior: "smooth" }); return;
+    }
+    if (act === "phmode") {
+      const m = prompt("סוג הערוץ בקו: 1 = העלאה אוטומטית, 2 = לבקשה בטלפון בלבד, 3 = שניהם", "2"); if (!m) return;
+      const mode = { 1: "auto", 2: "req", 3: "both" }[m.trim()]; if (!mode) return;
+      d.append("mode", mode); await post("/channels/set", d); toast("עודכן"); refresh(); return;
     }
     if (/^ph(auto|req|both|min|cat)$/.test(act)) {
       if (act === "phcat") { const n = prompt("קטגוריה (אקשן / פודקאסטים / שיעורים…), ריק = בלי", (S.channels.find((x) => x.id === id) || {}).cat || ""); if (n === null) return; d.append("cat", n); }
