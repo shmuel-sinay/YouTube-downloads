@@ -1740,7 +1740,16 @@ async function dashboard(env) {
     <div class="card"><h2>${icon("monitor")}קו הטלפון (ימות)</h2>
       <div class="setting"><div class="txt"><b>בפועל בקו</b><span id="phoneLine">בודק…</span></div>
         <button class="btn ghost" type="button" onclick="renderPhone.at=0;renderPhone()">רענן</button></div>
-      <div id="phoneInfo"></div></div>
+      <div id="phoneInfo"></div>
+      <form data-action="/channels/add" style="margin-top:14px">
+        <input type="hidden" name="yemot" value="on"><input type="hidden" name="mode" value="m4a">
+        <input type="hidden" name="minMinutes" value="0"><input type="hidden" name="skipShorts" value="on">
+        <div class="cbar">
+          <input name="channel" placeholder="קישור לערוץ או פלייליסט להעלאה לקו" required style="flex:1;min-width:200px">
+          <label class="field" style="margin:0">להעלות עכשיו את האחרונים <input name="backfill" type="number" min="0" max="15" value="1" style="width:70px"></label>
+          <button class="btn">${icon("add")}<span>הוסף לקו</span></button>
+        </div>
+      </form></div>
     <div class="card"><h2>${icon("queue")}הפרקים האחרונים</h2>
       <div id="phoneJobs"></div></div>
   </section>
@@ -2194,7 +2203,7 @@ function renderPhone() {
   const last = jobs.find((j) => j.status === "done");
   const busy = jobs.filter((j) => ["queued", "taken"].includes(j.status)).length;
   $("phoneInfo").innerHTML = chs.length
-    ? chs.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>נבדק אוטומטית כל 3 שעות · כל פרק חדש מועלה לשלוחה</span></div></div>').join("") +
+    ? chs.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>נבדק אוטומטית כל 3 שעות · כל פרק חדש מועלה לשלוחה</span></div>' + btn("remove", c.id, "trash", "הסר מהקו", "danger") + '</div>').join("") +
       '<div class="setting"><div class="txt"><b>מצב</b><span>' +
       (busy ? busy + " בדרך (הורדה/העלאה)" : "אין כרגע פרק בדרך") + " · " +
       (last ? "הועלה לאחרונה " + ago(last.updated) + " — " + esc(last.title) : "עוד לא הועלה פרק") + '</span></div></div>'
