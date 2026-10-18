@@ -329,7 +329,7 @@ def _finish_cmd(cmd: list[str], job: dict) -> list[str]:
     return cmd
 
 
-def yemot_upload(src: Path) -> str:
+def yemot_upload(src: Path, path: str = "") -> str:
     """Convert to mono MP3 and upload to the Yemot line (env: YEMOT_USER,
     YEMOT_PASS, YEMOT_PATH, default ivr2:/1). autoNumbering keeps earlier
     episodes; the extension plays the newest first."""
@@ -343,7 +343,7 @@ def yemot_upload(src: Path) -> str:
         raise RuntimeError("המרה נכשלה")
     try:
         bd = "----yt" + os.urandom(8).hex()
-        fields = {"token": f"{user}:{pw}", "path": os.environ.get("YEMOT_PATH", "ivr2:/1"),
+        fields = {"token": f"{user}:{pw}", "path": path or os.environ.get("YEMOT_PATH", "ivr2:/8"),
                   "convertAudio": "1", "autoNumbering": "true"}
         body = b"".join(f'--{bd}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
                         for k, v in fields.items())
@@ -744,7 +744,7 @@ def _handle(job: dict) -> None:
         # Phone line (Yemot): small mono MP3, uploaded to the extension.
         set_progress(vid, stage="convert", pct=None)
         try:
-            msg = yemot_upload(files[-1])
+            msg = yemot_upload(files[-1], job.get("yemotPath") or "")
             dur = PROGRESS.get(vid, {}).get("duration")
             if dur:
                 msg += f" · {round(float(dur) / 60)} דק׳"

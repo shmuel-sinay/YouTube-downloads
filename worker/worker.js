@@ -417,7 +417,7 @@ function israelClock() {
 }
 
 async function checkAllChannels(env, only) {
-  const channels = (await getChannels(env)).filter(only || (() => true));
+  const channels = (await getChannels(env)).filter((c) => !c.reqOnly).filter(only || (() => true));
   let added = 0;
   const errors = [], notes = [];
   for (const ch of channels) {
@@ -825,6 +825,35 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     }
     return json({ ok: true });
   }
+  // --- request-by-phone: Yemot (type=api) calls this during a call ---
+  // Dialog: access code → channel → video; then the video is queued for the
+  // phone line. Answers are plain text in Yemot's grammar ("read=…", "id_list_message=…").
+  // Needs the Worker secret YEMOT_PIN. Each call returns one step.
+  if (p === "/yemot/req") {
+    const q = url.searchParams;
+    const T = (t) => new Response(t, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    const clean = (t) => String(t).replace(/[^\w\u0590-\u05FF ]/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
+    const bye = (m) => T("id_list_message=t-" + m + "&go_to_folder=hangup");
+    if (!env.YEMOT_PIN) return bye("השירות לא מוגדר");
+    if (!q.get("PIN")) return T("read=t-הקישו קוד גישה=PIN,,8,4,Digits,yes");
+    if (q.get("PIN") !== String(env.YEMOT_PIN)) return bye("קוד שגוי");
+    const menv = profileEnv(env, "main");
+    const chs = (await getChannels(menv)).filter((c) => c.req).slice(0, 9);
+    if (!chs.length) return bye("אין ערוצים זמינים לבקשה");
+    if (!q.get("CH")) return T("read=t-" + chs.map((c, i) => "לערוץ " + clean(c.name) + " הקישו " + (i + 1)).join(" ") + "=CH,,1,1,Digits,yes");
+    const ch = chs[parseInt(q.get("CH"), 10) - 1];
+    if (!ch) return bye("בחירה שגויה");
+    let vids = [];
+    try { vids = (await readFeed(ch.id)).entries.filter((e) => !e.isShort).slice(0, 5); } catch (e) {}
+    if (!vids.length) return bye("לא נמצאו סרטונים");
+    if (!q.get("V")) return T("read=t-" + vids.map((e, i) => "לסרטון " + clean(e.title) + " הקישו " + (i + 1)).join(" ") + "=V,,1,1,Digits,yes");
+    const e = vids[parseInt(q.get("V"), 10) - 1];
+    if (!e) return bye("בחירה שגויה");
+    await addJobs(menv, [{ ...jobFor(ch, e), mode: "m4a", yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/6", priority: Date.now() }]);
+    wake();
+    await addLog(menv, "worker", "בקשה מהטלפון: " + e.title);
+    return bye("הבקשה התקבלה הסרטון יהיה מוכן להאזנה בעוד כמה דקות");
+  }
   const pid = await whoIs(req, env);
   if (!pid) {
     if (!env.ADMIN_PASSWORD) return page("הגדרה חסרה", "<p>חסר Secret בשם <b>ADMIN_PASSWORD</b> ב-Worker. ראה README.</p>");
@@ -1180,11 +1209,12 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         };
         // "Upload to the phone line (Yemot)" — only the admin's own tracker.
         if (f.get("yemot") === "on" && (env.PROFILE || "main") === "main") ch.yemot = true;
+        if (f.get("req") === "on" && (env.PROFILE || "main") === "main") { ch.req = true; ch.reqOnly = true; delete ch.yemot; }
         channels.push(ch);
         await putJSON(env, "channels", channels);
         // Everything already on the channel counts as "seen" — except the
         // newest N, which are queued now if the user asked for a backfill.
-        const backfill = Math.max(0, Math.min(15, parseInt(f.get("backfill") || "0", 10) || 0));
+        const backfill = ch.reqOnly ? 0 : Math.max(0, Math.min(15, parseInt(f.get("backfill") || "0", 10) || 0));
         const take = entries.filter((e) => !(ch.skipShorts && e.isShort)).slice(0, backfill);
         await addJobs(env, take.map((e) => jobFor(ch, e)));
         await putJSON(env, "seen:" + id, entries.map((e) => e.videoId));
@@ -1797,6 +1827,7 @@ async function dashboard(env) {
         <input type="hidden" name="skipShorts" value="on">
         <div class="cbar">
           <input name="channel" placeholder="קישור לערוץ או פלייליסט להעלאה לקו" required style="flex:1;min-width:200px">
+          <label class="check" style="margin:0"><input type="checkbox" name="req">לבקשה בטלפון בלבד (לא מעלה לבד)</label>
           <label class="field" style="margin:0">אורך פרק מלא (דקות) <input name="minMinutes" type="number" min="0" value="40" style="width:70px"></label>
           <label class="field" style="margin:0">להעלות עכשיו את האחרונים <input name="backfill" type="number" min="0" max="15" value="3" style="width:70px"></label>
           <button class="btn">${icon("add")}<span>הוסף לקו</span></button>
@@ -2043,7 +2074,7 @@ function render() {
     : '<div class="empty">' + icon("queue") + '<div>' + (FILTER === "all" ? "התור ריק — הוסף סרטון, ערוץ או כמות סרטונים בעמוד \\"הוספה\\"." : "אין פריטים כאן") + '</div></div>';
   $("channels").innerHTML = S.channels.length ? S.channels.map((c) =>
     '<div class="ch"><div class="avatar">' + esc((c.name || "?").trim().charAt(0)) + '</div><div class="info">' +
-    '<div class="title"><a href="' + (/^UC/.test(c.id) ? "https://www.youtube.com/channel/" + esc(c.id) : "https://www.youtube.com/playlist?list=" + esc(c.id)) + '" target="_blank" rel="noopener">' + esc(c.name) + '</a>' + (c.yemot ? ' <span class="tag">קו טלפון</span>' : '') + '</div>' +
+    '<div class="title"><a href="' + (/^UC/.test(c.id) ? "https://www.youtube.com/channel/" + esc(c.id) : "https://www.youtube.com/playlist?list=" + esc(c.id)) + '" target="_blank" rel="noopener">' + esc(c.name) + '</a>' + (c.yemot ? ' <span class="tag">קו טלפון</span>' : '') + (c.req ? ' <span class="tag">לבקשה בטלפון</span>' : '') + '</div>' +
     '<div class="meta">' + icon(/^video/.test(c.mode || "") ? "video" : "music") + ' ' + esc(MODES[c.mode] || MODES.audio) +
     (c.minMinutes ? '<span class="sep">•</span>' + c.minMinutes + ' דק׳ ומעלה' : '') + (c.skipShorts ? '<span class="sep">•</span>בלי Shorts' : '') + '</div></div>' +
     '<div class="acts">' + btn("batch", c.id, "download", "הורד כמות סרטונים מהערוץ", "primary") + btn("remove", c.id, "trash", "הסר ערוץ", "danger") + '</div></div>').join("")
