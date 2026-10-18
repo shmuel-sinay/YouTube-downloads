@@ -1,6 +1,7 @@
 # YT-LINE v1
 @שלוחה 1 = ישיבישן | השקפה ישיבתית
 @שלוחה 2 = הפטריוטים | *
+@שלוחה 3 = הועלה ידנית | #ידני
 
 [פאנלים ואקטואליה]
 https://www.youtube.com/playlist?list=PL8E54R76rowCcCOn_HQf36o1RF3_oD3z4 | הפטריוטים | auto | 40

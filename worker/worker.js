@@ -247,6 +247,12 @@ function adultBlocked(u) {
 
 async function addJobs(env, jobs) {
   if (!jobs.length) return;
+  // Uploads to the phone line with no folder of their own (added by hand in the Add tab) go to the
+  // sub-extension marked "#ידני" in the phone config, if there is one.
+  if (jobs.some((j) => j.yemot && !j.yemotPath)) {
+    const cfg = await getJSON(env, "phonecfg", { subs: [] }), man = (cfg.subs || []).find((x) => x.cats.includes("#ידני"));
+    if (man) for (const j of jobs) if (j.yemot && !j.yemotPath) j.yemotPath = (env.YEMOT_PATH || "ivr2:/8") + "/" + man.n;
+  }
   // A NetFree-only profile: videos wait until the desktop app (behind
   // NetFree) confirms they're open. Lists/searches expand first.
   // A profile that downloads on its own computer skips this: the download is the check.
@@ -1296,6 +1302,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       "#    דקות (לא חובה, מספר שלם): אורך מינימלי של פרק מלא, רלוונטי רק ל-auto/both. 0 או ריק = בלי.",
       "# 2א. שלוחות משנה (אופציונלי, בראש הקובץ, לפני הקטגוריות): הקו מתפצל לשלוחות לפי נושא, וערוצי auto של קטגוריה נכנסים לשלוחה שלה ונשמרים שם תמיד.",
       "#    פורמט שורה:  @שלוחה מספר = שם מוקרא | קטגוריה, קטגוריה   (למשל: @שלוחה 1 = ישיבישן | השקפה ישיבתית). הסימן * במקום קטגוריה = כל השאר. אפשר להשאיר בלי שורות כאלה.",
+      "#    שורה עם #ידני במקום קטגוריה (למשל: @שלוחה 3 = הועלה ידנית | #ידני) = שלוחה לדברים שמעלים ידנית מלשונית ההוספה, ולא מערוץ.",
       "#    רק קטגוריות שנכתבו או * מקבלות שלוחה משלהן. מספרים 1-9 ללא כפילות. הקטגוריה בשורת @שלוחה חייבת להיות זהה לשם בסוגריים המרובעים.",
       "# 3. שורה שמתחילה ב-# היא הערה ומתעלמים ממנה. שורות ריקות מותרות.",
       "#",
@@ -2123,8 +2130,8 @@ async function dashboard(env) {
       <div class="cbar" style="margin-top:12px"><a class="btn ghost" href="${BASE}/phone/export" download>ייצוא לקובץ</a>
         <label class="btn ghost" style="cursor:pointer">ייבוא מקובץ<input type="file" id="phoneImp" accept=".txt,text/plain" hidden></label></div></div>
     <div class="card"><h2>${icon("layers")}שלוחות משנה של שלוחה 8</h2>
-      <p class="sub">שורה לכל שלוחה: <b>מספר = שם מוקרא | קטגוריות</b> (למשל <code>1 = ישיבישן | השקפה ישיבתית</code>). הסימן * = כל השאר. ערוצי "אוטומטי" נכנסים לשלוחה של הקטגוריה שלהם. בלי שורות = שלוחה אחת כמו היום.</p>
-      <textarea id="subsText" rows="4" style="width:100%;direction:rtl" placeholder="1 = ישיבישן | השקפה ישיבתית&#10;2 = הפטריוטים | *"></textarea>
+      <p class="sub">שורה לכל שלוחה: <b>מספר = שם מוקרא | קטגוריות</b> (למשל <code>1 = ישיבישן | השקפה ישיבתית</code>). הסימן * = כל השאר, <code>#ידני</code> = מה שמעלים ידנית מלשונית ההוספה. ערוצי "אוטומטי" נכנסים לשלוחה של הקטגוריה שלהם. בלי שורות = שלוחה אחת כמו היום.</p>
+      <textarea id="subsText" rows="4" style="width:100%;direction:rtl" placeholder="1 = ישיבישן | השקפה ישיבתית&#10;2 = הפטריוטים | *&#10;3 = הועלה ידנית | #ידני"></textarea>
       <div class="cbar" style="margin-top:8px"><button class="btn" id="subsSave" type="button">שמור</button><span class="sub" id="subsMsg" style="margin:0"></span></div></div>
     <div class="card hidden" id="askCard"><h2>${icon("queue")}בקשה מהאתר</h2><div id="askList"></div></div>
     <div class="card"><h2>${icon("queue")}בקשות מהטלפון</h2><div id="phoneReqs"></div></div>
