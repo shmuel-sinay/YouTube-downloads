@@ -1231,10 +1231,31 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   if (p === "/phone/export" && pid === "main") {
     const chs = (await getChannels(rootEnv)).filter((c) => c.yemot || c.req), by = {};
     chs.forEach((c) => (by[c.cat || "כללי"] = by[c.cat || "כללי"] || []).push(c));
-    const head = ["# YT-LINE v1 — ערוצים לקו הטלפון. שמור על המבנה בדיוק, ערוך רק קטגוריות ושורות.",
-      "# [שם קטגוריה] בשורה לבד פותח קטגוריה (אקשן, פודקאסטים, שיעורים…). מתחתיו ערוץ בכל שורה:",
-      "# קישור | שם | מצב | דקות   (קישור חובה. שם לתצוגה. מצב: req=לבקשה בלבד (ברירת מחדל), auto=עולה לבד, both=שניהם. דקות=אורך פרק מלא ל-auto, לא חובה)",
-      "# שורות עם # בהתחלה הן הערות. מותר להעביר ערוצים בין קטגוריות, להוסיף ולמחוק שורות. כל קישור פעם אחת. החזר את הקובץ הזה בלבד, בלי הסברים.", ""];
+    const head = ["# YT-LINE v1 — רשימת ערוצים ופלייליסטים של קו טלפון (ימות המשיח), להשלמה ולעריכה.",
+      "#",
+      "# מה זה: המאזין מתקשר, בוחר קטגוריה ואז ערוץ או סרטון, והסרטון יורד ומועלה לקו. הקובץ הזה מגדיר אילו ערוצים יש ובאיזו קטגוריה.",
+      "# המשימה שלך: לסדר את הערוצים לקטגוריות לפי תוכן (למשל אקשן, פודקאסטים, שיעורים), ולהחזיר קובץ טקסט בדיוק במבנה הזה.",
+      "#",
+      "# המבנה:",
+      "# 1. שורת קטגוריה: שם בסוגריים מרובעים בשורה לבד, למשל [שיעורים]. שם קצר וברור (עד 30 תווים), כי הוא מוקרא בקול למאזין. בלי סוגריים בתוך השם.",
+      "# 2. מתחת לקטגוריה, כל ערוץ בשורה אחת בלבד, בצורה:  קישור | שם | מצב | דקות",
+      "#    קישור (חובה): קישור לערוץ, ל-@handle או לפלייליסט ביוטיוב. כל קישור פעם אחת בקובץ, בקטגוריה אחת. אל תשנה קישורים קיימים ואל תמציא קישורים.",
+      "#    שם (לא חובה): לתצוגה בלבד. אפשר להשאיר ריק, אבל חייבים להשאיר את שני הקווים האנכיים אם ממשיכים לשדות הבאים.",
+      "#    מצב (לא חובה, ברירת מחדל req):",
+      "#       req  = לבקשה בטלפון בלבד: המאזין מבקש סרטון בעצמו, שום דבר לא עולה לבד.",
+      "#       auto = העלאה אוטומטית: כל סרטון חדש בערוץ עולה לבד לשלוחה הראשית. רק לערוצים שרוצים לשמוע כל פרק בלי לבקש.",
+      "#       both = גם אוטומטי וגם זמין לבקשה.",
+      "#       del  = להסיר את הערוץ מהקו. השתמש רק אם המשתמש ביקש להסיר ערוץ.",
+      "#    דקות (לא חובה, מספר שלם): אורך מינימלי של פרק מלא, רלוונטי רק ל-auto/both. 0 או ריק = בלי.",
+      "# 3. שורה שמתחילה ב-# היא הערה ומתעלמים ממנה. שורות ריקות מותרות.",
+      "#",
+      "# כללים והגבלות:",
+      "# - אל תוסיף טקסט, הסברים או עיצוב (בלי Markdown, בלי טבלאות, בלי גרשיים). החזר את הקובץ בלבד, מותר להשאיר את שורות ההערה האלה.",
+      "# - שורה בלי קישור תקין תידחה. אין מגבלה על מספר הערוצים.",
+      "# - ערוץ שלא מופיע בקובץ נשאר כפי שהוא, אלא אם ייבאו עם אפשרות הסרה מפורשת. כדי להסיר ערוץ בוודאות, כתוב לו מצב del.",
+      "# - ערוץ שכבר קיים: הקובץ מעדכן את הקטגוריה והמצב שלו. ערוץ חדש: נוסף.",
+      "# - אל תשנה את שורת הכותרת הראשונה (YT-LINE v1).",
+      ""];
     const body = Object.entries(by).map(([k, v]) => "[" + k + "]\n" + v.map((c) =>
       "https://www.youtube.com/" + (/^UC/.test(c.id) ? "channel/" : "playlist?list=") + c.id + " | " + c.name.replace(/\|/g, " ") + " | " +
       (c.yemot && c.req ? "both" : c.req ? "req" : "auto") + (c.minMinutes ? " | " + c.minMinutes : "")).join("\n")).join("\n\n");
@@ -1243,7 +1264,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   if (p === "/phone/import" && req.method === "POST" && pid === "main") {
     const text = String((await req.formData()).get("text") || ""), ids = [];
     const channels = await getChannels(rootEnv);
-    let cat = "", added = 0, upd = 0, bad = 0;
+    let cat = "", added = 0, upd = 0, bad = 0, dels = 0;
     for (const raw of text.split(/\r?\n/)) {
       const line = raw.trim();
       if (!line || line.startsWith("#")) continue;
@@ -1252,6 +1273,15 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const [url, nm, mode, mins] = line.split("|").map((x) => x.trim());
       let id; try { id = await resolveChannelId(url); } catch (e) { bad++; continue; }
       let c = channels.find((x) => x.id === id);
+      if (mode === "del") {
+        // Removal chosen in the file: off the phone line; a channel that existed only for the phone is deleted.
+        if (c) {
+          delete c.yemot; delete c.req; delete c.cat;
+          if (c.reqOnly) channels.splice(channels.indexOf(c), 1);
+          dels++;
+        }
+        continue;
+      }
       if (!c) {
         try { c = { id, name: nm || (await readFeed(id)).name, mode: "m4a", minMinutes: 0, skipShorts: true, added: new Date().toISOString() }; } catch (e) { bad++; continue; }
         channels.push(c); added++;
@@ -1267,7 +1297,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     await putJSON(rootEnv, "channels", channels);
     await rootEnv.DB.delete("phonebrowse");
     await addLog(rootEnv, "worker", `ייבוא ערוצים לקו: ${added} חדשים, ${upd} עודכנו` + (bad ? `, ${bad} לא תקינים` : ""));
-    return json({ added, upd, bad, ids });
+    return json({ added, upd, bad, dels, ids });
   }
   // After an import with "remove what is not in the file": take everything else off the phone line.
   if (p === "/phone/prune" && req.method === "POST" && pid === "main") {
@@ -2568,17 +2598,17 @@ $("phoneImp").onchange = async (e) => {
   }
   const prune = $("phonePrune").checked;
   if (prune && !confirm("ערוצים בקו שלא מופיעים בקובץ יוסרו מהקו. להמשיך?")) return;
-  let a = 0, u = 0, b = 0; const ids = [];
+  let a = 0, u = 0, b = 0, dl = 0; const ids = [];
   try {
     for (let i = 0; i < chunks.length; i++) {
       toast("מייבא… " + (i + 1) + "/" + chunks.length, 30000);
       const d = new FormData(); d.append("text", (chunks[i].cat ? chunks[i].cat + "\n" : "") + chunks[i].join("\n"));
       const r = await (await post("/phone/import", d)).json();
-      a += r.added; u += r.upd; b += r.bad; ids.push(...r.ids);
+      a += r.added; u += r.upd; b += r.bad; dl += r.dels; ids.push(...r.ids);
     }
     let rm = 0;
     if (prune) { const d = new FormData(); d.append("ids", JSON.stringify(ids)); rm = (await (await post("/phone/prune", d)).json()).n; }
-    toast("יובא: " + a + " חדשים, " + u + " עודכנו" + (b ? ", " + b + " לא תקינים" : "") + (prune ? ", " + rm + " הוסרו" : ""), 9000); refresh();
+    toast("יובא: " + a + " חדשים, " + u + " עודכנו" + (b ? ", " + b + " לא תקינים" : "") + (dl ? ", " + dl + " הוסרו לפי הקובץ" : "") + (prune ? ", " + rm + " הוסרו" : ""), 9000); refresh();
   } catch (x) { toast("שגיאה: " + x.message, 8000); }
 };
 $("askList").onclick = async (e) => {
