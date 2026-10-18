@@ -401,7 +401,8 @@ async function readFeed(channelId) {
 // A "filtered" channel is a slice of a big channel (e.g. one rabbi inside Kol HaLashon): id = "UC…|words", src = the real
 // channel, match = words that must all appear in the title. Its videos come from the channel's RSS plus a search inside the channel.
 const normT = (t) => String(t).toLowerCase().replace(/[֑-ׇ"'׳״]/g, "").replace(/\s+/g, " ").trim();
-const hasWords = (title, kw) => { const t = normT(title); return normT(kw).split(" ").filter(Boolean).every((w) => t.includes(w)); };
+// Words must all appear; a word starting with "-" must NOT appear (e.g. "משה שפירא -שמואל").
+const hasWords = (title, kw) => { const t = normT(title); return normT(kw).split(" ").filter(Boolean).every((w) => (w[0] === "-" ? w.length < 2 || !t.includes(w.slice(1)) : t.includes(w))); };
 async function searchChannel(src, kw) {
   const r = await fetch("https://www.youtube.com/channel/" + src + "/search?query=" + encodeURIComponent(kw), {
     headers: { "User-Agent": "Mozilla/5.0", "Accept-Language": "he,en", Cookie: "CONSENT=YES+1" }, signal: AbortSignal.timeout(15000) });
