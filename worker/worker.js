@@ -1132,7 +1132,12 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         // Already tracked: don't ignore silently — apply the phone-line flag
         // and the "download the latest now" request to it.
         const wantY = f.get("yemot") === "on" && (env.PROFILE || "main") === "main";
-        if (wantY && !exist.yemot) { exist.yemot = true; await putJSON(env, "channels", channels); }
+        const mm = f.get("minMinutes");
+        if (wantY && (!exist.yemot || (mm !== null && mm !== "" && +mm !== exist.minMinutes))) {
+          exist.yemot = true;
+          if (mm !== null && mm !== "") exist.minMinutes = Math.max(0, parseInt(mm, 10) || 0);
+          await putJSON(env, "channels", channels);
+        }
         const bf = Math.max(0, Math.min(15, parseInt(f.get("backfill") || "0", 10) || 0));
         let n = 0;
         if (bf) {
@@ -1761,10 +1766,11 @@ async function dashboard(env) {
       <div id="phoneInfo"></div>
       <form data-action="/channels/add" style="margin-top:14px">
         <input type="hidden" name="yemot" value="on"><input type="hidden" name="mode" value="m4a">
-        <input type="hidden" name="minMinutes" value="0"><input type="hidden" name="skipShorts" value="on">
+        <input type="hidden" name="skipShorts" value="on">
         <div class="cbar">
           <input name="channel" placeholder="קישור לערוץ או פלייליסט להעלאה לקו" required style="flex:1;min-width:200px">
-          <label class="field" style="margin:0">להעלות עכשיו את האחרונים <input name="backfill" type="number" min="0" max="15" value="1" style="width:70px"></label>
+          <label class="field" style="margin:0">אורך מינימלי (דקות) <input name="minMinutes" type="number" min="0" value="20" style="width:70px"></label>
+          <label class="field" style="margin:0">להעלות עכשיו את האחרונים <input name="backfill" type="number" min="0" max="15" value="3" style="width:70px"></label>
           <button class="btn">${icon("add")}<span>הוסף לקו</span></button>
         </div>
       </form></div>
@@ -2221,7 +2227,7 @@ function renderPhone() {
   const last = jobs.find((j) => j.status === "done");
   const busy = jobs.filter((j) => ["queued", "taken"].includes(j.status)).length;
   $("phoneInfo").innerHTML = chs.length
-    ? chs.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>נבדק אוטומטית כל 3 שעות · כל פרק חדש מועלה לשלוחה</span></div>' + btn("remove", c.id, "trash", "הסר מהקו", "danger") + '</div>').join("") +
+    ? chs.map((c) => '<div class="setting"><div class="txt"><b>' + esc(c.name) + '</b><span>נבדק אוטומטית כל 3 שעות · ' + (c.minMinutes ? "רק פרקים של " + c.minMinutes + " דקות ומעלה (קצרים מדולגים, והבדיקה ממשיכה)" : "כל פרק חדש") + ' · לשינוי: מוסיפים שוב עם אורך אחר</span></div>' + btn("remove", c.id, "trash", "הסר מהקו", "danger") + '</div>').join("") +
       '<div class="setting"><div class="txt"><b>מצב</b><span>' +
       (busy ? busy + " בדרך (הורדה/העלאה)" : "אין כרגע פרק בדרך") + " · " +
       (last ? "הועלה לאחרונה " + ago(last.updated) + " — " + esc(last.title) : "עוד לא הועלה פרק") + '</span></div></div>'
