@@ -2592,12 +2592,12 @@ async function loadLineFiles() {
 $("lineFilesLoad").onclick = loadLineFiles;
 $("phoneImp").onchange = async (e) => {
   const file = e.target.files[0]; if (!file) return;
-  const lines = (await file.text()).split(/\r?\n/); e.target.value = "";
+  const lines = (await file.text()).split(/\\r?\\n/); e.target.value = "";
   // Sent in chunks of 20 channels (Worker limit per request) — so any number of channels works.
   const chunks = []; let cat = "", cur = [];
   for (const raw of lines) {
     const l = raw.trim(); if (!l || l[0] === "#") continue;
-    if (/^\[.+\]$/.test(l)) { cat = l; continue; }
+    if (/^\\[.+\\]$/.test(l)) { cat = l; continue; }
     if (!cur.length || cur.length >= 20 || cur.cat !== cat) { cur = []; cur.cat = cat; chunks.push(cur); }
     cur.push(l);
   }
@@ -2607,7 +2607,7 @@ $("phoneImp").onchange = async (e) => {
     a = u = b = dl = 0; ids = []; addN = []; delN = [];
     for (let i = 0; i < chunks.length; i++) {
       toast((dry ? "בודק… " : "מייבא… ") + (i + 1) + "/" + chunks.length, 30000);
-      const d = new FormData(); d.append("text", (chunks[i].cat ? chunks[i].cat + "\n" : "") + chunks[i].join("\n")); if (dry) d.append("dry", "1");
+      const d = new FormData(); d.append("text", (chunks[i].cat ? chunks[i].cat + "\\n" : "") + chunks[i].join("\\n")); if (dry) d.append("dry", "1");
       const r = await (await post("/phone/import", d)).json();
       a += r.added; u += r.upd; b += r.bad; dl += r.dels; ids.push(...r.ids); addN.push(...r.addN); delN.push(...r.delN);
     }
