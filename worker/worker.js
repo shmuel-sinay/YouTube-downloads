@@ -986,7 +986,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         const a = q.get("A" + k);
         if (a === "1") {
           const it = all[pos];
-          await addJobs(menv, [{ ...jobFor(it.ch, it.e), mode: "m4a", yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
+          await addJobs(menv, [{ ...jobFor(it.ch, it.e), mode: "m4a", minMinutes: 0, yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
           wake();
           await addLog(menv, "worker", "בקשה מהטלפון: " + it.e.title);
           return bye("הבקשה התקבלה הסרטון יהיה מוכן להאזנה בעוד כמה דקות");
@@ -1037,7 +1037,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (!q.get("V")) return T("read=t-" + vids.map((e, i) => "לסרטון " + clean(e.title) + " הקישו " + (i + 1)).join(" ") + "=" + D("V", 1, 1));
     const e = vids[parseInt(q.get("V"), 10) - 1];
     if (!e) return bye("בחירה שגויה");
-    await addJobs(menv, [{ ...jobFor(ch, e), mode: "m4a", yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
+    await addJobs(menv, [{ ...jobFor(ch, e), mode: "m4a", minMinutes: 0, yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
     wake();
     await addLog(menv, "worker", "בקשה מהטלפון: " + e.title);
     return bye("הבקשה התקבלה הסרטון יהיה מוכן להאזנה בעוד כמה דקות");
@@ -1493,7 +1493,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (!f) return json({ name: ch.name, entries: entries.slice(0, 10).map((e) => ({ videoId: e.videoId, title: e.title, published: e.published })) });
       const e = entries.find((x) => x.videoId === String(f.get("videoId")));
       if (!e) return json({ error: "הסרטון לא נמצא" }, 404);
-      await addJobs(rootEnv, [{ ...jobFor(ch, e), mode: "m4a", yemot: true, yemotPath: rootEnv.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
+      await addJobs(rootEnv, [{ ...jobFor(ch, e), mode: "m4a", minMinutes: 0, yemot: true, yemotPath: rootEnv.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
       wake();
       await addLog(rootEnv, "worker", "בקשה מהאתר לקו: " + e.title);
       return json({ ok: true });
