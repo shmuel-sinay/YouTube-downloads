@@ -224,6 +224,8 @@ function videoFromUrl(line) {
   }
   return null;
 }
+// A link is YouTube (the only source allowed for NetFree-restricted profiles).
+function isYouTubeUrl(u) { return /youtube\.com|youtu\.be/.test(u || ""); }
 
 async function addJobs(env, jobs) {
   if (!jobs.length) return;
@@ -1174,13 +1176,14 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         const v = videoFromUrl(line);
         const pl = line.match(/[?&]list=([\w-]+)/);
         if (v && !pl) {
-          if (v.source === "tiktok" && ttBlocked) return;     // not for NetFree profiles
+          if (v.source !== "youtube" && ttBlocked) return;    // NetFree profiles: YouTube only
           jobs.push({ ...base, videoId: v.videoId, channelName: "רשימה", title: v.videoId, url: v.url, source: v.source });
         } else if (/^https?:\/\//.test(line)) {
-          if (/tiktok\.com/.test(line) && ttBlocked) return;  // TikTok account not for NetFree profiles
-          // playlist / channel link: expand it like "N videos from a channel"
+          if (!isYouTubeUrl(line) && ttBlocked) return;        // NetFree profiles: YouTube only
+          // playlist / channel / account link: expand it like "N videos from a channel"
+          const src = /tiktok\.com/.test(line) ? "tiktok" : isYouTubeUrl(line) ? "" : "other";
           jobs.push({ ...base, kind: "list", videoId: "list-" + (now + i).toString(36), channelName: "רשימה",
-                      title: "כל הסרטונים מ: " + line, url: line, count: 300, source: /tiktok\.com/.test(line) ? "tiktok" : "" });
+                      title: "כל הסרטונים מ: " + line, url: line, count: 300, source: src });
         } else {
           jobs.push({ ...base, kind: "search", videoId: "q-" + (now + i).toString(36), channelName: "חיפוש",
                       title: line, query: line });
@@ -1249,15 +1252,20 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       return redirect(BASE + "/");
     }
     if (p === "/jobs/add") {
-      // Manual one-off: paste a video link (YouTube or TikTok).
-      const v = videoFromUrl(String(f.get("url") || ""));
-      if (v && v.source === "tiktok" && (await profileInfo(env, env.PROFILE)).netfree)
-        return new Response("טיקטוק לא זמין בפרופיל הזה", { status: 400 });
-      if (v) await addJobs(env, [{
-        videoId: v.videoId, channelId: "", channelName: "ידני", title: v.videoId, source: v.source,
-        published: "", url: v.url, mode: modeOf(f.get("mode")), minMinutes: 0,
-        status: "queued", updated: new Date().toISOString() }]);
-      if (v) wake();
+      // Manual one-off: paste any video link (YouTube, TikTok, or any site
+      // yt-dlp supports). A NetFree-restricted profile may only use YouTube.
+      const raw = String(f.get("url") || "").trim();
+      const u = (raw.match(/https?:\/\/[^\s]+/) || [])[0];
+      const v = videoFromUrl(raw) || (u ? { videoId: "x-" + Math.random().toString(36).slice(2, 11), url: u, source: "other" } : null);
+      if (v && v.source !== "youtube" && (await profileInfo(env, env.PROFILE)).netfree)
+        return new Response("בפרופיל הזה אפשר להוריד רק מיוטיוב", { status: 400 });
+      if (v) {
+        await addJobs(env, [{
+          videoId: v.videoId, channelId: "", channelName: "ידני", title: v.videoId, source: v.source,
+          published: "", url: v.url, mode: modeOf(f.get("mode")), minMinutes: 0,
+          status: "queued", updated: new Date().toISOString() }]);
+        wake();
+      }
       return redirect(BASE + "/");
     }
   }
@@ -1642,15 +1650,15 @@ async function dashboard(env) {
   <section data-p="add" class="hidden">
     <div class="cols">
       <form class="card" data-action="/jobs/add">
-        <h2>${icon("download")}סרטון בודד</h2><p class="sub">קישור לסרטון מיוטיוב<span class="ttHint"> או מטיקטוק</span> — יורד מיד.</p>
+        <h2>${icon("download")}סרטון בודד</h2><p class="sub">קישור לסרטון מיוטיוב<span class="ttHint">, מטיקטוק או מכל אתר נתמך</span> — יורד מיד.</p>
         <div class="grid">
-          <label class="field wide">קישור<input name="url" placeholder="https://www.youtube.com/watch?v=…  או  https://www.tiktok.com/@…" required></label>
+          <label class="field wide">קישור<input name="url" placeholder="קישור מיוטיוב, טיקטוק, אינסטגרם, X, וימאו ועוד…" required></label>
           <label class="field">סוג<select name="mode">${modeOptions}</select></label>
         </div>
         <div class="actions-row"><button class="btn">${icon("add")}<span>הוסף לתור</span></button></div>
       </form>
       <form class="card" data-action="/jobs/list">
-        <h2>${icon("queue")}רשימת שירים או קישורים</h2><p class="sub">שורה לכל פריט: קישור ליוטיוב<span class="ttHint"> או לטיקטוק</span>, או שם לחיפוש (זמר - שיר).</p>
+        <h2>${icon("queue")}רשימת שירים או קישורים</h2><p class="sub">שורה לכל פריט: קישור<span class="ttHint"> (יוטיוב, טיקטוק או אתר אחר)</span>, או שם לחיפוש (זמר - שיר).</p>
         <div class="grid">
           <label class="field wide">הרשימה<textarea name="lines" rows="6" required placeholder="נפתלי קמפה - גרש את העצבות&#10;https://www.youtube.com/watch?v=…&#10;מוטי וייס - רפ״ב"></textarea></label>
           <label class="field">סוג<select name="mode">${modeOptions}</select></label>
@@ -1828,7 +1836,8 @@ function jobRow(j) {
   const thumb = list ? '<div class="thumb">' + icon(j.kind === "search" ? "queue" : "layers") + '</div>'
     : '<img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">';
   const modeIc = /^video/.test(j.mode || "") ? "video" : "music";
-  const meta = [esc(j.channelName || "קישור ידני"), j.source === "tiktok" ? "TikTok" : "", icon(modeIc) + " " + esc(MODES[j.mode] || MODES.audio),
+  const srcTag = j.source === "tiktok" ? "TikTok" : (j.source === "other" && j.url ? (j.url.match(/https?:\/\/(?:www\.)?([^\/]+)/) || ["", ""])[1] : "");
+  const meta = [esc(j.channelName || "קישור ידני"), srcTag ? esc(srcTag) : "", icon(modeIc) + " " + esc(MODES[j.mode] || MODES.audio),
     j.pcConvert ? icon("zap") + " המרה במחשב" : "", j.pcGot ? icon("monitor") + " במחשב" : "",
     icon("clock") + " " + ago(j.updated)].filter(Boolean).join('<span class="sep">•</span>');
   const a = [];

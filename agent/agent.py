@@ -550,10 +550,11 @@ def handle_list(job: dict) -> None:
         if min_s and dur is not None and dur < min_s:
             continue
         wurl = parts[2] if parts[2].startswith("http") else None
-        item = {"videoId": parts[0] if is_yt else ("tt" + parts[0]), "title": parts[3], "duration": dur}
+        pfx = "tt" if "tiktok.com" in job["url"] else "x-"
+        item = {"videoId": parts[0] if is_yt else (pfx + parts[0]), "title": parts[3], "duration": dur}
         if not is_yt:
             item["url"] = wurl or job["url"]
-            item["source"] = "tiktok" if "tiktok.com" in job["url"] else ""
+            item["source"] = "tiktok" if "tiktok.com" in job["url"] else "other"
         items.append(item)
         if len(items) >= count:
             break
@@ -719,6 +720,10 @@ def _handle(job: dict) -> None:
         status, err = "skipped", f"קצר מ-{job.get('minMinutes')} דקות"
     elif "age restricted" in out or "age-restricted" in out:
         status, err = "skipped", "הגבלת גיל"
+    elif "Unsupported URL" in out:
+        status, err = "failed", "האתר הזה לא נתמך להורדה"
+    elif "requested format" in out.lower() and "not available" in out.lower():
+        status, err = "failed", "אין פורמט מתאים להורדה בקישור הזה"
     else:
         errs = [l for l in out.splitlines() if "ERROR" in l or "error" in l]
         status, err = "failed", (errs[-1] if errs else f"yt-dlp exit {r.returncode}")
