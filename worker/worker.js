@@ -2443,7 +2443,14 @@ async function loadLineFiles() {
     const d = await (await fetch(B + "/yemot/ls", { cache: "no-store" })).json();
     if (d.error) { $("lineFilesInfo").innerHTML = '<span class="bad">' + esc(d.error) + "</span>"; return; }
     $("lineFilesInfo").textContent = d.files.length + " קבצים";
-    $("lineFiles").innerHTML = d.files.map((f) => '<div class="setting"><div class="txt"><b>' + esc(f.name) + '</b><span>' + esc(f.dir) + " · " +
+    // The line only knows numbered names (001.wav); the real titles come from the jobs that uploaded them.
+    const titles = {};
+    S.jobs.filter((j) => j.yemot && j.status === "done").forEach((j) => {
+      const m = String(j.error || "").match(/ivr2?[:/]*\\/?([\\d/]+?)\\/(\\d+\\.\\w+)/);
+      if (m && !titles[m[1] + "/" + m[2]]) titles[m[1] + "/" + m[2]] = j.title;
+    });
+    const real = (f) => titles[String(f.dir).replace(/^ivr2?[:/]*\\/?/, "") + "/" + f.name];
+    $("lineFiles").innerHTML = d.files.map((f) => '<div class="setting"><div class="txt"><b>' + esc(real(f) || f.name) + '</b><span>' + (real(f) ? esc(f.name) + " · " : "") + esc(f.dir) + " · " +
       Math.round(f.size / 1024) + " KB · " + esc(f.mtime) + '</span></div><button class="ibtn danger" data-lf="' + esc(f.name) + '" data-dir="' + esc(f.dir) + '" title="מחק">' + icon("trash") + "</button></div>").join("");
   } catch (e) { $("lineFilesInfo").textContent = "שגיאה: " + e; }
 }
