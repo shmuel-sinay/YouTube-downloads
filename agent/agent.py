@@ -596,7 +596,7 @@ def handle_list(job: dict) -> None:
         return
     res = api("/api/enqueue", {"items": items, "mode": job.get("mode"), "minMinutes": job.get("minMinutes"),
                                 "channelId": job.get("channelId"), "channelName": job.get("channelName"),
-                                "yemot": bool(job.get("yemot"))})
+                                "yemot": bool(job.get("yemot")), "yemotPath": job.get("yemotPath") or ""})
     msg = f"נוספו לתור {res.get('added', 0)} סרטונים" + (f" ({res['skipped']} כבר היו)" if res.get("skipped") else "")
     api("/api/report", {"videoId": vid, "status": "done", "error": msg})
     log("   " + msg)
@@ -642,7 +642,7 @@ def handle_search(job: dict) -> None:
         for rank, m in enumerate(matches):
             m.update(group=vid, rank=rank)
     api("/api/enqueue", {"items": matches if want > 1 else [found], "mode": job.get("mode"), "minMinutes": job.get("minMinutes"),
-                         "channelName": "חיפוש: " + q, "replace": vid, "yemot": bool(job.get("yemot")),
+                         "channelName": "חיפוש: " + q, "replace": vid, "yemot": bool(job.get("yemot")), "yemotPath": job.get("yemotPath") or "",
                          "priority": (job.get("priority") or 0) + 1})  # download it right away
     log(f"   נמצא: {found['title']}" + (f" (+{len(matches) - 1} חלופות לבדיקת נטפרי)" if want > 1 else ""))
 

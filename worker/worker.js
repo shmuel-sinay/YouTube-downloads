@@ -755,7 +755,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         videoId: it.videoId, channelId: b.channelId || "", channelName: b.channelName || "",
         title: it.title || it.videoId, published: "", url: it.url || ("https://www.youtube.com/watch?v=" + it.videoId),
         source: it.source || b.source || "", mode: b.yemot ? "m4a" : modeOf(b.mode), minMinutes: b.minMinutes || 0,
-        ...(b.yemot ? { yemot: true } : {}),
+        ...(b.yemot ? { yemot: true } : {}), ...(b.yemotPath ? { yemotPath: String(b.yemotPath) } : {}),
         status: "queued", updated: new Date().toISOString(),
         ...(it.group ? { group: String(it.group), rank: +it.rank || 0 } : {}) }));
       if (b.priority) fresh.forEach((j) => { j.priority = b.priority; });
@@ -840,7 +840,18 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const menv = profileEnv(env, "main");
     const chs = (await getChannels(menv)).filter((c) => c.req).slice(0, 9);
     if (!chs.length) return bye("אין ערוצים זמינים לבקשה");
-    if (!q.get("CH")) return T("read=t-" + chs.map((c, i) => "לערוץ " + clean(c.name) + " הקישו " + (i + 1)).join(" ") + "=CH,,1,1,Digits,yes");
+    if (!q.get("CH")) return T("read=t-" + chs.map((c, i) => "לערוץ " + clean(c.name) + " הקישו " + (i + 1)).join(" ") + " לחיפוש לפי דיבור הקישו אפס=CH,,1,1,Digits,yes");
+    if (q.get("CH") === "0") {
+      // Search by voice: Yemot recognizes Hebrew speech and sends the text back as Q.
+      if (!q.get("Q")) return T("read=t-אמרו מה לחפש אחרי הצליל=Q,,voice,he-IL");
+      const query = clean(q.get("Q")).slice(0, 80);
+      if (!query) return bye("לא הבנתי נסו שוב");
+      await addJobs(menv, [{ videoId: "q-" + Date.now().toString(36), kind: "search", channelName: "חיפוש בטלפון", title: query, query,
+        mode: "m4a", yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", status: "queued", priority: Date.now(), updated: new Date().toISOString() }]);
+      wake();
+      await addLog(menv, "worker", "חיפוש בטלפון: " + query);
+      return bye("החיפוש התקבל הסרטון יהיה מוכן להאזנה בעוד כמה דקות");
+    }
     const ch = chs[parseInt(q.get("CH"), 10) - 1];
     if (!ch) return bye("בחירה שגויה");
     let vids = [];
