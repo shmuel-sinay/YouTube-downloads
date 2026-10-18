@@ -836,6 +836,10 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const D = (name, max, min) => name + ",," + max + "," + min + ",7,Digits,yes,no,,,,,,,no";
     const bye = (m) => T("id_list_message=t-" + m + "&go_to_folder=hangup");
     if (!env.YEMOT_PIN) return bye("השירות לא מוגדר");
+    // The menu itself (extension 7 is an API extension): 1 = request, 2 = listen.
+    if (!q.has("M")) return T("read=t-הקישו 1 לבקשת סרטון 2 להאזנה לסרטונים שהתבקשו=" + D("M", 1, 1));
+    if (q.get("M") === "2") return T("go_to_folder=/7/2");
+    if (q.get("M") !== "1") return bye("בחירה שגויה");
     if (!q.get("PIN")) return T("read=t-הקישו קוד גישה=" + D("PIN", 8, 4));
     if (q.get("PIN") !== String(env.YEMOT_PIN)) return bye("קוד שגוי");
     const menv = profileEnv(env, "main");
