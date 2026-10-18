@@ -845,6 +845,36 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const menv = profileEnv(env, "main");
     const chs = (await getChannels(menv)).filter((c) => c.req).slice(0, 9);
     if (!chs.length) return bye("אין ערוצים זמינים לבקשה");
+    if (!q.get("MD")) return T("read=t-לשמיעת הסרטונים האחרונים מכל הערוצים הקישו 1 לבחירת ערוץ הקישו 2 לחיפוש לפי דיבור הקישו 3=" + D("MD", 1, 1));
+    if (q.get("MD") === "1") {
+      // Browse the newest videos of all request channels, one title at a time:
+      // 1 = request it, 2 = next, 3 = previous, 0 = exit. Position is replayed from the A0,A1,… answers.
+      const feeds = await Promise.allSettled(await getChannels(menv).then((all) => all.filter((c) => c.req).slice(0, 20).map(async (c) => {
+        const en = (await readFeed(c.id)).entries.filter((e) => !e.isShort).slice(0, 3);
+        return en.map((e) => ({ ch: c, e }));
+      })));
+      const all = feeds.flatMap((f) => (f.status === "fulfilled" ? f.value : []))
+        .sort((x, y) => (y.e.published || "").localeCompare(x.e.published || "")).slice(0, 30);
+      if (!all.length) return bye("לא נמצאו סרטונים");
+      let pos = 0, k = 0;
+      for (; q.has("A" + k); k++) {
+        const a = q.get("A" + k);
+        if (a === "1") {
+          const it = all[pos];
+          await addJobs(menv, [{ ...jobFor(it.ch, it.e), mode: "m4a", yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
+          wake();
+          await addLog(menv, "worker", "בקשה מהטלפון: " + it.e.title);
+          return bye("הבקשה התקבלה הסרטון יהיה מוכן להאזנה בעוד כמה דקות");
+        }
+        if (a === "2") pos = Math.min(all.length - 1, pos + 1);
+        else if (a === "3") pos = Math.max(0, pos - 1);
+        else return bye("תודה ולהתראות");
+      }
+      const it = all[pos];
+      return T("read=t-" + clean(it.ch.name) + " " + clean(it.e.title) + " לבקשה הקישו 1 לבא 2 לקודם 3 ליציאה 0=" + D("A" + k, 1, 1));
+    }
+    if (q.get("MD") === "3") q.set("CH", "0");
+    else if (q.get("MD") !== "2") return bye("בחירה שגויה");
     if (!q.get("CH")) return T("read=t-" + chs.map((c, i) => "לערוץ " + clean(c.name) + " הקישו " + (i + 1)).join(" ") + " לחיפוש לפי דיבור הקישו אפס=" + D("CH", 1, 1));
     if (q.get("CH") === "0") {
       // Search by speech; the recognized words are played back for approval;
