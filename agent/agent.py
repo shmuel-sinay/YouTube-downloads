@@ -557,7 +557,7 @@ def handle_list(job: dict) -> None:
     set_progress(vid, stage="start", pct=None, started=time.time(), mode="m4a")
     is_yt = "youtube.com" in job["url"] or "youtu.be" in job["url"]
     cmd = ["yt-dlp", job["url"], "--flat-playlist", "--no-warnings",
-           "--playlist-end", str(min(count * (3 if min_s else 1) + 5, 600)),
+           "--playlist-end", str(min(max(count * (3 if min_s else 1) + 5, int(job.get("scan") or 0)), 600)),
            "--print", "%(id)s\t%(duration)s\t%(webpage_url)s\t%(title)s"]
     if is_yt:
         cmd += ["--js-runtimes", "node", "--impersonate", "chrome"]
@@ -567,6 +567,7 @@ def handle_list(job: dict) -> None:
         cmd += ["--cookies", cookies]
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
     items = []
+    cat = []                            # for a catalog: everything that fits the title filter (no length filter)
     for line in r.stdout.splitlines():
         parts = line.split("\t", 3)
         if len(parts) < 4 or not parts[0]:
@@ -577,8 +578,6 @@ def handle_list(job: dict) -> None:
             dur = float(parts[1])
         except ValueError:
             dur = None                  # unknown here; the real download still filters
-        if min_s and dur is not None and dur < min_s:
-            continue
         if job.get("match") and not all(w in parts[3].lower() for w in str(job["match"]).lower().split() if not w.startswith("-")):
             continue                    # the title must hold all the filter words
         wurl = parts[2] if parts[2].startswith("http") else None
@@ -587,9 +586,22 @@ def handle_list(job: dict) -> None:
         if not is_yt:
             item["url"] = wurl or job["url"]
             item["source"] = "tiktok" if "tiktok.com" in job["url"] else "other"
-        items.append(item)
-        if len(items) >= count:
+        if job.get("catalog") and len(cat) < 40:
+            cat.append({"id": item["videoId"], "title": parts[3], "duration": dur})
+        if min_s and dur is not None and dur < min_s:
+            continue
+        if job.get("noEnqueue"):
+            continue
+        if len(items) < count:
+            items.append(item)
+        if len(items) >= count and not job.get("catalog"):
             break
+    if job.get("catalog"):
+        api("/api/catalog", {"channelId": job.get("channelId"), "items": cat})
+        log(f"   קטלוג: {len(cat)} פריטים")
+        if job.get("noEnqueue"):
+            api("/api/report", {"videoId": vid, "status": "done", "error": f"עודכן קטלוג: {len(cat)} פריטים"})
+            return
     if not items:
         errs = [l for l in r.stderr.splitlines() if "ERROR" in l]
         api("/api/report", {"videoId": vid, "status": "failed",

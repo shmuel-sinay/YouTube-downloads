@@ -3,7 +3,6 @@
 @שלוחה 2 = הפטריוטים | *
 @שלוחה 3 = הועלה ידנית | #ידני
 
-[פאנלים ואקטואליה]
 https://www.youtube.com/playlist?list=PL8E54R76rowCcCOn_HQf36o1RF3_oD3z4 | הפטריוטים | auto | 40
 https://www.youtube.com/channel/UCKEImtWikw9usC1pl_9m1nQ | C14 | req
 https://www.youtube.com/playlist?list=PLqsnGzdsslQgrlnxKqAzHBMrWcSBoL1OA | פתחי וזמרי בעם יותם זמרי - נעם פתחי | auto | 40
@@ -36,5 +35,9 @@ https://www.kolhalashon.com/he/regularSite/playShiur/29916629/-1/0/false | הר�
 https://www.kolhalashon.com/he/regularSite/playShiur/996432/1/0/false | הרב אריה שפירא (קול הלשון) | auto
 https://www.kolhalashon.com/he/regularSite/playShiur/36030094/-1/0/false | הרב ישראל גולדווסר (קול הלשון) | auto
 
+
 [פאנלים ואקטואליה]
-https://www.youtube.com/channel/UCKEImtWikw9usC1pl_9m1nQ/streams | הפטריוטים - שידור מלא (ערוץ 14) | auto | 40 | הפטריוטים
+https://www.youtube.com/@c14news/search?query=%D7%94%D7%A4%D7%98%D7%A8%D7%99%D7%95%D7%98%D7%99%D7%9D+%D7%94%D7%AA%D7%95%D7%9B%D7%A0%D7%99%D7%AA+%D7%94%D7%9E%D7%9C%D7%90%D7%94 | הפטריוטים - התוכנית המלאה | both | 40 | התוכנית המלאה
+
+[תוכניות ערוץ 14]
+https://www.youtube.com/@c14news/streams | תוכניות ערוץ 14 (שידורים מוקלטים) | req

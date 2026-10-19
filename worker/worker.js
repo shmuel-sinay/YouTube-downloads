@@ -476,9 +476,16 @@ async function khFeed(ch) {
   });
   return { name: ch.name, entries };
 }
-async function feedOf(ch) {
+async function feedOf(ch, env) {
   if (ch.kh) return khFeed(ch);
-  if (ch.agentList) return { name: ch.name, entries: [] };     // watched by the download server (see checkAllChannels)
+  if (ch.agentList) {
+    // Listed by the download server (see checkAllChannels); newest first by the date in the title when there is one.
+    const cat = await getJSON(env, "catalog:" + ch.id, null).catch(() => null);
+    const dateOf = (t) => { const m = String(t).match(/(\d{1,2})\.(\d{1,2})\.(\d{2,4})/); return m ? ((+m[3] < 100 ? 2000 + +m[3] : +m[3]) * 10000 + +m[2] * 100 + +m[1]) : 0; };
+    const items = ((cat && cat.items) || []).slice().sort((a, b) => dateOf(b.title) - dateOf(a.title));
+    return { name: ch.name, entries: items.map((x) => ({ videoId: x.id, title: x.title, published: "", isShort: false,
+      url: "https://www.youtube.com/watch?v=" + x.id, minutes: Math.round(x.dur / 60) })) };
+  }
   if (!ch.match) return readFeed(ch.id);
   const [rss, srch] = await Promise.allSettled([readFeed(ch.src), searchChannel(ch.src, ch.match)]);
   const entries = [], have = new Set();
@@ -526,7 +533,7 @@ async function applyFolders(env, channels) {
 async function checkChannel(env, ch, notes) {
   const seenRaw = await getJSON(env, "seen:" + ch.id, null);
   const seen = seenRaw || [];
-  const { entries } = await feedOf(ch);
+  const { entries } = await feedOf(ch, env);
   const top = entries[0];
   // First time this channel is checked (e.g. added by an import): everything already on it counts as seen,
   // otherwise its whole back catalogue would be queued at once.
@@ -555,7 +562,7 @@ function israelClock() {
 }
 
 async function checkAllChannels(env, only) {
-  const channels = (await getChannels(env)).filter((c) => !c.reqOnly).filter(only || (() => true));
+  const channels = (await getChannels(env)).filter((c) => !c.reqOnly || c.agentList).filter(only || (() => true));
   let added = 0;
   const errors = [], notes = [], failedIds = [];
   for (const ch of channels) {
@@ -566,6 +573,7 @@ async function checkAllChannels(env, only) {
         const id = "watch-" + ch.id.replace(/[^\w]/g, "").slice(-12) + "-" + Date.now().toString(36);
         await addJobs(env, [{ videoId: id, kind: "list", channelId: ch.id, channelName: ch.name, title: "מעקב: " + ch.name, url: ch.listUrl,
           count: ch.count || 3, match: ch.match || "", minMinutes: ch.minMinutes || 0, mode: "m4a", yemot: !!ch.yemot,
+          catalog: true, scan: 40, noEnqueue: !ch.yemot,
           ...(ch.folder ? { yemotPath: ch.folder } : {}), status: "queued", updated: new Date().toISOString() }]);
         added++;
         if (notes) notes.push(ch.name + ": נשלחה בדיקה לשרת ההורדות");
@@ -923,6 +931,13 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (b.replace) await deleteJobs(env, [String(b.replace)]);
       return json({ added: fresh.length, skipped: (b.items || []).length - fresh.length });
     }
+    if (p === "/api/catalog" && req.method === "POST") {
+      // The download server lists a channel tab / search with yt-dlp and leaves the list here (phone menus read it).
+      const b = await req.json();
+      env = profileEnv(env, b.profile);
+      await putJSON(env, "catalog:" + String(b.channelId || ""), { at: Date.now(), items: (b.items || []).slice(0, 40).map((x) => ({ id: String(x.id), title: String(x.title || "").slice(0, 160), dur: +x.duration || 0 })) });
+      return json({ ok: true });
+    }
     if (p === "/api/check" && req.method === "POST") {
       // The agent asks every few seconds whether its job was cancelled.
       const b = await req.json();
@@ -1043,7 +1058,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       let cache = await getJSON(menv, "phonebrowse", null), all = cache && cache.cat === cat && Date.now() - cache.at < 600000 ? cache.all : null;
       if (!all) {
         const feeds = await Promise.allSettled(chs.slice(0, 20).map(async (c) => {
-          const en = (await feedOf(c)).entries.filter((e) => !e.isShort).slice(0, 3);
+          const en = (await feedOf(c, menv)).entries.filter((e) => !e.isShort).slice(0, 3);
           return en.map((e) => ({ ch: c, e }));
         }));
         all = feeds.flatMap((f) => (f.status === "fulfilled" ? f.value : []))
@@ -1102,7 +1117,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const ch = pick[parseInt(q.get("CH"), 10) - 1];
     if (!ch) return back("בחירה שגויה");
     let vids = [];
-    try { vids = (await feedOf(ch)).entries.filter((e) => !e.isShort).slice(0, 5); } catch (e) {}
+    try { vids = (await feedOf(ch, menv)).entries.filter((e) => !e.isShort).slice(0, 5); } catch (e) {}
     if (!vids.length) return back("לא נמצאו כרגע סרטונים");
     if (!q.get("V")) return T("read=t-" + vids.map((e, i) => "לסרטון " + clean(e.title) + " הקישו " + (i + 1)).join(" ") + "=" + D("V", 1, 1));
     const e = vids[parseInt(q.get("V"), 10) - 1];
@@ -1487,14 +1502,15 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const hd = line.match(/^\[(.+)\]$/);
       if (hd) { cat = hd[1].trim().slice(0, 30); continue; }
       const [url, nm, mode, mins, flt0] = line.split("|").map((x) => x.trim());
-      const khm = url.match(/kolhalashon\.com\/.*playShiur\/(\d+)/), tab = /youtube\.com\/(?:@[^/]+|channel\/UC[\w-]{22})\/(?:streams|videos)\b/.test(url);
+      const khm = url.match(/kolhalashon\.com\/.*playShiur\/(\d+)/), tab = /youtube\.com\/(?:@[^/]+|channel\/UC[\w-]{22})\/(?:streams|videos|search\?query=)/.test(url);
       let id, khd = null;
       if (khm) { try { khd = await khInfo(khm[1]); id = "kh:" + khd.rav; } catch (e) { bad++; continue; } }
+      else if (tab) id = (url.match(/youtube\.com\/(@[^/?]+|channel\/UC[\w-]{22})/) || [])[1] || url;
       else { try { id = memo.has(url) ? memo.get(url) : await resolveChannelId(url); memo.set(url, id); } catch (e) { bad++; continue; } }
       const flt = (khd || tab) ? "" : String(flt0 || "").replace(/\s+/g, " ").trim().slice(0, 60), src = id;
       const mt = tab ? String(flt0 || "").replace(/\s+/g, " ").trim().slice(0, 60) : "";
       if (flt) id = src + "|" + flt;
-      if (tab) id = "ag:" + src + "|" + mt;
+      if (tab) id = "ag:" + url.replace(/^https?:\/\/(?:www\.)?youtube\.com\//, "") + "|" + mt;
       let c = channels.find((x) => x.id === id);
       if (mode === "del") {
         // Removal chosen in the file: off the phone line; a channel that existed only for the phone is deleted.
@@ -1513,12 +1529,12 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
           srchN.push(c.name + " ← מעקב אחרי " + url + (mt ? " (כותרת עם: " + mt + ")" : "") + " דרך שרת ההורדות, בבדיקות הקבועות");
         } else if (khd) {
           c = { id, kh: true, seed: khm[1], url, name: nm || khd.name, mode: "m4a", minMinutes: 0, skipShorts: false, added: new Date().toISOString() };
-          let n = "?"; try { n = (await feedOf(c)).entries.length; } catch (e) {}
+          let n = "?"; try { n = (await feedOf(c, rootEnv)).entries.length; } catch (e) {}
           channels.push(c); added++;
           srchN.push(c.name + " ← קול הלשון (רב " + khd.rav + ") — נמצאו " + n + " שיעורים אחרונים");
         } else if (flt) {
           c = { id, src, match: flt, name: nm || flt, mode: "m4a", minMinutes: 0, skipShorts: true, added: new Date().toISOString() };
-          let n = "?"; try { n = (await feedOf(c)).entries.length; } catch (e) {}
+          let n = "?"; try { n = (await feedOf(c, rootEnv)).entries.length; } catch (e) {}
           channels.push(c); added++;
           srchN.push(c.name + " ← מסנן \"" + flt + "\" בערוץ " + src + " — נמצאו " + n + " שיעורים");
         } else {
@@ -1566,7 +1582,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const ch = (await getChannels(rootEnv)).find((c) => c.id === String(f ? f.get("id") : url.searchParams.get("id")));
     if (!ch) return json({ error: "אין ערוץ כזה" }, 404);
     try {
-      const entries = (await feedOf(ch)).entries.filter((e) => !e.isShort);
+      const entries = (await feedOf(ch, rootEnv)).entries.filter((e) => !e.isShort);
       if (!f) return json({ name: ch.name, entries: entries.slice(0, 10).map((e) => ({ videoId: e.videoId, title: e.title, published: e.published })) });
       const e = entries.find((x) => x.videoId === String(f.get("videoId")));
       if (!e) return json({ error: "הסרטון לא נמצא" }, 404);
