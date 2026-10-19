@@ -1378,7 +1378,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       out.search = { status: r.status, length: html.length, hasVideoRenderer: html.includes('"videoRenderer"'), hasConsent: /consent\.youtube|before you continue/i.test(html),
         titles: (await searchChannel(src, q)).slice(0, 8).map((e) => e.title) };
     } catch (e) { out.search = { error: String(e.message || e) }; }
-    try { const f = await readFeed(src); out.rss = { name: f.name, count: f.entries.length, titles: f.entries.slice(0, 15).map((e) => e.title) }; }
+    try { const f = await readFeed(src); out.rss = { name: f.name, count: f.entries.length, titles: f.entries.slice(0, 15).map((e) => (e.published || "").slice(0, 16) + " " + (e.isShort ? "[short] " : "") + e.title) }; }
     catch (e) { out.rss = { error: String(e.message || e) }; }
     return json(out);
   }
