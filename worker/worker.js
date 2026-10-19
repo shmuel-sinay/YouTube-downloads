@@ -936,7 +936,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (!subs.length) return T("id_list_message=t-השירות לא מוגדר&go_to_folder=hangup");
     const say = (t) => String(t).replace(/[^\w\u0590-\u05FF ]/g, " ").replace(/\s+/g, " ").trim();
     if (!q.has("M8")) return T("read=t-" + ["ברוכים הבאים לקו השיעורים"].concat(subs.map((x) => "ל" + say(x.label) + " הקישו " + x.n),
-      ["לבקשת שיעור או סרטון הקישו 7", "להאזנה לשיעורים שביקשתם הקישו 8"]).join(". ") + "=M8,,1,1,7,Digits,yes,no,,,,,,,no");
+      ["לבקשת שיעור או סרטון הקישו 7", "להאזנה לשיעורים שביקשתם הקישו 8"]).join(", ") + "=M8,,1,1,7,Digits,yes,no,,,,,,,no");
     const m = q.get("M8");
     if (m === "7") return T("go_to_folder=/7");
     if (m === "8") return T("go_to_folder=/7/2");
@@ -948,7 +948,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const T = (t) => new Response(t, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
     const clean = (t) => String(t).replace(/[^\w\u0590-\u05FF ]/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
     const D = (name, max, min) => name + ",," + max + "," + min + ",7,Digits,yes,no,,,,,,,no";
-    const bye = (m) => T("id_list_message=t-" + m + "&go_to_folder=hangup");
+    const bye = (m) => T("id_list_message=t-" + String(m).replace(/[.]/g, ",") + "&go_to_folder=hangup");
     if (!env.YEMOT_PIN) return bye("השירות לא מוגדר");
     // Extension 7 starts straight at the access code; the menu (request / listen) is extension 8's.
     // Yemot keeps the answers of one call across steps, so after a finished request the call ends (a second request starts a new call).
@@ -993,7 +993,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
           await addJobs(menv, [{ ...jobFor(it.ch, it.e), mode: "m4a", minMinutes: 0, yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
           wake();
           await addLog(menv, "worker", "בקשה מהטלפון: " + it.e.title);
-          return back("הבקשה התקבלה. השיעור יהיה מוכן להאזנה בעוד כמה דקות. להתראות");
+          return back("הבקשה התקבלה, השיעור יהיה מוכן להאזנה בעוד כמה דקות, להתראות");
         }
         if (a === "2") pos = Math.min(all.length - 1, pos + 1);
         else if (a === "3") pos = Math.max(0, pos - 1);
@@ -1031,7 +1031,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         status: "queued", priority: Date.now(), updated: new Date().toISOString() }]);
       wake();
       await addLog(menv, "worker", `חיפוש בטלפון: ${text} (${n} סרטונים` + (ml ? `, מ-${ml} דקות` : "") + ")");
-      return back("החיפוש התקבל. התוצאות יהיו מוכנות להאזנה בעוד כמה דקות. להתראות");
+      return back("החיפוש התקבל, התוצאות יהיו מוכנות להאזנה בעוד כמה דקות, להתראות");
     }
     const ch = pick[parseInt(q.get("CH"), 10) - 1];
     if (!ch) return back("בחירה שגויה");
@@ -1044,7 +1044,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     await addJobs(menv, [{ ...jobFor(ch, e), mode: "m4a", minMinutes: 0, yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
     wake();
     await addLog(menv, "worker", "בקשה מהטלפון: " + e.title);
-    return back("הבקשה התקבלה. השיעור יהיה מוכן להאזנה בעוד כמה דקות. להתראות");
+    return back("הבקשה התקבלה, השיעור יהיה מוכן להאזנה בעוד כמה דקות, להתראות");
   }
   const pid = await whoIs(req, env);
   if (!pid) {
