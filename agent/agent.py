@@ -579,6 +579,8 @@ def handle_list(job: dict) -> None:
             dur = None                  # unknown here; the real download still filters
         if min_s and dur is not None and dur < min_s:
             continue
+        if job.get("match") and not all(w in parts[3].lower() for w in str(job["match"]).lower().split() if not w.startswith("-")):
+            continue                    # the title must hold all the filter words
         wurl = parts[2] if parts[2].startswith("http") else None
         pfx = "tt" if "tiktok.com" in job["url"] else "x-"
         item = {"videoId": parts[0] if is_yt else (pfx + parts[0]), "title": parts[3], "duration": dur}
