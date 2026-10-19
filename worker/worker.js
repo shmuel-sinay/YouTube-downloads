@@ -53,6 +53,26 @@ export default {
     const { h, m } = israelClock();
     const phone = PHONE_CHECKS.includes(String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0"));
     const full = h % 3 === 0 && m === 0;
+    // Videos announced but not aired yet: one small read every 10 minutes (almost always empty).
+    ctx.waitUntil((async () => {
+      const e2 = await withStore(env), lp = await getJSON(e2, "livepending", []);
+      if (!lp.length) return;
+      const keep = [];
+      let any = false;
+      for (const x of lp) {
+        if (Date.now() - x.at < 15 * 60000) { keep.push(x); continue; }
+        if (x.n > 96) continue;                          // about a day of tries: give up
+        const pe = profileEnv(e2, x.p || "main"), j = await getJSON(pe, "job:" + x.id, null);
+        if (!j || j.status !== "failed") continue;
+        j.status = "queued"; j.error = ""; j.updated = new Date().toISOString();
+        await putJSON(pe, "job:" + j.videoId, j);
+        keep.push({ ...x, at: Date.now() });             // it will report again (and be re-added) if still not up
+        any = true;
+      }
+      await putJSON(e2, "livepending", keep);
+      if (e2.DB && e2.DB.flush) await e2.DB.flush();
+      if (any) await wakeAgent(e2);
+    })());
     if (!phone && !full) return;                       // nothing to do: no database work at all
     ctx.waitUntil((async () => {
       env = await withStore(env);
@@ -524,16 +544,6 @@ async function checkAllChannels(env, only) {
     try { added += await checkChannel(env, ch, notes); }
     catch (e) { errors.push(ch.name + ": " + e.message); }
   }
-  // A video that was announced but not yet aired ("טרם שודר") is queued again a few hours later.
-  try {
-    const now = Date.now();
-    for (const j of await listJobs(env)) {
-      if (j.status === "failed" && String(j.error || "").includes("טרם שודר") && now - Date.parse(j.updated) > 2 * 3600000) {
-        j.status = "queued"; j.error = ""; j.updated = new Date().toISOString();
-        await putJSON(env, "job:" + j.videoId, j); added++;
-      }
-    }
-  } catch (e) {}
   await putJSON(env, "lastCheck", { at: new Date().toISOString(), added, errors });
   await addLog(env, "worker", `בדיקת ערוצים: ${channels.length} ערוצים, נוספו ${added} לתור` +
     (notes.length ? ` · ${notes.join(" | ")}` : "") + (errors.length ? ` · שגיאות: ${errors.join(" | ")}` : ""));
@@ -893,6 +903,13 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         updated: new Date().toISOString(),
       });
       await putJSON(env, "job:" + j.videoId, j);
+      if (j.status === "failed" && /טרם שודר|live event will begin|premieres in/i.test(j.error)) {
+        // Announced but not aired yet: tried again every ~15 minutes (for up to a day) until it is up.
+        const lp = (await getJSON(env, "livepending", [])).filter((x) => x.id !== j.videoId);
+        const prev = (await getJSON(env, "livepending", [])).find((x) => x.id === j.videoId);
+        lp.push({ id: j.videoId, p: env.PROFILE || b.profile || "", n: (prev ? prev.n : 0) + 1, at: Date.now() });
+        await putJSON(env, "livepending", lp.slice(-50));
+      }
       if (!j.kind) await recordActivity(env, j);
       await addLog(env, "worker", `${STATUS[j.status] || j.status}: ${j.title}` + (j.error ? ` — ${j.error}` : ""));
       return json({ ok: true });

@@ -796,6 +796,8 @@ def _handle(job: dict) -> None:
             break
         if "does not pass filter" in out or "age restricted" in out or "age-restricted" in out:
             break                               # not YouTube refusing — no point retrying
+        if "live event will begin" in out or "Premieres in" in out or "premieres in" in out:
+            break                               # not aired yet — the same on every client
         if not why:                              # some other error: show it and try the next way
             errs = [l for l in out.splitlines() if "ERROR" in l]
             why = (errs[-1].split("ERROR:")[-1].strip()[:80] if errs else f"exit {r.returncode}")
