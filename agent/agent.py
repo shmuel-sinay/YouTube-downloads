@@ -851,6 +851,8 @@ def _handle(job: dict) -> None:
         status, err = "skipped", f"קצר מ-{job.get('minMinutes')} דקות"
     elif "age restricted" in out or "age-restricted" in out:
         status, err = "skipped", "הגבלת גיל"
+    elif "live event will begin" in out or "Premieres in" in out or "premieres in" in out:
+        status, err = "failed", "טרם שודר — ינסה שוב לבד בבדיקה הבאה"
     elif "Unsupported URL" in out:
         status, err = "failed", "האתר הזה לא נתמך להורדה"
     elif "requested format" in out.lower() and "not available" in out.lower():

@@ -524,6 +524,16 @@ async function checkAllChannels(env, only) {
     try { added += await checkChannel(env, ch, notes); }
     catch (e) { errors.push(ch.name + ": " + e.message); }
   }
+  // A video that was announced but not yet aired ("טרם שודר") is queued again a few hours later.
+  try {
+    const now = Date.now();
+    for (const j of await listJobs(env)) {
+      if (j.status === "failed" && String(j.error || "").includes("טרם שודר") && now - Date.parse(j.updated) > 2 * 3600000) {
+        j.status = "queued"; j.error = ""; j.updated = new Date().toISOString();
+        await putJSON(env, "job:" + j.videoId, j); added++;
+      }
+    }
+  } catch (e) {}
   await putJSON(env, "lastCheck", { at: new Date().toISOString(), added, errors });
   await addLog(env, "worker", `בדיקת ערוצים: ${channels.length} ערוצים, נוספו ${added} לתור` +
     (notes.length ? ` · ${notes.join(" | ")}` : "") + (errors.length ? ` · שגיאות: ${errors.join(" | ")}` : ""));
