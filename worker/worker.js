@@ -73,6 +73,23 @@ export default {
       if (e2.DB && e2.DB.flush) await e2.DB.flush();
       if (any) await wakeAgent(e2);
     })());
+    // Refused feeds: second look after 15 min, then 45, then 90 (one small read every 10 minutes, almost always empty).
+    ctx.waitUntil((async () => {
+      const e2 = await withStore(env), fr = await getJSON(e2, "feedretry", []), delays = [15, 45, 90];
+      if (!fr.length) return;
+      const keep = [];
+      let added = 0;
+      for (const x of fr) {
+        if (Date.now() - x.at < delays[Math.min(x.n, 2)] * 60000) { keep.push(x); continue; }
+        const pe = profileEnv(e2, x.p || "main"), ch = (await getChannels(pe)).find((c) => c.id === x.id);
+        if (!ch) continue;
+        try { added += await checkChannel(pe, ch, null); await addLog(pe, "worker", "ניסיון חוזר לפיד של " + ch.name + ": עבר"); }
+        catch (err) { if (x.n + 1 < 3) keep.push({ ...x, n: x.n + 1, at: Date.now() }); else await addLog(pe, "worker", "הפיד של " + ch.name + " עדיין לא נגיש: " + err.message); }
+      }
+      await putJSON(e2, "feedretry", keep);
+      if (e2.DB && e2.DB.flush) await e2.DB.flush();
+      if (added) await wakeAgent(e2);
+    })());
     if (!phone && !full) return;                       // nothing to do: no database work at all
     ctx.waitUntil((async () => {
       env = await withStore(env);
@@ -539,10 +556,18 @@ function israelClock() {
 async function checkAllChannels(env, only) {
   const channels = (await getChannels(env)).filter((c) => !c.reqOnly).filter(only || (() => true));
   let added = 0;
-  const errors = [], notes = [];
+  const errors = [], notes = [], failedIds = [];
   for (const ch of channels) {
     try { added += await checkChannel(env, ch, notes); }
-    catch (e) { errors.push(ch.name + ": " + e.message); }
+    catch (e) { errors.push(ch.name + ": " + e.message); failedIds.push(ch.id); }
+  }
+  // Feeds that YouTube refused (404/500 are usually temporary): looked at again later, once the trouble has passed.
+  if (failedIds.length) {
+    try {
+      const pid = env.PROFILE || "main", fr = (await getJSON(env, "feedretry", [])).filter((x) => !(x.p === pid && failedIds.includes(x.id)));
+      for (const id of failedIds) fr.push({ id, p: pid, n: 0, at: Date.now() });
+      await putJSON(env, "feedretry", fr.slice(-60));
+    } catch (e) {}
   }
   await putJSON(env, "lastCheck", { at: new Date().toISOString(), added, errors });
   await addLog(env, "worker", `בדיקת ערוצים: ${channels.length} ערוצים, נוספו ${added} לתור` +

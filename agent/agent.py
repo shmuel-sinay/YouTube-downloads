@@ -1018,11 +1018,39 @@ def youtube_selftest() -> None:
     log(f"בדיקת יוטיוב ({'WARP' if warp_up() else 'ישיר'}, visionos): {res}")
 
 
+def diag() -> None:
+    """Optional, on startup: list what YouTube returns for the addresses in DIAG_URLS (comma separated) —
+    title, minutes, date — into the log. For finding out where a show's full episodes are published."""
+    urls = [u.strip() for u in os.environ.get("DIAG_URLS", "").split(",") if u.strip()]
+    if not urls:
+        return
+    time.sleep(45)
+    for u in urls:
+        cmd = ["yt-dlp", "--flat-playlist", "-J", "--playlist-end", "25", "--no-warnings", "--extractor-args", "youtube:player_client=default,mweb"] + net_args()
+        ck = cookies_path()
+        if ck:
+            cmd += ["--cookies", ck]
+        try:
+            r = subprocess.run(cmd + [u], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+            if r.returncode:
+                log(f"DIAG {u}: נכשל — {(r.stderr or '').strip()[-200:]}")
+                continue
+            data = json.loads(r.stdout)
+            ents = [e for e in (data.get("entries") or []) if e]
+            log(f"DIAG {u}: {data.get('title')} · {len(ents)} פריטים")
+            for e in ents:
+                dur = e.get("duration")
+                log("DIAG  " + (f"{round(dur / 60)}ד" if dur else "?ד") + " · " + str(e.get("upload_date") or e.get("release_timestamp") or "") + " · " + str(e.get("live_status") or "") + " · " + str(e.get("title"))[:90] + " · " + str(e.get("id")))
+        except Exception as ex:
+            log(f"DIAG {u}: שגיאה {ex}")
+
+
 def serve() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=log_flusher, daemon=True).start()
     hello()
     threading.Thread(target=youtube_selftest, daemon=True).start()
+    threading.Thread(target=diag, daemon=True).start()
     threading.Thread(target=worker_loop, daemon=True).start()
     threading.Thread(target=keep_awake_loop, daemon=True).start()
     _wake.set()  # woke up — check the queue right away
