@@ -2012,6 +2012,17 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       }
       return redirect(BASE + "/");
     }
+    if (p === "/jobs/restart") {
+      // A download that crawls: back into the queue, behind everything else (the server stops it within seconds and goes on to the next).
+      const j = await getJSON(env, "job:" + f.get("id"), null);
+      if (j && ["taken", "queued", "paused"].includes(j.status)) {
+        j.status = "queued"; j.priority = -Date.now(); j.updated = new Date().toISOString();
+        await putJSON(env, "job:" + j.videoId, j);
+        await addLog(env, "worker", `↻ הוחזר לסוף התור: ${j.title}`);
+        wake();
+      }
+      return redirect(BASE + "/");
+    }
     if (p === "/jobs/cancel") {
       const j = await getJSON(env, "job:" + f.get("id"), null);
       if (j && ["queued", "taken", "paused", "nfcheck"].includes(j.status)) {
@@ -2720,6 +2731,7 @@ function jobRow(j) {
   if (j.status === "queued") a.push(btn("priority", j.videoId, "now", "הורד עכשיו — לפני כל השאר", "primary"));
   if (j.status === "paused") a.push(btn("resume", j.videoId, "play", "המשך", "primary"), btn("priority", j.videoId, "now", "הורד עכשיו"));
   if (j.status === "queued" || j.status === "taken") a.push(btn("pause", j.videoId, "pause", "השהה"));
+  if (j.status === "taken") a.push(btn("restart", j.videoId, "retry", "תקוע? החזר לסוף התור ונסה שוב"));
   if (["failed", "skipped", "cancelled", "blocked"].includes(j.status)) a.push(btn("retry", j.videoId, "retry", j.status === "blocked" ? "בדוק שוב בנטפרי" : "נסה שוב"));
   if (["queued", "taken", "paused", "nfcheck"].includes(j.status)) a.push(btn("cancel", j.videoId, "x", "ביטול", "danger"));
   a.push(btn("delete", j.videoId, "trash", "מחק מההיסטוריה", "danger"));
@@ -2904,7 +2916,7 @@ document.querySelectorAll("form[data-action]").forEach((f) => f.onsubmit = async
   catch (err) { toast("שגיאה: " + err.message, 8000); }
   b.disabled = false;
 });
-const MSG = { pause: "הושהה", resume: "ממשיך", priority: "יורד עכשיו", retry: "חזר לתור", cancel: "בוטל", remove: "הוסר" };
+const MSG = { pause: "הושהה", resume: "ממשיך", priority: "יורד עכשיו", retry: "חזר לתור", restart: "הוחזר לסוף התור", cancel: "בוטל", remove: "הוסר" };
 document.addEventListener("click", async (e) => {
   const el = e.target.closest("[data-act]"); if (!el) return;
   const act = el.dataset.act, id = el.dataset.id, d = new FormData(); d.append("id", id);
