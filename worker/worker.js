@@ -273,6 +273,8 @@ function videoFromUrl(line) {
   return null;
 }
 // "Upload to the phone line" on a one-off add: admin only; fetched as fast audio.
+// Where requested videos (phone / site) go: extension 8/3 unless YEMOT_REQ_PATH says otherwise.
+const reqDir = (e) => e.YEMOT_REQ_PATH || (e.YEMOT_PATH || "ivr2:/8") + "/3";
 const wantsYemot = (f, env) => f.get("yemot") === "on" && (env.PROFILE || "main") === "main";
 
 // A link is YouTube (the only source allowed for NetFree-restricted profiles).
@@ -1101,7 +1103,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   // Dialog: access code → channel → video; then the video is queued for the
   // phone line. Answers are plain text in Yemot's grammar ("read=…", "id_list_message=…").
   // Needs the Worker secret YEMOT_PIN. Each call returns one step.
-  // Extension 8 (type=api) is the line's main menu: the sub-extensions, then "request" (7) and "listen to requests" (7/2).
+  // Extension 8 (type=api) is the line's main menu: the sub-extensions, then "request" (7) and "listen to requests" (8/3).
   if (p === "/yemot/menu8") {
     const q = url.searchParams, T = (t) => new Response(t, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
     if (q.get("hangup") === "yes") return T("");
@@ -1112,7 +1114,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       ["לבקשת שיעור או סרטון הקישו 7", "להאזנה לשיעורים שביקשתם הקישו 8"]).join(", ") + "=M8,,1,1,7,Digits,yes,no,,,,,,,no");
     const m = q.get("M8");
     if (m === "7") return T("go_to_folder=/7");
-    if (m === "8") return T("go_to_folder=/7/2");
+    if (m === "8") return T("go_to_folder=/8/3");
     const sub = subs.find((x) => x.n === m);
     return T(sub ? "go_to_folder=/8/" + sub.n : "id_list_message=t-בחירה שגויה&go_to_folder=hangup");
   }
@@ -1165,7 +1167,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         const a = q.get("A" + k);
         if (a === "1") {
           const it = all[pos];
-          await addJobs(menv, [{ ...jobFor(it.ch, it.e), mode: "m4a", minMinutes: 0, yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
+          await addJobs(menv, [{ ...jobFor(it.ch, it.e), mode: "m4a", minMinutes: 0, yemot: true, phoneReq: true, yemotPath: reqDir(env), priority: Date.now() }]);
           wake();
           await addLog(menv, "worker", "בקשה מהטלפון: " + it.e.title);
           return back("הבקשה התקבלה, השיעור יהיה מוכן להאזנה בעוד כמה דקות, להתראות");
@@ -1202,7 +1204,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (!q.has("N")) return T("read=t-כמה סרטונים להוריד מהחיפוש ספרה בין אחת לתשע=" + D("N", 1, 1));
       const ml = Math.min(999, parseInt(g("ML"), 10) || 0), n = Math.max(1, Math.min(9, parseInt(g("N"), 10) || 1));
       await addJobs(menv, [{ videoId: "q-" + Date.now().toString(36), kind: "search", channelName: "חיפוש בטלפון", title: text, query: text,
-        mode: "m4a", yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", minMinutes: ml, results: n,
+        mode: "m4a", yemot: true, phoneReq: true, yemotPath: reqDir(env), minMinutes: ml, results: n,
         status: "queued", priority: Date.now(), updated: new Date().toISOString() }]);
       wake();
       await addLog(menv, "worker", `חיפוש בטלפון: ${text} (${n} סרטונים` + (ml ? `, מ-${ml} דקות` : "") + ")");
@@ -1216,7 +1218,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (!q.get("V")) return T("read=t-" + vids.map((e, i) => "לסרטון " + clean(e.title) + " הקישו " + (i + 1)).join(" ") + "=" + D("V", 1, 1));
     const e = vids[parseInt(q.get("V"), 10) - 1];
     if (!e) return back("בחירה שגויה");
-    await addJobs(menv, [{ ...jobFor(ch, e), mode: "m4a", minMinutes: 0, yemot: true, yemotPath: env.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
+    await addJobs(menv, [{ ...jobFor(ch, e), mode: "m4a", minMinutes: 0, yemot: true, phoneReq: true, yemotPath: reqDir(env), priority: Date.now() }]);
     wake();
     await addLog(menv, "worker", "בקשה מהטלפון: " + e.title);
     return back("הבקשה התקבלה, השיעור יהיה מוכן להאזנה בעוד כמה דקות, להתראות");
@@ -1680,7 +1682,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (!f) return json({ name: ch.name, entries: entries.slice(0, 10).map((e) => ({ videoId: e.videoId, title: e.title, published: e.published })) });
       const e = entries.find((x) => x.videoId === String(f.get("videoId")));
       if (!e) return json({ error: "הסרטון לא נמצא" }, 404);
-      await addJobs(rootEnv, [{ ...jobFor(ch, e), mode: "m4a", minMinutes: 0, yemot: true, yemotPath: rootEnv.YEMOT_REQ_PATH || "ivr2:/7/2", priority: Date.now() }]);
+      await addJobs(rootEnv, [{ ...jobFor(ch, e), mode: "m4a", minMinutes: 0, yemot: true, phoneReq: true, yemotPath: reqDir(rootEnv), priority: Date.now() }]);
       wake();
       await addLog(rootEnv, "worker", "בקשה מהאתר לקו: " + e.title);
       return json({ ok: true });
@@ -1690,7 +1692,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   if ((p === "/yemot/ls" || p === "/yemot/rm" || p === "/yemot/mv") && pid === "main") {
     if (!(rootEnv.YEMOT_USER && rootEnv.YEMOT_PASS)) return json({ error: "חסרים Secrets בשם YEMOT_USER ו-YEMOT_PASS ב-Worker" });
     const base = rootEnv.YEMOT_PATH || "ivr2:/8", subs = (await getJSON(rootEnv, "phonecfg", { subs: [] })).subs || [];
-    const dirs = [base, ...subs.map((x) => base + "/" + x.n), rootEnv.YEMOT_REQ_PATH || "ivr2:/7/2"];
+    const dirs = [...new Set([base, ...subs.map((x) => base + "/" + x.n), reqDir(rootEnv)])];
     const tok = encodeURIComponent(rootEnv.YEMOT_USER + ":" + rootEnv.YEMOT_PASS);
     const call = async (api, qs) => (await fetch("https://www.call2all.co.il/ym/api/" + api + "?token=" + tok + "&" + qs, { signal: AbortSignal.timeout(20000) })).json();
     try {
@@ -1890,9 +1892,9 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       const j = await getJSON(env, "job:" + f.get("id"), null);
       if (!j || j.kind === "list" || j.kind === "search" || !j.url) return new Response("אי אפשר להעלות את הפריט הזה לקו", { status: 400 });
       const to = String(f.get("to") || "").trim(), cfg = await getJSON(env, "phonecfg", { subs: [] }), base = env.YEMOT_PATH || "ivr2:/8";
-      const path = to === "r" ? (env.YEMOT_REQ_PATH || "ivr2:/7/2") : (cfg.subs || []).some((x) => x.n === to) ? base + "/" + to : base;
+      const path = to === "r" ? (reqDir(env)) : (cfg.subs || []).some((x) => x.n === to) ? base + "/" + to : base;
       const id = "ph" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
-      const nj = { ...j, videoId: id, status: "queued", yemot: true, yemotPath: path, mode: "m4a", minMinutes: 0, error: "", fileUrl: "", fileName: "",
+      const nj = { ...j, videoId: id, status: "queued", yemot: true, ...(to === "r" ? { phoneReq: true } : {}), yemotPath: path, mode: "m4a", minMinutes: 0, error: "", fileUrl: "", fileName: "",
         priority: Date.now(), nf: "ok", updated: new Date().toISOString() };
       await addJobs(env, [nj]);
       wake();
@@ -2550,7 +2552,7 @@ async function dashboard(env) {
       <div class="card"><h2>${icon("queue")}בקשה מהאתר</h2>
         <div class="cbar"><select id="askSel" style="flex:1;min-width:180px"></select><button class="btn" type="button" id="askGo">הצג סרטונים אחרונים</button></div>
         <div id="askList" style="margin-top:8px"></div></div>
-      <div class="card"><h2>${icon("queue")}בקשות שהתקבלו</h2><p class="sub">מהטלפון ומהאתר. מגיעות לשלוחה 7/2.</p><div id="phoneReqs"></div></div>
+      <div class="card"><h2>${icon("queue")}בקשות שהתקבלו</h2><p class="sub">מהטלפון ומהאתר. מגיעות לשלוחה 8/3.</p><div id="phoneReqs"></div></div>
     </div>
 
     <div data-pp="cf" class="hidden">
@@ -2560,7 +2562,7 @@ async function dashboard(env) {
         <div class="cbar" style="margin-top:8px"><button class="btn" id="subsSave" type="button">שמור</button><span class="sub" id="subsMsg" style="margin:0"></span></div></div>
       <div class="card"><h2>${icon("clock")}איך הקו עובד</h2>
         <div class="setting"><div class="txt"><b>העלאה אוטומטית</b><span>בדיקה ב-22:40, 23:00, 23:10 ו-23:20 (שעון ישראל) וגם כל 3 שעות. ערוץ חדש: הבדיקה הראשונה רק קובעת נקודת התחלה.</span></div></div>
-        <div class="setting"><div class="txt"><b>בטלפון</b><span>שלוחה 8: תפריט שלוחות המשנה · בזמן השמעה: 1 = בקשה (שלוחה 7), 2 = האזנה לבקשות (7/2).</span></div></div>
+        <div class="setting"><div class="txt"><b>בטלפון</b><span>שלוחה 8: תפריט שלוחות המשנה · בזמן השמעה: 1 = בקשה (שלוחה 7), 2 = האזנה לבקשות (8/3).</span></div></div>
         <div class="setting"><div class="txt"><b>בקשה בטלפון</b><span>קוד גישה → "האחרונים מכל הערוצים" (1 מבקש, 2 הבא, 3 הקודם, 0 יציאה) · בחירת ערוץ · חיפוש בדיבור. אם יש כמה קטגוריות, קודם בוחרים קטגוריה.</span></div></div>
         <div class="setting"><div class="txt"><b>Secrets נדרשים ב-Cloudflare</b><span>YEMOT_PIN (קוד גישה), YEMOT_USER ו-YEMOT_PASS (לרשימת הקבצים ולמחיקה). ב-Render: YEMOT_USER, YEMOT_PASS, YEMOT_PATH.</span></div></div>
       </div>
@@ -3085,7 +3087,7 @@ function renderPhone() {
   if (!renderPhone.subs) { renderPhone.subs = 1; loadSubs(); }
   const all = S.channels.filter((c) => c.yemot || c.req), jobs = S.jobs.filter((j) => j.yemot);
   const auto = all.filter((c) => c.yemot), reqCh = all.filter((c) => c.req);
-  const reqs = jobs.filter((j) => (j.yemotPath || "").indexOf("/7/") >= 0);
+  const reqs = jobs.filter((j) => j.phoneReq || (j.yemotPath || "").indexOf("/7/") >= 0);
   const last = jobs.find((j) => j.status === "done");
   const busy = jobs.filter((j) => ["queued", "taken"].includes(j.status)).length;
   const failed = jobs.filter((j) => j.status === "failed").length;
@@ -3099,7 +3101,7 @@ function renderPhone() {
     tile("מצב", busy ? busy + " בדרך" : "אין פרק בדרך", (last ? "הועלה לאחרונה " + ago(last.updated) + " — " + esc(last.title) : "עוד לא הועלה פרק") + (failed ? ' · <span class="bad">' + failed + " נכשלו</span>" : "")) +
     tile("הבדיקה האוטומטית הבאה", nextCheck(), auto.length + " ערוצי אוטומטי · " + reqCh.length + " ערוצי בקשה") +
     tile("הפרק המלא של היום", fullMin ? (fullToday ? "✓ עלה" : "עדיין לא") : "לא מוגדר", fullMin ? "פרק מלא = " + fullMin + " דק׳ ומעלה · הבדיקה ממשיכה כל 3 שעות" : "אין ערוץ עם אורך פרק מלא") +
-    tile("בקשות", reqs.length + " אחרונות", "מהטלפון ומהאתר · בשלוחה 7/2");
+    tile("בקשות", reqs.length + " אחרונות", "מהטלפון ומהאתר · בשלוחה 8/3");
   $("phRefresh").onclick = (e) => { e.preventDefault(); renderPhone.at = 0; renderPhone(); };
   $("phFiles").onclick = (e) => { e.preventDefault(); phTab("fl"); };
 
@@ -3137,10 +3139,10 @@ function renderPhone() {
 }
 $("phFilter").oninput = () => renderPhone();
 $("phKind").onchange = () => renderPhone();
-// Which extension? sub-extension numbers from the phone config, or "r" = the requests extension (7/2).
+// Which extension? sub-extension numbers from the phone config, or "r" = the requests extension (8/3).
 function askDest(exclude) {
   const L = renderPhone.labels || {}, ks = Object.keys(L), nl = String.fromCharCode(10);
-  const txt = ks.map((k) => k + " = " + L[k] + " (8/" + k + ")").join(nl) + nl + "r = בקשות (7/2)";
+  const txt = ks.map((k) => k + " = " + L[k] + " (8/" + k + ")").join(nl) + nl + "r = בקשות (8/3)";
   const v = prompt("לאיזו שלוחה?" + nl + txt, ks[0] || "r");
   return v ? v.trim() : "";
 }
@@ -3149,7 +3151,7 @@ async function askFor(id) {
   phTab("rq"); $("askList").textContent = "טוען…";
   const r = await (await fetch(B + "/yemot/feed?id=" + encodeURIComponent(id), { cache: "no-store" })).json();
   if (r.error) { $("askList").textContent = r.error; return; }
-  $("askList").innerHTML = '<div class="sub">' + esc(r.name) + " — הסרטונים האחרונים. הבקשה עולה לשלוחה 7/2</div>" +
+  $("askList").innerHTML = '<div class="sub">' + esc(r.name) + " — הסרטונים האחרונים. הבקשה עולה לשלוחה 8/3</div>" +
     r.entries.map((v) => '<div class="setting"><div class="txt"><b>' + esc(v.title) + '</b><span>' + esc((v.published || "").slice(0, 10)) +
       '</span></div><button class="btn ghost" type="button" data-ask="' + esc(v.videoId) + '" data-ch="' + esc(id) + '">בקש לקו</button></div>').join("");
 }
