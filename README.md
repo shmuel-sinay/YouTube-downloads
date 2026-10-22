@@ -99,6 +99,17 @@ Cloudflare Worker (my-gemini)            Render (שרת ההורדות)
   - בכספת: מסמנים קבצים ← **העבר לטלפון** ← בוחרים תיקייה (Music, Movies או Download).
 - **MP3:** ההמרה ל-MP3 נעשית רק בתוכנה למחשב, ולכן האפשרות זמינה באתר רק כשהתוכנה פועלת. ברירת המחדל היא סרטון (MP4).
 
+## סרטונים עם Gemini (Veo) — השרת ב-GitHub
+
+הדף "סרטונים" בתוכנה: יצירת סרטון לוקחת כמה דקות והקובץ שוקל כמה מגה — יותר ממה שה-Worker בתוכנית החינמית מחזיק. לכן העבודה נעשית ב-GitHub Actions (`.github/workflows/video.yml`): ה-Worker רק מפעיל את השרת, השרת מבקש מ-Veo, מחכה, מוריד ומערבל, וה-Worker לוקח בסוף את הקובץ המעורבל ומוחק אותו מ-GitHub. הבקשה והמפתחות לא מופיעים בלוג של GitHub.
+
+הגדרה (פעם אחת):
+1. **GitHub → Settings → Developer settings → Fine-grained tokens → Generate**: רק למאגר הזה, הרשאה **Actions: Read and write**. את הטוקן שמים ב-Worker כ-Secret בשם **GH_TOKEN**.
+2. **במאגר → Settings → Secrets and variables → Actions**: `TRACKER_URL` (כמו ב-Render, `https://my-gemini.<שם>.workers.dev/yt`) ו-`AGENT_TOKEN` (אותו ערך כמו ב-Worker).
+3. קובץ ה-workflow צריך להיות בענף הראשי של המאגר.
+4. **בחינם (ברירת המחדל):** בלי מפתח בתשלום, הסרטון נוצר ב-Hugging Face (Space חינמי עם GPU, ברירת מחדל `Lightricks/ltx-video-distilled`). פותחים חשבון חינמי ב-huggingface.co, ב-**Settings ← Access Tokens** יוצרים טוקן מסוג Read ושמים אותו ב-Secrets של המאגר בשם `HF_TOKEN` (בלעדיו המכסה קטנה יותר). המכסה היומית מספיקה לכמה סרטונים קצרים. אפשר להחליף Space עם Variables במאגר: `HF_SPACE`, `HF_API`.
+5. **בתשלום (איכות Veo):** מפתח Gemini עם חיוב פעיל (Veo לא בחינם): באתר, **הגדרות ← מפתחות Gemini ← מפתח בתשלום לסרטונים**. כשהוא מוגדר, רק סרטונים משתמשים בו (תמונות והצ'אט ממשיכים עם המפתחות החינמיים). מנוי Gemini/Google AI (Plus/Pro) לא נותן מפתח API — צריך חיוב בפרויקט ב-Google Cloud. אופציונלי ב-Worker: `VIDEO_MODEL` (ברירת מחדל `veo-3.0-fast-generate-001`), `GH_REPO`, `GH_REF`.
+
 ## שימוש
 
 - **מעבר בין המערכות:** בצ'אט יש כפתור **📺 ערוצים**, ובדף הערוצים יש כפתור **💬 מעבר ל-Gemini**.

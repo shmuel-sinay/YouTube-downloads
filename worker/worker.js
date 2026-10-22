@@ -21,6 +21,7 @@
 //   Variable:              RENDER_URL — the download server, e.g.
 //                          https://my-agent.onrender.com (woken up on demand)
 //   Cron Trigger:          e.g. "0 */3 * * *"
+//   Optional GH_TOKEN:     the "סרטונים" page (made on GitHub Actions, see README)
 //   Optional R2 binding:   FILES
 
 const BASE = "/yt";     // where the tracker lives; "/" stays the Gemini chat
@@ -36,9 +37,11 @@ export default {
     try {
       env = await withStore(env);
       store = env.DB;
-      const res = await route(req, env, ctx);
+      let res = await route(req, env, ctx);
       if (store) await autoCheck(env);
       if (store && store.flush) await store.flush();
+      const renew = RENEW.get(req);                    // a signed-in visit pushes the hour on
+      if (renew) { res = new Response(res.body, res); res.headers.append("Set-Cookie", renew); }
       return res;
     } catch (e) {
       try { if (store && store.flush) await store.flush(); } catch (x) {}
@@ -673,21 +676,43 @@ async function sha256(s) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function profileToken(env, pid) {
-  if (pid === "main") return sha256("yt-tracker:main:" + env.ADMIN_PASSWORD);
+// Sign-in: cookie "auth=<profile>.<signed in at>.<expires>.<signature>".
+// It ends an hour after the site was last open (every visit pushes it on),
+// always 12 hours after signing in, and when the browser closes (no Max-Age).
+// The signature's secret is the profile's code, so a new code signs out
+// everyone. Cookies from before (one fixed token, good for a year) no
+// longer count.
+const SESSION_IDLE = 60 * 60 * 1000;
+const SESSION_MAX = 12 * 60 * 60 * 1000;
+const RENEW = new WeakMap();   // request → a renewed cookie to send back (see fetch)
+async function sessionSecret(env, pid) {
+  if (pid === "main") return env.ADMIN_PASSWORD ? "main:" + env.ADMIN_PASSWORD : null;
   const prof = (await getJSON(env, "profiles", {}))[pid];
-  return prof ? sha256("yt-tracker:" + pid + ":" + prof.hash) : null;
+  return prof ? pid + ":" + prof.hash : null;
+}
+async function hmac(secret, msg) {
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(msg));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function sessionCookie(env, pid, iat = Date.now()) {
+  const secret = await sessionSecret(env, pid);
+  if (!secret) return null;
+  const body = pid + "." + iat.toString(36) + "." + (Date.now() + SESSION_IDLE).toString(36);
+  return `auth=${body}.${await hmac("yt-session:" + secret, body)}; Path=/; HttpOnly; Secure; SameSite=Lax`;
 }
 
-// Which profile is logged in (cookie "auth=<profile>.<token>"), or null.
+// Which profile is logged in, or null.
 async function whoIs(req, env) {
   if (!env.ADMIN_PASSWORD) return null;
-  const c = req.headers.get("Cookie") || "";
-  const m = c.match(/(?:^|;\s*)auth=([\w-]+)\.([a-f0-9]{64})/);
-  if (m && m[2] === await profileToken(env, m[1])) return m[1];
-  const legacy = c.match(/(?:^|;\s*)auth=([a-f0-9]{64})(?:;|$)/);   // cookie from before profiles
-  if (legacy && legacy[1] === await sha256("yt-tracker:" + env.ADMIN_PASSWORD)) return "main";
-  return null;
+  const m = (req.headers.get("Cookie") || "").match(/(?:^|;\s*)auth=([\w-]+)\.([0-9a-z]+)\.([0-9a-z]+)\.([a-f0-9]{64})/);
+  if (!m) return null;
+  const [, pid, iat36, exp36, sig] = m, iat = parseInt(iat36, 36), exp = parseInt(exp36, 36), now = Date.now();
+  if (!(exp > now && now - iat < SESSION_MAX && iat <= now + 60000)) return null;
+  const secret = await sessionSecret(env, pid);
+  if (!secret || sig !== await hmac("yt-session:" + secret, pid + "." + iat36 + "." + exp36)) return null;
+  if (exp - now < SESSION_IDLE - 5 * 60000) RENEW.set(req, await sessionCookie(env, pid, iat));   // at most every 5 minutes
+  return pid;
 }
 
 async function checkCode(env, pid, password) {
@@ -716,7 +741,7 @@ function isAgent(req, env) {
 
 // ---------- routing ----------
 
-// Scrambled picture: "YTI1" + 12-byte IV + AES-GCM(mime length, mime, bytes).
+// Scrambled picture or video: "YTI1" + 12-byte IV + AES-GCM(mime length, mime, bytes).
 // A mime ending in ";base64" means the bytes are the picture's base64 text.
 // The key is fixed (desktop/images.py has the same): the point is that what
 // travels and what the browser holds is not an image, not secrecy.
@@ -735,7 +760,8 @@ async function scrambleImage(bytes, mime) {
 }
 
 // ---------- Gemini keys: a pool that moves on when one runs out ----------
-// "gemkeys" = { keys: [{key, label, until: {model: ms}, err, errAt}], builtin: {...} }
+// "gemkeys" = { keys: [{key, label, until: {model: ms}, err, errAt}], builtin: {...},
+//               video: {...} } — video: a separate paid key, used only for videos (i "v")
 // (kept in the site's database, added in settings — not in the code, which
 // is public on GitHub). A key that hits its daily quota rests until it resets
 // (midnight in California ≈ 08:00 UTC), a per-minute limit rests a minute, a
@@ -745,6 +771,7 @@ function geminiKeys(env, ks) {
   if (env.GEMINI_API_KEY) list.push({ key: env.GEMINI_API_KEY, label: "המפתח המובנה", ...(ks.builtin || {}), i: "b" });
   return list;
 }
+const videoKey = (ks) => ks.video && ks.video.key ? { ...ks.video, i: "v" } : null;
 function nextQuotaReset() {
   const d = new Date(); d.setUTCHours(8, 0, 0, 0);
   if (d.getTime() <= Date.now()) d.setUTCDate(d.getUTCDate() + 1);
@@ -752,7 +779,22 @@ function nextQuotaReset() {
 }
 function setKey(ks, i, v) {
   if (i === "b") ks.builtin = { ...(ks.builtin || {}), ...v };
+  else if (i === "v") ks.video = { ...ks.video, ...v };
   else ks.keys[i] = { ...ks.keys[i], ...v };
+}
+// Was Google's answer a problem with the key itself (quota, spend cap, bad
+// key)? Then the key rests (until in ks) and the message is returned; null
+// means the key is fine. Also used for the video Action's tries (/api/vid/job).
+function keyTrouble(ks, k, model, status, t) {
+  const bad400 = status === 400 && /API_KEY_INVALID|API key not valid|API key expired/i.test(t);
+  const capped = /spending cap/i.test(t);              // the project's monthly spend cap (AI Studio)
+  if (!(status === 429 || status === 401 || status === 403 || bad400 || capped)) return null;
+  let msg = t; try { msg = JSON.parse(t).error.message || t; } catch (e) {}
+  const now = Date.now(), month = new Date(); month.setUTCMonth(month.getUTCMonth() + 1, 1); month.setUTCHours(8, 0, 0, 0);
+  const rest = capped ? month.getTime() : status !== 429 ? now + 86400000
+    : /per ?day|PerDay|limit: 0/i.test(t) ? nextQuotaReset() : now + 65000;
+  setKey(ks, k.i, { until: { ...(k.until || {}), [model]: rest }, err: String(msg).slice(0, 200), errAt: new Date().toISOString() });
+  return String(msg);
 }
 // Sends body (a Gemini request, as text or bytes) to model with the first key
 // that isn't resting; on a quota or key error marks it and tries the next.
@@ -760,7 +802,8 @@ function setKey(ks, i, v) {
 async function geminiCall(env, model, body, only) {
   const ks = await getJSON(env, "gemkeys", {});
   ks.keys = ks.keys || [];
-  const all = geminiKeys(env, ks).filter((k) => only === undefined || String(k.i) === String(only));
+  const all = only === undefined ? geminiKeys(env, ks)
+    : [...geminiKeys(env, ks), videoKey(ks)].filter((k) => k && String(k.i) === String(only));
   if (!all.length) return { error: "אין מפתח Gemini — מוסיפים בהגדרות ← מפתחות Gemini", status: 400 };
   const now = Date.now();
   const ready = all.filter((k) => !((k.until || {})[model] > now));
@@ -775,21 +818,13 @@ async function geminiCall(env, model, body, only) {
   for (const k of ready) {
     const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", {
       method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": k.key }, body });
-    const peek = res.ok ? "" : await res.clone().text();
-    const bad400 = res.status === 400 && /API_KEY_INVALID|API key not valid|API key expired/i.test(peek);
-    const capped = /spending cap/i.test(peek);           // the project's monthly spend cap (AI Studio)
-    if (!(res.status === 429 || res.status === 401 || res.status === 403 || bad400 || capped)) {
+    const msg = keyTrouble(ks, k, model, res.status, res.ok ? "" : await res.clone().text());
+    if (msg === null) {
       if (k.err) { setKey(ks, k.i, { err: "" }); changed = true; }
       if (changed) await putJSON(env, "gemkeys", ks);    // the keys that failed on the way rest
       return { res };
     }
-    const t = await res.text();
-    let msg = t; try { msg = JSON.parse(t).error.message || t; } catch (e) {}
-    const month = new Date(); month.setUTCMonth(month.getUTCMonth() + 1, 1); month.setUTCHours(8, 0, 0, 0);
-    const rest = capped ? month.getTime() : res.status !== 429 ? now + 86400000
-      : /per ?day|PerDay|limit: 0/i.test(t) ? nextQuotaReset() : now + 65000;
-    setKey(ks, k.i, { until: { ...(k.until || {}), [model]: rest }, err: String(msg).slice(0, 200), errAt: new Date().toISOString() });
-    last = k.label + ": " + String(msg).slice(0, 160); changed = true;
+    last = k.label + ": " + msg.slice(0, 160); changed = true;
   }
   await putJSON(env, "gemkeys", ks);
   return { error: "כל המפתחות נכשלו — " + last, status: 429 };
@@ -816,8 +851,32 @@ async function cleanImagePrompt(env, prompt) {
   } catch (e) { return ""; }
 }
 
+// ---------- videos: GitHub Actions does the work ----------
+// GH_TOKEN: a fine-grained token for this repository with "Actions: read and
+// write" (start the run, read and delete its artifact). GH_REPO / GH_REF
+// override the repository and branch.
+const gh = (env, path, opts = {}) => fetch("https://api.github.com/repos/" + (env.GH_REPO || "shmuel-sinay/YouTube-downloads") + path, {
+  ...opts, headers: { Authorization: "Bearer " + env.GH_TOKEN, Accept: "application/vnd.github+json",
+                      "User-Agent": "yt-tracker-worker", "X-GitHub-Api-Version": "2022-11-28" } });
+// An artifact comes as a zip with one file. Uploaded with compression-level 0,
+// so getting it out is slicing (or a native inflate) — no work for the free plan.
+async function unzipOne(buf) {
+  const b = new Uint8Array(buf), v = new DataView(buf);
+  let e = b.length - 22;
+  while (e >= 0 && v.getUint32(e, true) !== 0x06054b50) e--;   // end of central directory
+  if (e < 0) throw new Error("not a zip");
+  const cd = v.getUint32(e + 16, true);
+  if (v.getUint32(cd, true) !== 0x02014b50) throw new Error("bad zip");
+  const method = v.getUint16(cd + 10, true), size = v.getUint32(cd + 20, true), lh = v.getUint32(cd + 42, true);
+  const start = lh + 30 + v.getUint16(lh + 26, true) + v.getUint16(lh + 28, true);
+  const data = b.subarray(start, start + size);
+  if (method === 0) return data;
+  if (method !== 8) throw new Error("zip method " + method);
+  return new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer());
+}
+
 const json = (v, status = 200) => new Response(JSON.stringify(v), {
-  status, headers: { "Content-Type": "application/json; charset=utf-8" } });
+  status, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
 const redirect = (to, headers = {}) => new Response(null, { status: 303, headers: { Location: to, ...headers } });
 
 async function route(req, env, ctx) {
@@ -843,6 +902,39 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     if (!isAgent(req, env)) {
       await addLog(env, "worker", "⚠ הסוכן ניסה להתחבר עם AGENT_TOKEN שגוי (צריך להיות זהה ב-Cloudflare וב-Render)");
       return json({ error: "unauthorized" }, 401);
+    }
+    // The video Action (.github/workflows/video.yml), with the same token.
+    if (p === "/api/vid/job") {
+      const id = String(url.searchParams.get("id") || ""), key = "vidjob:" + id;
+      const j = /^[0-9a-f]{16}$/.test(id) && await getJSON(env, key, null);
+      if (!j) return json({ error: "no such job" }, 404);
+      const ks = await getJSON(env, "gemkeys", {});
+      ks.keys = ks.keys || [];
+      // Veo only with the paid video key (it has no free tier); without one the
+      // Action makes the video for free on Hugging Face.
+      const vk = videoKey(ks), keys = vk ? [vk] : [];
+      if (req.method === "GET") {                        // starting: the prompt and the keys to try, in order
+        if (j.status !== "queued") return json({ error: "already taken" }, 409);
+        Object.assign(j, { status: "running", run: String(url.searchParams.get("run") || "") });
+        await putJSON(env, key, j);
+        const now = Date.now();
+        return json({ prompt: j.prompt, model: j.model, paid: !!vk,
+          keys: keys.filter((k) => !((k.until || {})[j.model] > now)).map((k) => ({ i: k.i, key: k.key })) });
+      }
+      // Finished: keys that Google refused rest, like in geminiCall.
+      const b = await req.json();
+      let changed = false;
+      for (const f of (b.failed || []).slice(0, 20)) {
+        const k = keys.find((x) => String(x.i) === String(f.i));
+        if (k && keyTrouble(ks, k, j.model, +f.status, String(f.text || "")) !== null) changed = true;
+      }
+      const ok = (b.used !== undefined) && keys.find((x) => String(x.i) === String(b.used));
+      if (ok && ok.err) { setKey(ks, ok.i, { err: "" }); changed = true; }
+      if (changed) await putJSON(env, "gemkeys", ks);
+      if (b.status === "done") j.status = "done";
+      else Object.assign(j, { status: "failed", error: String(b.error || "השרת ב-GitHub נכשל").slice(0, 400) });
+      await putJSON(env, key, j);
+      return json({ ok: true });
     }
     const agent = await getJSON(env, "agent", {});
     if (!agent.seen || Date.now() - Date.parse(agent.seen) > 180000) {
@@ -982,8 +1074,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const want = String(f.get("pid") || ""), pw = String(f.get("password") || "");
     const pid = want ? ((await checkCode(env, want, pw)) ? want : null) : await loginProfile(env, pw);
     if (pid) {
-      const tok = await profileToken(env, pid);
-      return redirect(BASE + "/", { "Set-Cookie": `auth=${pid}.${tok}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000` });
+      return redirect(BASE + "/", { "Set-Cookie": await sessionCookie(env, pid) });
     }
     return page("כניסה", await loginForm(env, "קוד שגוי", want));
   }
@@ -1629,6 +1720,57 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       return json({ ok: true });
     } catch (e) { return json({ error: "אין תשובה מימות: " + (e.message || e) }); }
   }
+
+  // --- videos from Gemini (Veo), for the desktop app only ---
+  // The work happens on GitHub (.github/workflows/video.yml): Veo takes
+  // minutes and the video is megabytes, too much for a request here. This
+  // only starts the Action and, at the end, passes on the scrambled file it
+  // left (an artifact) — the same scrambled format as the pictures.
+  if (p.startsWith("/vid/") && req.method === "POST") {
+    if ((await profileInfo(env, pid)).netfree) return json({ error: "לא זמין בפרופיל הזה" }, 403);
+    if (!rootEnv.GH_TOKEN) return json({ error: "חסר GH_TOKEN ב-Worker — ראה README ← סרטונים" }, 400);
+    const b = await req.json();
+    if (p === "/vid/start") {
+      const prompt = String(b.prompt || "").trim().slice(0, 2000);
+      if (!prompt) return json({ error: "צריך לכתוב מה לצלם" }, 400);
+      const id = [...crypto.getRandomValues(new Uint8Array(8))].map((x) => x.toString(16).padStart(2, "0")).join("");
+      await putJSON(rootEnv, "vidjob:" + id, { id, pid, prompt, model: rootEnv.VIDEO_MODEL || "veo-3.0-fast-generate-001",
+                                               status: "queued", at: Date.now() });
+      let ref = rootEnv.GH_REF;
+      if (!ref) ref = (await (await gh(rootEnv, "")).json()).default_branch || "main";
+      const r = await gh(rootEnv, "/actions/workflows/video.yml/dispatches", { method: "POST", body: JSON.stringify({ ref, inputs: { job: id } }) });
+      if (!r.ok) {
+        await rootEnv.DB.delete("vidjob:" + id);
+        return json({ error: "GitHub לא הפעיל את השרת: HTTP " + r.status + " " + (await r.text()).slice(0, 200) }, 502);
+      }
+      return json({ job: id });
+    }
+    const id = String(b.job || "");
+    const j = /^[0-9a-f]{16}$/.test(id) && await getJSON(rootEnv, "vidjob:" + id, null);
+    if (!j || j.pid !== pid) return json({ error: "הסרטון לא נמצא" }, 404);
+    if (p === "/vid/done") {                             // saved in the app: clean up on GitHub
+      if (j.artifact) await gh(rootEnv, "/actions/artifacts/" + j.artifact, { method: "DELETE" });
+      await rootEnv.DB.delete("vidjob:" + id);
+      return json({ ok: true });
+    }
+    if (p !== "/vid/poll") return json({ error: "not found" }, 404);
+    if (j.status === "queued" || j.status === "running") {
+      if (Date.now() - j.at > 25 * 60000) { await rootEnv.DB.delete("vidjob:" + id); return json({ error: "השרת ב-GitHub לא סיים תוך 25 דקות — כדאי לנסות שוב" }, 504); }
+      return json({ done: false, stage: j.status });
+    }
+    if (j.status !== "done") { await rootEnv.DB.delete("vidjob:" + id); return json({ error: j.error || "השרת ב-GitHub נכשל" }, 502); }
+    const arts = (await (await gh(rootEnv, "/actions/runs/" + j.run + "/artifacts")).json()).artifacts || [];
+    const art = arts.find((x) => x.name === "vid-" + id);
+    if (!art) return json({ error: "הקובץ לא נמצא ב-GitHub" }, 502);
+    if (j.artifact !== art.id) { j.artifact = art.id; await putJSON(rootEnv, "vidjob:" + id, j); }
+    // The zip link sends on to a signed storage address — fetched without our token.
+    const z = await gh(rootEnv, "/actions/artifacts/" + art.id + "/zip", { redirect: "manual" });
+    const loc = z.headers.get("location");
+    const zr = loc ? await fetch(loc) : z;
+    if (!zr.ok) return json({ error: "הורדת הקובץ מ-GitHub נכשלה: HTTP " + zr.status }, 502);
+    return new Response(await unzipOne(await zr.arrayBuffer()), {
+      headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
+  }
   // --- the key pool (admin): add, remove, move up, release, test ---
   if (p === "/keys" && pid === "main") {
     const ks = await getJSON(rootEnv, "gemkeys", {});
@@ -1644,14 +1786,21 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         if (key.length < 10 || key.length > 200 || /\s/.test(key)) return json({ error: "מפתח לא תקין (ריק או עם רווחים)" }, 400);
         if (ks.keys.some((k) => k.key === key) || key === rootEnv.GEMINI_API_KEY) return json({ error: "המפתח כבר ברשימה" }, 400);
         ks.keys.push({ key, label: String(b.label || "").trim().slice(0, 40) || "מפתח " + (ks.keys.length + 1), added: new Date().toISOString() });
-      } else if (b.op === "del" && ks.keys[i]) ks.keys.splice(i, 1);
+      } else if (b.op === "vset") {
+        const key = String(b.key || "").trim();
+        if (key.length < 10 || key.length > 200 || /\s/.test(key)) return json({ error: "מפתח לא תקין (ריק או עם רווחים)" }, 400);
+        ks.video = { key, label: "מפתח בתשלום לסרטונים", added: new Date().toISOString() };
+      } else if (b.op === "vdel") delete ks.video;
+      else if (b.op === "del" && ks.keys[i]) ks.keys.splice(i, 1);
       else if (b.op === "up" && i > 0 && ks.keys[i]) ks.keys.splice(i - 1, 0, ks.keys.splice(i, 1)[0]);
-      else if (b.op === "reset") setKey(ks, b.i === "b" ? "b" : i, { until: {}, err: "" });
+      else if (b.op === "reset" && (b.i !== "v" || ks.video)) setKey(ks, b.i === "b" || b.i === "v" ? b.i : i, { until: {}, err: "" });
       await putJSON(rootEnv, "gemkeys", ks);
     }
     const now = Date.now();
-    return json({ keys: geminiKeys(rootEnv, ks).map((k) => ({ i: k.i, label: k.label, mask: k.key.slice(0, 6) + "…" + k.key.slice(-4),
-      err: k.err || "", resting: Object.values(k.until || {}).filter((t) => t > now).sort()[0] || 0 })) });
+    const show = (k) => ({ i: k.i, label: k.label, mask: k.key.slice(0, 6) + "…" + k.key.slice(-4),
+      err: k.err || "", resting: Object.values(k.until || {}).filter((t) => t > now).sort()[0] || 0 });
+    const vk = videoKey(ks);
+    return json({ keys: geminiKeys(rootEnv, ks).map(show), video: vk ? show(vk) : null });
   }
   if (req.method === "POST") {
     const f = await req.formData();
@@ -2084,6 +2233,10 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .imgcard .cap span{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .imgbig{position:fixed;inset:0;background:#000d;display:grid;place-items:center;z-index:50;cursor:zoom-out}
 .imgbig img{max-width:94vw;max-height:94vh;border-radius:10px}
+#vidPrompt{min-height:76px;resize:vertical}
+.vidgrid{grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
+.imgcard video{width:100%;aspect-ratio:16/9;display:block;background:#000}
+.imgcard.wait .ph.v{aspect-ratio:16/9}
 .mini{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)}.mini:last-child{border-bottom:0}
 .mini .pos,.keyrow .pos{flex:none;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--panel2);color:var(--muted);font-size:.8rem;font-variant-numeric:tabular-nums}
 .mini .t{flex:1;min-width:0}.mini .t b{display:block;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -2163,7 +2316,7 @@ function page(title, body) {
 <link rel="icon" href="${ICON}">
 <link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>${CSS}</style></head><body>${body}</body></html>`,
-    { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
 // "Who's signing in?" — a tile per profile, then that profile's code.
@@ -2222,6 +2375,7 @@ async function dashboard(env) {
   <button class="nav hidden" id="vaultNav" type="button">${icon("lock")}<span>כספת</span></button>
   <button class="nav hidden" data-page="phone" id="phoneNav">${icon("monitor")}<span>קו טלפון</span></button>
   <button class="nav hidden" data-page="images" id="imgNav">${icon("image")}<span>תמונות</span></button>
+  <button class="nav hidden" data-page="videos" id="vidNav">${icon("video")}<span>סרטונים</span></button>
   <div class="grow"></div>
   <a class="nav extra" href="/">${icon("chat")}<span>Gemini</span></a>
 </aside>
@@ -2399,6 +2553,17 @@ async function dashboard(env) {
     </div>
   </section>
 
+  <section data-p="videos" class="hidden">
+    <div class="card">
+      <h2>${icon("video")}סרטון חדש עם Gemini</h2>
+      <p class="sub">הסרטון נוצר בשרת ב-GitHub, עובר מעורבל ונפתח רק כאן בתוכנה. באתר עצמו לא נשמר שום סרטון. בלי מפתח בתשלום הוא נוצר בחינם ב-Hugging Face (מכסה יומית קטנה, איכות נמוכה מ-Veo).</p>
+      <textarea id="vidPrompt" rows="3" placeholder="מה לצלם? למשל: גלים מתנפצים על סלעים בשקיעה, צילום רחפן איטי"></textarea>
+      <div class="imgbar"><button class="btn" id="vidMake" type="button">${icon("zap")}<span>צור סרטון</span></button>
+      <span class="sub" style="margin:0">Ctrl+Enter ליצירה</span></div>
+    </div>
+    <div id="vidGrid" class="imggrid vidgrid"></div>
+  </section>
+
   <section data-p="logs" class="hidden">
     <div class="actions-row" style="margin:0 0 12px;gap:8px;justify-content:space-between;align-items:center">
       <span class="sub" style="margin:0">worker = Cloudflare · render = שרת ההורדות · pc = התוכנה במחשב</span>
@@ -2435,6 +2600,14 @@ async function dashboard(env) {
         <input id="keyValue" placeholder="מפתח API" style="flex:1;min-width:160px">
         <button class="btn ghost" id="keyGet" type="button" title="יצירת מפתח ב-Google AI Studio">${icon("link")}<span>צור מפתח</span></button>
         <button class="btn" id="keyAdd" type="button">${icon("add")}<span>הוסף</span></button>
+      </div>
+      <p class="sub" style="margin:8px 0 0">מפתח חדש: aistudio.google.com/apikey ← Create API key</p>
+      <h2 style="margin-top:20px">${icon("video")}מפתח בתשלום לסרטונים</h2>
+      <p class="sub">מפתח מפרויקט עם חיוב פעיל (Google Cloud). כשהוא מוגדר, סרטונים משתמשים רק בו, ותמונות והצ'אט לעולם לא — כדי שלא ישלמו עליהם. בלעדיו, סרטונים נוצרים בחינם ב-Hugging Face.</p>
+      <div id="vkeyRow"></div>
+      <div class="cbar" style="margin-top:12px">
+        <input id="vkeyValue" placeholder="AIza…" style="flex:1;min-width:180px">
+        <button class="btn" id="vkeySet" type="button">${icon("check")}<span>שמור</span></button>
       </div>
     </div>
     <div class="card hidden" id="cookieCard">
@@ -2488,7 +2661,7 @@ function toast(msg, ms) { const t = $("toast"); t.textContent = msg; t.style.dis
 const APP = () => window.pywebview && window.pywebview.api;   // running inside the desktop app?
 
 // ---------- pages ----------
-const TITLES = { dash: "לוח בקרה", global: "לוח בקרה כללי", queue: "תור הורדות", channels: "ערוצים", add: "הוספה", logs: "לוגים", settings: "הגדרות", phone: "קו טלפון", images: "תמונות" };
+const TITLES = { dash: "לוח בקרה", global: "לוח בקרה כללי", queue: "תור הורדות", channels: "ערוצים", add: "הוספה", logs: "לוגים", settings: "הגדרות", phone: "קו טלפון", images: "תמונות", videos: "סרטונים" };
 function showPage(name) {
   if (name === "global" && !(S.profile && S.profile.admin)) name = "dash";
   document.querySelectorAll(".nav[data-page]").forEach((n) => n.classList.toggle("on", n.dataset.page === name));
@@ -2498,6 +2671,7 @@ function showPage(name) {
   if (name === "logs") { const b = $("logs"); b.scrollTop = b.scrollHeight; }
   if (name === "global") setTimeout(loadGlobal, 0);
   if (name === "images") setTimeout(loadImages, 0);
+  if (name === "videos") setTimeout(loadVideos, 0);
   if (name === "settings") setTimeout(loadKeys, 0);
 }
 document.querySelectorAll(".nav[data-page]").forEach((n) => n.onclick = () => showPage(n.dataset.page));
@@ -2672,6 +2846,7 @@ function render() {
   $("imgNav").classList.toggle("hidden", !(APP() && APP().img_list && S.profile && !S.profile.netfree));
   document.querySelectorAll(".ttHint").forEach((e) => e.classList.toggle("hidden", !!(S.profile && S.profile.netfree)));
   document.querySelectorAll(".ymtOnly").forEach((e) => e.classList.toggle("hidden", !(S.profile && S.profile.admin)));
+  $("vidNav").classList.toggle("hidden", !(APP() && APP().vid_list && S.profile && !S.profile.netfree));
   $("globalNav").classList.toggle("hidden", !(S.profile && S.profile.admin));
   $("cookieCard").classList.toggle("hidden", !S.cookieExt);
   if (S.cookieExt) {
@@ -2730,7 +2905,7 @@ const MSG = { pause: "הושהה", resume: "ממשיך", priority: "יורד ע�
 document.addEventListener("click", async (e) => {
   const el = e.target.closest("[data-act]"); if (!el) return;
   const act = el.dataset.act, id = el.dataset.id, d = new FormData(); d.append("id", id);
-  if (act.startsWith("img")) return;                 // the images page handles these
+  if (act.startsWith("img") || act.startsWith("vid")) return;   // the images / videos pages handle these
   try {
     if (act === "cancel" && !confirm("לבטל את ההורדה?")) return;
     if (act === "remove" && !confirm("להסיר את הערוץ מהמעקב?")) return;
@@ -3096,6 +3271,68 @@ $("lfMove").onclick = async () => {
   await lineOp("/yemot/mv", l.filter((f) => f.dir !== to), to);
 };
 
+// ---------- videos (desktop app only) ----------
+// Same as the pictures: scrambled bytes from the site, kept scrambled by the
+// app, which hands back a playable video only to show it here.
+async function loadVideos() {
+  if (!(APP() && APP().vid_list)) return;
+  const list = await APP().vid_list();
+  const hasVault = APP().vid_to_vault && S.profile && S.profile.vault;
+  const wait = $("vidWait");
+  $("vidGrid").innerHTML = list.length ? list.map((m) => '<div class="imgcard"><video data-vid="' + esc(m.id) + '" controls preload="metadata"></video>' +
+    '<div class="cap"><span title="' + esc(m.prompt) + '">' + esc(m.prompt) + '</span>' +
+    (hasVault ? btn("vidvault", m.id, "lock", "העבר לכספת") : "") +
+    btn("vidsave", m.id, "download", "שמור כקובץ וידאו") + btn("viddel", m.id, "trash", "מחק", "danger") + '</div></div>').join("")
+    : (wait ? "" : '<div class="empty">' + icon("video") + '<div>עוד אין סרטונים</div></div>');
+  if (wait) $("vidGrid").prepend(wait);              // still making one
+  for (const el of document.querySelectorAll("video[data-vid]")) {
+    try { el.src = await APP().vid_get(el.dataset.vid); } catch (e) {}
+  }
+}
+const VID_BTN = $("vidMake").innerHTML;
+$("vidPrompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("vidMake").click(); });
+$("vidMake").onclick = async () => {
+  const prompt = $("vidPrompt").value.trim(); if (!prompt) return toast("כתוב מה לצלם");
+  if ($("vidMake").disabled) return;
+  $("vidMake").disabled = true;
+  const busy = (t) => $("vidMake").innerHTML = '<span class="spin"></span><span>' + t + '</span>';
+  busy("מתחיל…");
+  const empty = $("vidGrid").querySelector(".empty"); if (empty) empty.remove();
+  $("vidGrid").insertAdjacentHTML("afterbegin", '<div class="imgcard wait" id="vidWait"><div class="ph v">' + icon("video") + '</div><div class="cap"><span>' + esc(prompt) + '</span></div></div>');
+  const call = async (path, body) => {
+    const r = await fetch(B + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if ((r.headers.get("content-type") || "").includes("json")) { const d = await r.json(); if (d.error) throw new Error(d.error); return d; }
+    if (!r.ok) throw new Error("HTTP " + r.status + " " + (await r.text()).slice(0, 200));
+    return r;
+  };
+  try {
+    const job = await call("/vid/start", { prompt });
+    const t0 = Date.now();
+    let stage = "queued";
+    for (;;) {                                       // the GitHub server starts in ~30s, Veo takes 1-3 minutes
+      busy((stage === "queued" ? "מפעיל שרת ב-GitHub… " : "מצלם… ") + mmss(Math.round((Date.now() - t0) / 1000)) + " (בדרך כלל 2-4 דקות)");
+      await new Promise((ok) => setTimeout(ok, 8000));
+      const r = await call("/vid/poll", job);
+      if (r instanceof Response) {
+        busy("שומר…"); await APP().vid_save(b64(await r.arrayBuffer()), prompt);
+        call("/vid/done", job).catch(() => {});
+        break;
+      }
+      stage = r.stage;
+    }
+    $("vidPrompt").value = "";
+  } catch (e) { toast("שגיאה: " + (e.message || e), 8000); }
+  const w = $("vidWait"); if (w) w.remove();
+  await loadVideos();
+  $("vidMake").disabled = false; $("vidMake").innerHTML = VID_BTN;
+};
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-act]"); if (!b || !b.dataset.act.startsWith("vid")) return;
+  if (b.dataset.act === "vidsave") { const f = await APP().vid_export(b.dataset.id); if (f) toast("נשמר: " + f, 6000); }
+  if (b.dataset.act === "viddel" && confirm("למחוק את הסרטון?")) { await APP().vid_delete(b.dataset.id); loadVideos(); }
+  if (b.dataset.act === "vidvault") { try { await APP().vid_to_vault(b.dataset.id); toast("הועבר לכספת"); loadVideos(); } catch (x) { toast("שגיאה: " + x, 6000); } }
+});
+
 // ---------- Gemini keys (admin) ----------
 async function keysOp(body) {
   const r = await fetch(B + "/keys", body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
@@ -3112,8 +3349,20 @@ function keysRender(d) {
     (k.i !== "b" && k.i > 0 ? '<button class="ibtn" data-key="up" data-i="' + k.i + '" title="העלה למעלה">' + icon("now") + '</button>' : '') +
     (k.i !== "b" ? '<button class="ibtn danger" data-key="del" data-i="' + k.i + '" title="מחק">' + icon("trash") + '</button>' : '') + '</div>').join("")
     : '<div class="sub" style="margin:0">אין עדיין מפתחות.</div>';
+  const v = d.video;
+  $("vkeyRow").innerHTML = v ? '<div class="keyrow"><div class="t"><b>' + esc(v.label) + '</b><span>' + esc(v.mask) +
+    (v.resting ? ' · <span class="bad">נח עד ' + new Date(v.resting).toLocaleString("he-IL", { weekday: "short", hour: "2-digit", minute: "2-digit" }) + '</span>' : ' · פעיל') +
+    (v.err ? ' · ' + esc(v.err) : '') + '</span></div>' +
+    '<button class="btn ghost" data-key="test" data-i="v" type="button">בדוק</button>' +
+    (v.resting || v.err ? '<button class="btn ghost" data-key="reset" data-i="v" type="button">שחרר</button>' : '') +
+    '<button class="ibtn danger" data-key="vdel" data-i="v" title="מחק">' + icon("trash") + '</button></div>'
+    : '<div class="sub" style="margin:0">לא הוגדר.</div>';
 }
 async function loadKeys() { if (S.profile && S.profile.admin) try { keysRender(await keysOp()); } catch (e) {} }
+$("vkeySet").onclick = async () => {
+  try { keysRender(await keysOp({ op: "vset", key: $("vkeyValue").value })); $("vkeyValue").value = ""; toast("המפתח לסרטונים נשמר"); }
+  catch (e) { toast("שגיאה: " + e.message, 6000); }
+};
 $("keyAdd").onclick = async () => {
   try { keysRender(await keysOp({ op: "add", key: $("keyValue").value, label: $("keyLabel").value })); $("keyValue").value = ""; $("keyLabel").value = ""; toast("המפתח נוסף"); }
   catch (e) { toast("שגיאה: " + e.message, 6000); }
@@ -3126,7 +3375,7 @@ $("profHelp").onclick = (e) => { e.preventDefault(); toast("קוד — רק המ
 $("extHelp").onclick = (e) => { e.preventDefault(); toast("מורידים YTCookies-extension.zip מעמוד ההורדות, פותחים, וב-Chrome: chrome://extensions ← מצב מפתח ← טען תוסף לא ארוז ← בוחרים את התיקייה. מדביקים בתוסף את המפתח שלמטה.", 14000); };
 document.addEventListener("click", async (e) => {
   const b = e.target.closest("[data-key]"); if (!b) return;
-  if (b.dataset.key === "del" && !confirm("למחוק את המפתח?")) return;
+  if ((b.dataset.key === "del" || b.dataset.key === "vdel") && !confirm("למחוק את המפתח?")) return;
   if (b.dataset.key === "test") toast("בודק…");
   try { const d = await keysOp({ op: b.dataset.key, i: b.dataset.i }); if (d.msg) { toast(d.msg, 8000); loadKeys(); } else keysRender(d); }
   catch (x) { toast("שגיאה: " + x.message, 6000); }

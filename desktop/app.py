@@ -1129,6 +1129,49 @@ class Api:
             webbrowser.open(str(url))
         return True
 
+    # -- videos made with Gemini (Veo) — same as the pictures, own folder
+    def _videos(self):
+        from images import Gallery
+        dl = self._dl()
+        if dl.cfg.get("netfree"):
+            raise PermissionError("לא זמין בפרופיל הזה")
+        return Gallery(USERDATA / f"videos-{dl.pid}", ".mp4")
+
+    def vid_save(self, b64: str, prompt: str) -> str:
+        return self._videos().add(str(b64), str(prompt))
+
+    def vid_list(self) -> list:
+        return self._videos().list()
+
+    def vid_get(self, vid: str) -> str:
+        return self._videos().data_url(str(vid))
+
+    def vid_export(self, vid: str) -> str:
+        dest = self._videos().export(str(vid), Path.home() / "Videos" / "Gemini")
+        subprocess.Popen(["explorer", "/select,", str(dest)])
+        return str(dest)
+
+    def vid_delete(self, vid: str) -> bool:
+        self._videos().delete(str(vid))
+        return True
+
+    def vid_to_vault(self, vid: str) -> str:
+        """Like img_to_vault: into the encrypted vault, out of the gallery."""
+        dl = self._dl()
+        if not dl.cfg.get("vault_dir"):
+            raise PermissionError("אין כספת לפרופיל הזה")
+        from vault import Vault
+        g = self._videos()
+        tmp = Path(tempfile.mkdtemp(prefix="yt-vid-"))
+        try:
+            src = g.export(str(vid), tmp)                      # a real video file, briefly
+            prompt = next((m.get("prompt", "") for m in g.list() if m["id"] == str(vid)), "")
+            Vault(dl.cfg["vault_dir"]).add(src, {"title": prompt[:120]}, remove_src=True)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        g.delete(str(vid))
+        return "ok"
+
     def open_folder(self) -> None:
         dl = self._dl()
         if dl.cfg.get("vault_dir"):
