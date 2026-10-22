@@ -1017,7 +1017,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         title: it.title || it.videoId, published: "", url: it.url || ("https://www.youtube.com/watch?v=" + it.videoId),
         source: it.source || b.source || "", mode: b.yemot ? "m4a" : modeOf(b.mode), minMinutes: b.minMinutes || 0,
         ...(b.yemot ? { yemot: true } : {}), ...(b.yemotPath ? { yemotPath: String(b.yemotPath) } : {}),
-        status: "queued", updated: new Date().toISOString(),
+        status: "queued", updated: new Date().toISOString(), ...(b.parent ? { parent: String(b.parent) } : {}),
         ...(it.group ? { group: String(it.group), rank: +it.rank || 0 } : {}) }));
       if (b.priority) fresh.forEach((j) => { j.priority = b.priority; });
       await addJobs(env, fresh);
@@ -1925,15 +1925,17 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       // the channel with yt-dlp (any number — RSS only shows the last 15)
       // and sends the videos back to /api/enqueue as regular jobs.
       const id = await resolveChannelId(String(f.get("channel") || ""));
-      const { name } = await readFeed(id).catch(() => ({ name: id }));
+      const isPl = !/^UC/.test(id);
+      const { name: nm } = await readFeed(id).catch(() => ({ name: id }));
+      const name = nm === id ? (isPl ? "רשימת הפעלה" : "ערוץ") : nm;
       const count = Math.max(1, Math.min(300, parseInt(f.get("count") || "10", 10) || 10));
       const skipShorts = f.get("skipShorts") === "on";
       const lid = "list-" + id + "-" + Date.now().toString(36);
       await addJobs(env, [{
         videoId: lid, kind: "list", channelId: id, channelName: name,
-        title: `${count} סרטונים אחרונים מ-${name}`,
+        title: `${count} סרטונים אחרונים — ${name}`,
         // the "videos" tab has no Shorts; the uploads playlist (UU…) has everything
-        url: skipShorts ? `https://www.youtube.com/channel/${id}/videos` : `https://www.youtube.com/playlist?list=UU${id.slice(2)}`,
+        url: isPl ? `https://www.youtube.com/playlist?list=${id}` : skipShorts ? `https://www.youtube.com/channel/${id}/videos` : `https://www.youtube.com/playlist?list=UU${id.slice(2)}`,
         count, mode: wantsYemot(f, env) ? "m4a" : modeOf(f.get("mode")), minMinutes: Math.max(0, parseInt(f.get("minMinutes") || "0", 10) || 0),
         ...(wantsYemot(f, env) ? { yemot: true } : {}),
         status: "queued", priority: Date.now(), updated: new Date().toISOString() }]);
@@ -2225,6 +2227,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;color:var(--muted);font-size:.8rem;margin-top:4px}
 .meta .i{width:13px;height:13px}
 .sep{opacity:.4}
+.kids{margin-top:8px;font-size:.85rem}.kids summary{cursor:pointer;color:var(--muted)}.kid{padding:6px 0;border-top:1px solid var(--line,#2a2f3a)}.kid .kt{display:inline-block;max-width:70%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle;margin-inline-end:8px}
 .note{font-size:.8rem;margin-top:6px;color:var(--muted);word-break:break-word}.note.bad{color:var(--bad)}
 .badge{display:inline-flex;align-items:center;gap:6px;font-size:.76rem;font-weight:500;padding:3px 10px;border-radius:999px;white-space:nowrap;background:var(--panel2);color:var(--muted)}
 .badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
@@ -2745,13 +2748,21 @@ function jobRow(j) {
   if (["failed", "skipped", "cancelled", "blocked"].includes(j.status)) a.push(btn("retry", j.videoId, "retry", j.status === "blocked" ? "בדוק שוב בנטפרי" : "נסה שוב"));
   if (["queued", "taken", "paused", "nfcheck"].includes(j.status)) a.push(btn("cancel", j.videoId, "x", "ביטול", "danger"));
   a.push(btn("delete", j.videoId, "trash", "מחק מההיסטוריה", "danger"));
+  const kids = list ? S.jobs.filter((k) => k.parent === j.videoId) : [];
+  const kidsHtml = kids.length ? '<details class="kids"' + (kids.some((k) => k.status === "taken") ? " open" : "") + '><summary>' + kids.length + ' סרטונים: ' +
+    kids.filter((k) => k.status === "done").length + ' ירדו · ' + kids.filter((k) => k.status === "taken").length + ' בהורדה · ' +
+    kids.filter((k) => ["queued", "paused", "nfcheck"].includes(k.status)).length + ' ממתינים' +
+    (kids.some((k) => PROBLEM.includes(k.status)) ? ' · ' + kids.filter((k) => PROBLEM.includes(k.status)).length + ' בעיות' : '') + '</summary>' +
+    kids.map((k) => '<div class="kid"><span class="kt" title="' + esc(k.title) + '">' + esc(k.title) + '</span>' + badgeOf(k.status) +
+      (k.status === "taken" ? '<div class="prog" data-prog="' + esc(k.videoId) + '">' + progHtml(k.videoId) + '</div>' : '') +
+      (k.error && k.status !== "done" ? '<div class="note bad">' + esc(k.error) + '</div>' : '') + '</div>').join("") + '</details>' : '';
   return '<div class="row">' + thumb + '<div class="info"><div class="title" title="' + esc(j.title) + '">' + esc(j.title) + '</div>' +
     '<div class="meta">' + meta + '</div>' +
     (j.error ? '<div class="note' + (["failed", "blocked"].includes(j.status) ? " bad" : "") + '">' + esc(j.error) + '</div>' : '') +
     (/confirm you.re not a bot|cookies-from-browser/i.test(j.error || "") ? '<div class="note">' + icon("alert") +
       ' יוטיוב חסם את שרת ההורדות ("תוכיח שאתה לא בוט"). צריך קובץ עוגיות חדש: מייצאים cookies.txt מחלון גלישה בסתר שמחובר ליוטיוב, ומחליפים ב-Render ← Environment ← Secret Files ← cookies.txt. אחר כך "נסה שוב".</div>' : '') +
     (j.status === "nfcheck" ? '<div class="note">התוכנה במחשב בודקת שהסרטון פתוח בנטפרי, ורק אז הוא יורד (אם התוכנה סגורה — ממתין לה).</div>' : '') +
-    (j.status === "taken" ? '<div class="prog" data-prog="' + esc(j.videoId) + '">' + progHtml(j.videoId) + '</div>' : '') + '</div>' +
+    (j.status === "taken" ? '<div class="prog" data-prog="' + esc(j.videoId) + '">' + progHtml(j.videoId) + '</div>' : '') + kidsHtml + '</div>' +
     '<div class="side-col"><span class="badge b-' + esc(j.status) + '">' + (STATUS[j.status] || esc(j.status)) + '</span>' +
     '<div class="acts">' + a.join("") + '</div></div></div>';
 }

@@ -577,7 +577,7 @@ def handle_list(job: dict) -> None:
     is_yt = "youtube.com" in job["url"] or "youtu.be" in job["url"]
     cmd = ["yt-dlp", job["url"], "--flat-playlist", "--no-warnings",
            "--playlist-end", str(min(max(count * (3 if min_s else 1) + 5, int(job.get("scan") or 0)), 600)),
-           "--print", "%(id)s\t%(duration)s\t%(webpage_url)s\t%(title)s"]
+           "--print", "%(id)s\t%(duration)s\t%(webpage_url)s\t%(title)s\t%(playlist_title)s"]
     if is_yt:
         # skip=authcheck: with the signed-in cookies yt-dlp refuses a public channel/playlist page it could not load fully
         # ("Playlists that require authentication may not extract correctly…") — list it anyway.
@@ -587,12 +587,15 @@ def handle_list(job: dict) -> None:
     if cookies:
         cmd += ["--cookies", cookies]
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+    real_name = ""
     items = []
     cat = []                            # for a catalog: everything that fits the title filter (no length filter)
     for line in r.stdout.splitlines():
-        parts = line.split("\t", 3)
+        parts = line.split("\t", 4)
         if len(parts) < 4 or not parts[0]:
             continue
+        if len(parts) > 4 and parts[4] not in ("", "NA") and not real_name:
+            real_name = parts[4]
         if is_yt and len(parts[0]) != 11:
             continue
         try:
@@ -635,8 +638,8 @@ def handle_list(job: dict) -> None:
         log("   לא נמצאו סרטונים")
         return
     res = api("/api/enqueue", {"items": items, "mode": job.get("mode"), "minMinutes": job.get("minMinutes"),
-                                "channelId": job.get("channelId"), "channelName": job.get("channelName"),
-                                "yemot": bool(job.get("yemot")), "yemotPath": job.get("yemotPath") or ""})
+                                "channelId": job.get("channelId"), "channelName": (real_name if job.get("channelName") in ("", "רשימה", "רשימת הפעלה", "ערוץ", job.get("channelId")) and real_name else job.get("channelName")),
+                                "parent": vid, "yemot": bool(job.get("yemot")), "yemotPath": job.get("yemotPath") or ""})
     msg = f"נוספו לתור {res.get('added', 0)} סרטונים" + (f" ({res['skipped']} כבר היו)" if res.get("skipped") else "")
     api("/api/report", {"videoId": vid, "status": "done", "error": msg})
     log("   " + msg)
