@@ -491,6 +491,20 @@ def run_ytdlp(cmd: list[str], vid: str = "") -> _Result:
             except Exception:
                 pass
 
+    def stall_watch() -> None:
+        """A download that crawls (under 1% in 8 minutes — seen: 26% over 6 hours at under 1 KB/s) holds the whole queue:
+        stop it, and the next client/route is tried."""
+        while not done.wait(30):
+            if state.get("dl") and time.time() - state.get("good", time.time()) > 480:
+                state["stalled"] = True
+                say("   ✖ ההורדה כמעט לא מתקדמת (פחות מאחוז ב-8 דקות) — עוצר ומנסה דרך אחרת")
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    pass
+                return
+
+    threading.Thread(target=stall_watch, daemon=True).start()
     if vid:
         threading.Thread(target=ffmpeg_monitor, daemon=True).start()
         threading.Thread(target=cancel_watch, daemon=True).start()
@@ -512,6 +526,9 @@ def run_ytdlp(cmd: list[str], vid: str = "") -> _Result:
                              speed=f[2] if len(f) > 2 else "", eta=f[3] if len(f) > 3 else "",
                              part=max(parts, 1))
             finished = line.split("·")[0].strip().endswith("100.0%")
+            if pct is not None and (state.get("pct") is None or pct >= state["pct"] + 1.0 or finished):
+                state["pct"], state["good"] = pct, time.time()
+            state["dl"] = not finished
             if (finished and not state.get("logged100")) or (not finished and time.time() - last_prog >= 60):
                 say("   ⬇ " + line[5:].strip())
                 last_prog = time.time()
@@ -536,6 +553,8 @@ def run_ytdlp(cmd: list[str], vid: str = "") -> _Result:
     done.set()
     if pf:
         pf.unlink(missing_ok=True)
+    if state.get("stalled"):
+        err_lines.append("ERROR: download stalled")
     return _Result(proc.returncode, "\n".join(out_lines), "".join(err_lines))
 
 
@@ -592,11 +611,16 @@ def handle_list(job: dict) -> None:
             continue
         if job.get("noEnqueue"):
             continue
-        if len(items) < count:
+        if len(items) < count or job.get("catalog"):
             items.append(item)
         if len(items) >= count and not job.get("catalog"):
             break
     if job.get("catalog"):
+        # A search/tab is not in date order: take the newest by the date written in the title ("18.10.2026").
+        def dkey(it):
+            m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", it["title"])
+            return ((int(m.group(3)) + (2000 if int(m.group(3)) < 100 else 0)), int(m.group(2)), int(m.group(1))) if m else (0, 0, 0)
+        items = sorted(items, key=dkey, reverse=True)[:count]
         api("/api/catalog", {"channelId": job.get("channelId"), "items": cat})
         log(f"   קטלוג: {len(cat)} פריטים")
         if job.get("noEnqueue"):

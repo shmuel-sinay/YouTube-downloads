@@ -1104,6 +1104,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   // Extension 8 (type=api) is the line's main menu: the sub-extensions, then "request" (7) and "listen to requests" (7/2).
   if (p === "/yemot/menu8") {
     const q = url.searchParams, T = (t) => new Response(t, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    if (q.get("hangup") === "yes") return T("");
     const subs = (await getJSON(profileEnv(env, "main"), "phonecfg", { subs: [] })).subs || [];
     if (!subs.length) return T("id_list_message=t-השירות לא מוגדר&go_to_folder=hangup");
     const say = (t) => String(t).replace(/[^\w\u0590-\u05FF ]/g, " ").replace(/\s+/g, " ").trim();
@@ -1121,6 +1122,8 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const clean = (t) => String(t).replace(/[^\w\u0590-\u05FF ]/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
     const D = (name, max, min) => name + ",," + max + "," + min + ",7,Digits,yes,no,,,,,,,no";
     const bye = (m) => T("id_list_message=t-" + String(m).replace(/[.]/g, ",") + "&go_to_folder=hangup");
+    // When the call ends Yemot calls once more with hangup=yes and the same answers: that must not queue the request again.
+    if (q.get("hangup") === "yes") return T("");
     if (!env.YEMOT_PIN) return bye("השירות לא מוגדר");
     // Extension 7 starts straight at the access code; the menu (request / listen) is extension 8's.
     // Yemot keeps the answers of one call across steps, so after a finished request the call ends (a second request starts a new call).
