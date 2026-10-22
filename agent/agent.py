@@ -695,6 +695,25 @@ def _is_adult(url: str) -> bool:
     return bool(_ADULT.search(host) or re.search(r"\b(porn|xxx|hentai)\b", host, re.I))
 
 
+def offer_to_pc(path: Path, vid: str) -> tuple[str, str]:
+    """After a phone-line upload: the same file, zipped and offered to the desktop app (it fetches it into the vault when it is open).
+    Returns (url, name); ("", "") if it could not be prepared. Removes `path`."""
+    try:
+        f = to_zip(path, vid)
+        try:
+            url = upload_r2(f) or ""
+        except Exception as e:
+            log(f"   R2 upload failed: {e}")
+            url = ""
+        if not url and PORT and PUBLIC_URL:
+            url = f"{PUBLIC_URL}/files/{urllib.parse.quote(f.name)}?k={urllib.parse.quote(FILE_KEY)}"
+        return url, f.name
+    except Exception as e:
+        log(f"   לא הוכן עותק למחשב: {e}")
+        path.unlink(missing_ok=True)
+        return "", ""
+
+
 KH_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 
 
@@ -744,7 +763,8 @@ def handle_kh(job: dict) -> None:
             msg = yemot_upload(dest, job.get("yemotPath") or "")
             if job.get("minutes"):
                 msg += f" · {job['minutes']} דק׳"
-            api("/api/report", {"videoId": vid, "status": "done", "fileUrl": "", "error": msg})
+            url, name = offer_to_pc(dest, vid)
+            api("/api/report", {"videoId": vid, "status": "done", "fileUrl": url, "fileName": name, "error": msg})
             log(f"   ✓ {msg}")
         except Exception as e:
             api("/api/report", {"videoId": vid, "status": "failed", "error": f"העלאה לימות נכשלה: {e}"})
@@ -860,7 +880,8 @@ def _handle(job: dict) -> None:
             dur = PROGRESS.get(vid, {}).get("duration")
             if dur:
                 msg += f" · {round(float(dur) / 60)} דק׳"
-            api("/api/report", {"videoId": vid, "status": "done", "fileUrl": "", "error": msg})
+            url, name = offer_to_pc(files[-1], vid)
+            api("/api/report", {"videoId": vid, "status": "done", "fileUrl": url, "fileName": name, "error": msg})
             log(f"   ✓ {msg}")
         except Exception as e:
             api("/api/report", {"videoId": vid, "status": "failed", "error": f"העלאה לימות נכשלה: {e}"})
