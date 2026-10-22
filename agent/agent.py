@@ -579,7 +579,9 @@ def handle_list(job: dict) -> None:
            "--playlist-end", str(min(max(count * (3 if min_s else 1) + 5, int(job.get("scan") or 0)), 600)),
            "--print", "%(id)s\t%(duration)s\t%(webpage_url)s\t%(title)s"]
     if is_yt:
-        cmd += ["--js-runtimes", "node", "--impersonate", "chrome"]
+        # skip=authcheck: with the signed-in cookies yt-dlp refuses a public channel/playlist page it could not load fully
+        # ("Playlists that require authentication may not extract correctly…") — list it anyway.
+        cmd += ["--js-runtimes", "node", "--impersonate", "chrome", "--extractor-args", "youtubetab:skip=authcheck"]
     cmd += net_args()
     cookies = cookies_path()
     if cookies:
@@ -1085,7 +1087,7 @@ def diag() -> None:
         return
     time.sleep(45)
     for u in urls:
-        cmd = ["yt-dlp", "--flat-playlist", "-J", "--playlist-end", "25", "--no-warnings", "--extractor-args", "youtube:player_client=default,mweb"] + net_args()
+        cmd = ["yt-dlp", "--flat-playlist", "-J", "--playlist-end", "25", "--no-warnings", "--extractor-args", "youtube:player_client=default,mweb", "--extractor-args", "youtubetab:skip=authcheck"] + net_args()
         ck = cookies_path()
         if ck:
             cmd += ["--cookies", ck]
