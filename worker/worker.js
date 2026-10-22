@@ -37,9 +37,11 @@ export default {
     try {
       env = await withStore(env);
       store = env.DB;
-      const res = await route(req, env, ctx);
+      let res = await route(req, env, ctx);
       if (store) await autoCheck(env);
       if (store && store.flush) await store.flush();
+      const renew = RENEW.get(req);                    // a signed-in visit pushes the hour on
+      if (renew) { res = new Response(res.body, res); res.headers.append("Set-Cookie", renew); }
       return res;
     } catch (e) {
       try { if (store && store.flush) await store.flush(); } catch (x) {}
@@ -453,21 +455,43 @@ async function sha256(s) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function profileToken(env, pid) {
-  if (pid === "main") return sha256("yt-tracker:main:" + env.ADMIN_PASSWORD);
+// Sign-in: cookie "auth=<profile>.<signed in at>.<expires>.<signature>".
+// It ends an hour after the site was last open (every visit pushes it on),
+// always 12 hours after signing in, and when the browser closes (no Max-Age).
+// The signature's secret is the profile's code, so a new code signs out
+// everyone. Cookies from before (one fixed token, good for a year) no
+// longer count.
+const SESSION_IDLE = 60 * 60 * 1000;
+const SESSION_MAX = 12 * 60 * 60 * 1000;
+const RENEW = new WeakMap();   // request → a renewed cookie to send back (see fetch)
+async function sessionSecret(env, pid) {
+  if (pid === "main") return env.ADMIN_PASSWORD ? "main:" + env.ADMIN_PASSWORD : null;
   const prof = (await getJSON(env, "profiles", {}))[pid];
-  return prof ? sha256("yt-tracker:" + pid + ":" + prof.hash) : null;
+  return prof ? pid + ":" + prof.hash : null;
+}
+async function hmac(secret, msg) {
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(msg));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function sessionCookie(env, pid, iat = Date.now()) {
+  const secret = await sessionSecret(env, pid);
+  if (!secret) return null;
+  const body = pid + "." + iat.toString(36) + "." + (Date.now() + SESSION_IDLE).toString(36);
+  return `auth=${body}.${await hmac("yt-session:" + secret, body)}; Path=/; HttpOnly; Secure; SameSite=Lax`;
 }
 
-// Which profile is logged in (cookie "auth=<profile>.<token>"), or null.
+// Which profile is logged in, or null.
 async function whoIs(req, env) {
   if (!env.ADMIN_PASSWORD) return null;
-  const c = req.headers.get("Cookie") || "";
-  const m = c.match(/(?:^|;\s*)auth=([\w-]+)\.([a-f0-9]{64})/);
-  if (m && m[2] === await profileToken(env, m[1])) return m[1];
-  const legacy = c.match(/(?:^|;\s*)auth=([a-f0-9]{64})(?:;|$)/);   // cookie from before profiles
-  if (legacy && legacy[1] === await sha256("yt-tracker:" + env.ADMIN_PASSWORD)) return "main";
-  return null;
+  const m = (req.headers.get("Cookie") || "").match(/(?:^|;\s*)auth=([\w-]+)\.([0-9a-z]+)\.([0-9a-z]+)\.([a-f0-9]{64})/);
+  if (!m) return null;
+  const [, pid, iat36, exp36, sig] = m, iat = parseInt(iat36, 36), exp = parseInt(exp36, 36), now = Date.now();
+  if (!(exp > now && now - iat < SESSION_MAX && iat <= now + 60000)) return null;
+  const secret = await sessionSecret(env, pid);
+  if (!secret || sig !== await hmac("yt-session:" + secret, pid + "." + iat36 + "." + exp36)) return null;
+  if (exp - now < SESSION_IDLE - 5 * 60000) RENEW.set(req, await sessionCookie(env, pid, iat));   // at most every 5 minutes
+  return pid;
 }
 
 async function checkCode(env, pid, password) {
@@ -608,7 +632,7 @@ async function unzipOne(buf) {
 }
 
 const json = (v, status = 200) => new Response(JSON.stringify(v), {
-  status, headers: { "Content-Type": "application/json; charset=utf-8" } });
+  status, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
 const redirect = (to, headers = {}) => new Response(null, { status: 303, headers: { Location: to, ...headers } });
 
 async function route(req, env, ctx) {
@@ -790,8 +814,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
     const want = String(f.get("pid") || ""), pw = String(f.get("password") || "");
     const pid = want ? ((await checkCode(env, want, pw)) ? want : null) : await loginProfile(env, pw);
     if (pid) {
-      const tok = await profileToken(env, pid);
-      return redirect(BASE + "/", { "Set-Cookie": `auth=${pid}.${tok}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000` });
+      return redirect(BASE + "/", { "Set-Cookie": await sessionCookie(env, pid) });
     }
     return page("כניסה", await loginForm(env, "קוד שגוי", want));
   }
@@ -1570,7 +1593,7 @@ function page(title, body) {
 <link rel="icon" href="${ICON}">
 <link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>${CSS}</style></head><body>${body}</body></html>`,
-    { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
 // "Who's signing in?" — a tile per profile, then that profile's code.
