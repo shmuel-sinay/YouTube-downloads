@@ -1507,14 +1507,22 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
   // Needs Worker secrets YEMOT_USER (line number) and YEMOT_PASS.
   if (p === "/yemot/files" && pid === "main") {
     if (!(rootEnv.YEMOT_USER && rootEnv.YEMOT_PASS)) return json({ error: "חסרים Secrets בשם YEMOT_USER ו-YEMOT_PASS ב-Worker" });
-    const path = rootEnv.YEMOT_PATH || "ivr2:/8";
+    // Every folder the line uses: the base (8), its sub-extensions (8/1, 8/2…) and the requests folder.
+    const base = rootEnv.YEMOT_PATH || "ivr2:/8", subs = (await getJSON(rootEnv, "phonecfg", { subs: [] })).subs || [];
+    const dirs = [...new Set([...subs.map((x) => base + "/" + x.n), reqDir(rootEnv), base])];
     try {
-      const r = await fetch("https://www.call2all.co.il/ym/api/GetIVR2Dir?token=" + encodeURIComponent(rootEnv.YEMOT_USER + ":" + rootEnv.YEMOT_PASS) +
-                            "&path=" + encodeURIComponent(path), { signal: AbortSignal.timeout(20000) });
-      const d = await r.json();
-      if (d.responseStatus && d.responseStatus !== "OK") return json({ error: String(d.message || d.responseStatus).slice(0, 200) });
-      const files = (d.files || []).filter((f) => /\.(wav|mp3)$/i.test(f.name || "")).map((f) => ({ name: f.name, size: f.size || 0, mtime: f.mtime || "" }));
-      return json({ path, count: files.length, files: files.slice(-8).reverse() });
+      const per = [], all = [];
+      for (const path of dirs) {
+        const r = await fetch("https://www.call2all.co.il/ym/api/GetIVR2Dir?token=" + encodeURIComponent(rootEnv.YEMOT_USER + ":" + rootEnv.YEMOT_PASS) +
+                              "&path=" + encodeURIComponent(path), { signal: AbortSignal.timeout(20000) });
+        const d = await r.json();
+        if (d.responseStatus && d.responseStatus !== "OK") { per.push({ path, error: String(d.message || d.responseStatus).slice(0, 80) }); continue; }
+        const files = (d.files || []).filter((f) => /\.(wav|mp3)$/i.test(f.name || "")).map((f) => ({ name: f.name, size: f.size || 0, mtime: f.mtime || "", dir: path }));
+        per.push({ path, count: files.length });
+        all.push(...files);
+      }
+      all.sort((a, b) => String(b.mtime).localeCompare(String(a.mtime)));
+      return json({ count: all.length, per, files: all.slice(0, 8) });
     } catch (e) { return json({ error: "אין תשובה מימות: " + (e.message || e) }); }
   }
   // --- diagnostic (admin): what do YouTube's in-channel search and RSS return for "src" + "q"? ---
@@ -3132,7 +3140,7 @@ function renderPhone() {
     renderPhone.at = Date.now();
     fetch(B + "/yemot/files", { cache: "no-store" }).then((r) => r.json()).then((d) => {
       renderPhone.line = d.error ? '<span class="bad">' + esc(d.error) + "</span>"
-        : "<b>" + d.count + "</b> קבצים בשלוחה " + esc(d.path) + (d.files.length ? " · האחרון " + esc(d.files[0].mtime) : "");
+        : "<b>" + d.count + "</b> קבצים בקו" + (d.per && d.per.length ? '<div class="sub" style="margin:2px 0 0">' + d.per.filter((x) => !x.error).map((x) => esc(String(x.path).replace(/^ivr2?[:/]*\\/?/, "")) + ": " + x.count).join(" · ") + "</div>" : "");
       if ($("phoneLine")) $("phoneLine").innerHTML = renderPhone.line;
     }).catch(() => { if ($("phoneLine")) $("phoneLine").textContent = "לא ניתן לבדוק"; });
   }
