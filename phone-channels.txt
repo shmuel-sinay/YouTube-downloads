@@ -3,7 +3,7 @@
 @שלוחה 2 = הפטריוטים | *
 @שלוחה 3 = הועלה ידנית | #ידני
 
-https://www.youtube.com/playlist?list=PL8E54R76rowCcCOn_HQf36o1RF3_oD3z4 | הפטריוטים | auto | 40
+https://www.youtube.com/playlist?list=PL8E54R76rowCcCOn_HQf36o1RF3_oD3z4 | הפטריוטים - קטעים וראיונות | req
 https://www.youtube.com/channel/UCKEImtWikw9usC1pl_9m1nQ | C14 | req
 https://www.youtube.com/playlist?list=PLqsnGzdsslQgrlnxKqAzHBMrWcSBoL1OA | פתחי וזמרי בעם יותם זמרי - נעם פתחי | auto | 40
 https://www.youtube.com/channel/UC97tNnAqlsE3D6y-GUVhULg | רדיו גלי ישראל | auto | 40
