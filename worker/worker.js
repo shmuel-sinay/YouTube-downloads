@@ -2613,7 +2613,7 @@ async function dashboard(env) {
       <form class="grid" data-action="/profiles/add" style="margin-top:12px">
         <label class="field">שם<input name="name" placeholder="למשל: אחי" required></label>
         <label class="field">קוד לפרופיל<input name="password" type="password" minlength="4" required></label>
-        <label class="field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" name="netfree" style="width:auto" checked>רק פתוח בנטפרי</label>
+        <label class="field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" name="netfree" style="width:auto">רק פתוח בנטפרי</label>
         <label class="field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" name="vault" style="width:auto">כספת מוצפנת</label>
         <label class="field" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" name="direct" style="width:auto">מוריד מהמחשב (לא מהשרת)</label>
         <div class="actions-row" style="align-self:end;margin:0"><button class="btn">${icon("add")}<span>צור פרופיל</span></button></div>
