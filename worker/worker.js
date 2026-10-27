@@ -500,14 +500,24 @@ async function feedOf(ch, env) {
   return { name: ch.name, entries };
 }
 
-function jobFor(ch, e) {
+function jobFor(ch, e, site) {
+  // site: the video twin of a channel that uploads audio to the phone — the
+  // phone needs m4a, but a video channel should still have its MP4 to watch
+  // on the site, so it isn't stuck audio-only everywhere.
+  const asYemot = ch.yemot && !site;
   return {
-    videoId: e.videoId, channelId: ch.id, channelName: ch.name, title: e.title,
+    videoId: site ? e.videoId + "-vid" : e.videoId, ...(site ? { ytId: e.videoId } : {}),
+    channelId: ch.id, channelName: ch.name, title: e.title,
     published: e.published, url: e.url || "https://www.youtube.com/watch?v=" + e.videoId, ...(e.minutes ? { minutes: e.minutes } : {}),
-    mode: ch.yemot ? "m4a" : ch.mode, minMinutes: ch.yemot ? 0 : ch.minMinutes, status: "queued",
-    ...(ch.yemot ? { yemot: true } : {}), ...(ch.yemot && ch.folder ? { yemotPath: ch.folder } : {}),
+    mode: asYemot ? "m4a" : ch.mode, minMinutes: asYemot ? 0 : ch.minMinutes, status: "queued",
+    ...(asYemot ? { yemot: true } : {}), ...(asYemot && ch.folder ? { yemotPath: ch.folder } : {}),
     updated: new Date().toISOString(),
   };
+}
+function jobsFor(ch, e) {
+  const jobs = [jobFor(ch, e)];
+  if (ch.yemot && /^video/.test(ch.mode || "")) jobs.push(jobFor(ch, e, true));
+  return jobs;
 }
 
 // Phone line sub-extensions of ext 8: "N = spoken label | category, category" ("*" = everything else).
@@ -549,7 +559,7 @@ async function checkChannel(env, ch, notes) {
   }
   if (notes) notes.push(ch.name + ": " + (top ? "האחרון ביוטיוב " + (top.published || "").slice(0, 10) : "הפיד ריק"));
   const fresh = entries.filter((e) => !seen.includes(e.videoId));
-  const jobs = fresh.filter((e) => !(ch.skipShorts && e.isShort)).map((e) => jobFor(ch, e));
+  const jobs = fresh.filter((e) => !(ch.skipShorts && e.isShort)).flatMap((e) => jobsFor(ch, e));
   await addJobs(env, jobs);
   if (fresh.length) {
     await putJSON(env, "seen:" + ch.id, [...fresh.map((e) => e.videoId), ...seen].slice(0, SEEN_CAP));
@@ -1861,7 +1871,7 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
         // newest N, which are queued now if the user asked for a backfill.
         const backfill = ch.reqOnly ? 0 : Math.max(0, Math.min(15, parseInt(f.get("backfill") || "0", 10) || 0));
         const take = entries.filter((e) => !(ch.skipShorts && e.isShort)).slice(0, backfill);
-        await addJobs(env, take.map((e) => jobFor(ch, e)));
+        await addJobs(env, take.flatMap((e) => jobsFor(ch, e)));
         await putJSON(env, "seen:" + id, entries.map((e) => e.videoId));
         await addLog(env, "worker", `נוסף ערוץ: ${name}` + (take.length ? ` (${take.length} סרטונים לתור)` : ""));
         if (take.length) wake();
@@ -2730,7 +2740,7 @@ function btn(act, id, ic, title, cls) { return '<button class="ibtn ' + (cls || 
 function jobRow(j) {
   const list = j.kind === "list" || j.kind === "search";
   const thumb = list ? '<div class="thumb">' + icon(j.kind === "search" ? "queue" : "layers") + '</div>'
-    : '<img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">';
+    : '<img class="thumb" loading="lazy" src="https://i.ytimg.com/vi/' + esc(j.ytId || j.videoId) + '/mqdefault.jpg" onerror="this.style.visibility=\\'hidden\\'">';
   const modeIc = /^video/.test(j.mode || "") ? "video" : "music";
   const srcTag = j.source === "tiktok" ? "TikTok" : (j.source === "other" && j.url ? (j.url.split("/")[2] || "").replace(/^www\./, "") : "");
   const meta = [esc(j.channelName || "קישור ידני"), srcTag ? esc(srcTag) : "", icon(modeIc) + " " + esc(MODES[j.mode] || MODES.audio),
