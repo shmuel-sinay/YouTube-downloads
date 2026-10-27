@@ -1638,7 +1638,9 @@ Variable name: <b>DB</b>, ובוחרים KV (אם אין — יוצרים ב-Sto
       if (!c) {
         const bySearch = /search_query=/.test(url);
         if (tab) {
-          c = { id, agentList: true, listUrl: url, match: mt, count: 3, name: nm || mt || url, mode: "m4a", minMinutes: 0, skipShorts: false, added: new Date().toISOString() };
+          // A tab/search watch (e.g. a C14 "full episode" search, or a /streams page) is a program meant to be
+          // watched, not a shiur — default it to video so the site gets an MP4 twin alongside the phone's m4a.
+          c = { id, agentList: true, listUrl: url, match: mt, count: 3, name: nm || mt || url, mode: "video", minMinutes: 0, skipShorts: false, added: new Date().toISOString() };
           channels.push(c); added++;
           srchN.push(c.name + " ← מעקב אחרי " + url + (mt ? " (כותרת עם: " + mt + ")" : "") + " דרך שרת ההורדות, בבדיקות הקבועות");
         } else if (khd) {
